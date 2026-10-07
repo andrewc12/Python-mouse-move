@@ -437,14 +437,23 @@ class WinKeyboard:
         self.u.keybd_event(vk, self.u.MapVirtualKeyW(vk, 0), flags, 0)
 
     def press(self, mods, key: str, count: int = 1) -> None:
+        """Hold the modifiers, tap the key, release in reverse. Small gaps let the shell and
+        apps register the modifier first (Windows-key shortcuts need this)."""
         for _ in range(count):
             for m in mods:
                 self._event(m, False)
+            if mods:
+                time.sleep(0.04)
             self._event(key, False)
+            time.sleep(0.02 if mods else 0.005)
             self._event(key, True)
+            if mods:
+                time.sleep(0.03)
             for m in reversed(mods):
                 self._event(m, True)
             time.sleep(0.02 if count > 1 else 0.01)   # let the target app keep up on repeats
+        if mods:
+            print(f"pressed {'+'.join(mods)}+{key}" + (f" x{count}" if count > 1 else ""))
 
 
 def make_click_through(widget) -> None:
