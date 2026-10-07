@@ -39,6 +39,7 @@ Hotkey (no voice needed): tap Ctrl + Left-Windows together, then let go. It togg
 sleeping and listening (and leaves the grid). A high beep = now listening, low beep = sleeping.
 Ctrl+Win combined with any other key (e.g. virtual-desktop switching) is left alone.
 Disable with --no-hotkey.
+You can also click the status box in the bottom-right corner to toggle listening.
 
 Run:  python voice_mouse.py            (downloads the ~40 MB model on first run)
       python voice_mouse.py --list-devices
@@ -570,16 +571,19 @@ def make_win_hotkey() -> HotkeyWatcher:
     return HotkeyWatcher(is_down, mask)
 
 
-def make_click_through(widget) -> None:
-    """Layered + transparent + no-activate so the window never takes focus or clicks."""
+def make_click_through(widget, clickable: bool = False) -> None:
+    """Layered + no-activate window that never takes focus. Unless `clickable`, mouse clicks
+    also pass straight through it to whatever is underneath."""
     import ctypes
     u = ctypes.windll.user32
     widget.update_idletasks()
     hwnd = u.GetAncestor(widget.winfo_id(), 2)           # GA_ROOT
     GWL_EXSTYLE = -20
     style = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
-    u.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                     style | 0x80000 | 0x20 | 0x80 | 0x08000000)
+    extra = 0x80000 | 0x80 | 0x08000000                  # LAYERED | TOOLWINDOW | NOACTIVATE
+    if not clickable:
+        extra |= 0x20                                    # TRANSPARENT (click-through)
+    u.SetWindowLongW(hwnd, GWL_EXSTYLE, style | extra)
 
 
 class Overlay:
@@ -653,8 +657,12 @@ class StatusPill:
         self.bar = self.meter.create_rectangle(0, 0, 0, self.METER_H, width=0, fill="#34c759")
         self.screen = screen
         self.level = 0.0
+        self.on_click = lambda: None          # set by main(); toggles listening
+        for w in (self.win, self.frame, self.label, self.meter):
+            w.bind("<Button-1>", lambda e: self.on_click())
+            w.config(cursor="hand2")
         self.set(SLEEPING)
-        make_click_through(self.win)
+        make_click_through(self.win, clickable=True)   # takes clicks but never steals focus
 
     def set(self, state: str) -> None:
         colour, text = self.COLORS[state]
@@ -816,18 +824,24 @@ def main() -> None:
 
     root.after(30, poll)
 
+    import winsound
+
+    def toggle(source: str) -> None:
+        ctl.handle("start" if ctl.state == SLEEPING else "stop")
+        awake = ctl.state != SLEEPING
+        print(f"{source}: " + ("listening" if awake else "sleeping"))
+        threading.Thread(target=winsound.Beep, args=(1000 if awake else 500, 90),
+                         daemon=True).start()
+
+    pill.on_click = lambda: toggle("click")
+
     if not args.no_hotkey:
-        import winsound
         watcher = make_win_hotkey()
 
         def hotkey_poll():
             try:
                 if watcher.poll():
-                    ctl.handle("start" if ctl.state == SLEEPING else "stop")
-                    awake = ctl.state != SLEEPING
-                    print("hotkey: listening" if awake else "hotkey: sleeping")
-                    threading.Thread(target=winsound.Beep, args=(1000 if awake else 500, 90),
-                                     daemon=True).start()
+                    toggle("hotkey")
             except Exception as e:
                 print(f"hotkey error: {e}")
             root.after(20, hotkey_poll)
