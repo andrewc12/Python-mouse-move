@@ -83,4 +83,56 @@ c, m, o = make(); say(c, "start listening mouse grid")
 for _ in range(30): say(c, "five")
 assert c.nav.current.w >= MIN_CELL_PX * 0.9 * 1 or True
 assert c.nav.current.w / 3 < MIN_CELL_PX or len(c.nav.stack) < 40
-print("all tests passed; max depth", len(c.nav.stack) - 1, "final cell", c.nav.current.w, "px")
+
+# ---------------- keyboard ----------------
+class FakeKb:
+    def __init__(self): self.log = []
+    def press(self, mods, key, count=1): self.log.append((mods, key, count))
+
+def P(text):
+    out = parse_commands(text)
+    assert len(out) == 1 and isinstance(out[0], KeyPress), out
+    return [(c.mods, c.key, c.count) for c in out[0].chords]
+
+assert P("press tab") == [((), "tab", 1)]
+assert P("press down down enter") == [((), "down", 1), ((), "down", 1), ((), "enter", 1)]
+assert P("press down twenty") == [((), "down", 20)]
+assert P("press tab twenty five times") == [((), "tab", 25)]
+assert P("press page down one hundred ten") == [((), "pagedown", 110)]
+assert P("press down fifty enter") == [((), "down", 50), ((), "enter", 1)]
+assert P("press control c") == [(("ctrl",), "c", 1)]
+assert P("press control shift escape") == [(("ctrl", "shift"), "escape", 1)]
+assert P("press control c control v") == [(("ctrl",), "c", 1), (("ctrl",), "v", 1)]
+assert P("press control tab five") == [(("ctrl",), "tab", 5)]
+assert P("press function five") == [((), "f5", 1)]
+assert P("press function twelve") == [((), "f12", 1)]
+assert P("press one two three") == [((), "1", 1), ((), "2", 1), ((), "3", 1)]
+assert P("press control one") == [(("ctrl",), "1", 1)]
+assert P("press windows") == [((), "win", 1)]
+assert P("press alt left") == [(("alt",), "left", 1)]
+assert P("press alpha bravo see") == [((), "a", 1), ((), "b", 1), ((), "c", 1)]
+assert parse_commands("press") == []
+assert parse_commands("press mouse grid") == ["grid"]
+# mixes with mouse commands
+mix = parse_commands("mouse grid five left click press down ten cancel")
+assert mix[:3] == ["grid", "5", "left"] and isinstance(mix[3], KeyPress) and mix[4] == "cancel", mix
+assert parse_commands("press left click") == ["left"]            # click wins over arrow
+assert parse_commands("press down right click") [1] == "right"
+# every parsed key has a virtual-key code
+for w in list(SPOKEN_KEYS.values()) + list(LETTER_WORDS.values()) + list(MODIFIERS.values()):
+    assert w in VK, w
+assert "f12" in VK and "pagedown" in VK and "9" in VK
+assert all(w in COMMAND_GRAMMAR for w in ("press", "times", "twenty", "function", "page", "left", "bravo"))
+
+# controller: keys ignored while asleep, work awake and in grid, cap on repeats
+kb = FakeKb(); m, o = FakeMouse(), FakeOverlay()
+c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb)
+say(c, "press tab"); assert kb.log == []
+say(c, "start listening press control c press down twenty")
+assert kb.log == [(("ctrl",), "c", 1), ((), "down", 20)], kb.log
+say(c, "mouse grid press tab")
+assert c.state == GRID and kb.log[-1] == ((), "tab", 1) and o.visible
+say(c, "press down nine hundred ninety nine")
+assert kb.log[-1] == ((), "down", MAX_REPEAT), kb.log[-1]
+
+print("all tests passed")

@@ -14,6 +14,21 @@ In grid  : "one" ... "nine"              -> zoom into that cell (cursor moves to
            "double click"                -> double-click at the aimed spot
            "cancel"                      -> leave the grid (and forget any mark)
 
+Keyboard (awake, or inside the grid)
+------------------------------------
+  "press tab"                        one key
+  "press down down enter"            keys one after another
+  "press down twenty"                a key followed by a number repeats it ("twenty times" also ok)
+  "press control c"                  modifiers (control, alt, shift, windows) apply to the next key
+  "press control shift escape"       ... several modifiers
+  "press control c control v"        chords one after another
+  "press function five"              F5          "press page down fifty"   Page Down x50
+  "press one two three"              digit keys  (numbers straight after "press" are digits)
+  letters: say the letter ("a", "bee", "see"...) or NATO words ("alpha", "bravo", ...)
+  other keys: enter return tab escape space backspace delete insert home end up down left
+              right period comma slash backslash dash equals semicolon
+Everything can be chained in one breath: "mouse grid five one left click press hello" style.
+
 Run:  python voice_mouse.py            (downloads the ~40 MB model on first run)
       python voice_mouse.py --list-devices
 """
@@ -53,23 +68,165 @@ PHRASES = {
     ("cancel",): "cancel",
 }
 
+MAX_REPEAT = 500          # safety cap for "press down <N>"
+
+# ---- keyboard vocabulary ---------------------------------------------------
+UNITS = {w: i for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen "
+    "fourteen fifteen sixteen seventeen eighteen nineteen".split())}
+TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+        "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
+
+MODIFIERS = {"control": "ctrl", "alt": "alt", "shift": "shift", "windows": "win"}
+
+SPOKEN_KEYS = {
+    "enter": "enter", "return": "enter", "tab": "tab", "escape": "escape", "space": "space",
+    "backspace": "backspace", "delete": "delete", "insert": "insert", "home": "home",
+    "end": "end", "up": "up", "down": "down", "left": "left", "right": "right",
+    "period": "period", "comma": "comma", "slash": "slash", "backslash": "backslash",
+    "dash": "dash", "minus": "dash", "equals": "equals", "semicolon": "semicolon",
+}
+
+LETTER_WORDS = {c: c for c in "abcdefghijklmnopqrstuvwxyz"}
+LETTER_WORDS.update({   # spoken-letter homophones the recogniser may prefer
+    "bee": "b", "be": "b", "see": "c", "sea": "c", "dee": "d", "gee": "g", "jay": "j",
+    "kay": "k", "oh": "o", "pee": "p", "queue": "q", "are": "r", "tea": "t", "you": "u",
+    "why": "y", "zee": "z", "zed": "z", "ex": "x", "eye": "i", "el": "l", "em": "m", "en": "n",
+})
+LETTER_WORDS.update({   # NATO alphabet: longer words, usually more reliable than bare letters
+    w: w[0] for w in (
+        "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike "
+        "november oscar papa quebec romeo sierra tango uniform victor whiskey yankee zulu"
+    ).split()
+})
+
+# canonical key name -> Windows virtual-key code
+VK: dict[str, int] = {c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"}
+VK.update({str(d): 0x30 + d for d in range(10)})
+VK.update({f"f{n}": 0x6F + n for n in range(1, 13)})
+VK.update({
+    "enter": 0x0D, "tab": 0x09, "escape": 0x1B, "space": 0x20, "backspace": 0x08,
+    "delete": 0x2E, "insert": 0x2D, "home": 0x24, "end": 0x23, "pageup": 0x21,
+    "pagedown": 0x22, "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+    "period": 0xBE, "comma": 0xBC, "slash": 0xBF, "backslash": 0xDC, "dash": 0xBD,
+    "equals": 0xBB, "semicolon": 0xBA,
+    "ctrl": 0x11, "alt": 0x12, "shift": 0x10, "win": 0x5B,
+})
+EXTENDED_KEYS = {"delete", "insert", "home", "end", "pageup", "pagedown",
+                 "left", "up", "right", "down", "win"}
+
+_KEY_WORDS = (set(SPOKEN_KEYS) | set(LETTER_WORDS) | set(MODIFIERS) | set(UNITS) | set(TENS)
+              | {"press", "times", "function", "page", "hundred"})
+
 WAKE_GRAMMAR = ["start listening", "[unk]"]
-COMMAND_GRAMMAR = (
+COMMAND_GRAMMAR = list(dict.fromkeys(
     ["stop listening", "mouse grid", "left click", "right click", "double click",
      "mark", "back", "cancel", "start listening"]
-    + list(NUMBER_WORDS) + ["[unk]"]
-)
+    + list(NUMBER_WORDS) + sorted(_KEY_WORDS) + ["[unk]"]
+))
 
 
 # --------------------------------------------------------------------------
 # Pure logic (no Windows / audio dependencies, so it can be unit tested)
 # --------------------------------------------------------------------------
-def parse_commands(text: str) -> list[str]:
-    """Turn recognised text into a list of commands: 'start', 'grid', '1'..'9', ..."""
+@dataclass(frozen=True)
+class Chord:
+    mods: tuple[str, ...]
+    key: str
+    count: int = 1
+
+
+@dataclass(frozen=True)
+class KeyPress:
+    chords: tuple[Chord, ...]
+
+
+def parse_number(words: list[str], i: int):
+    """Parse 0-999 spoken ('twenty five', 'one hundred ten'). Returns (value, next_i) or None."""
+    n, j, total, got = len(words), i, 0, False
+    if j + 1 < n and words[j] in UNITS and UNITS[words[j]] < 10 and words[j + 1] == "hundred":
+        total, j, got = UNITS[words[j]] * 100, j + 2, True
+    if j < n and words[j] in TENS:
+        total += TENS[words[j]]
+        j, got = j + 1, True
+        if j < n and words[j] in UNITS and 1 <= UNITS[words[j]] <= 9:
+            total += UNITS[words[j]]
+            j += 1
+    elif j < n and words[j] in UNITS:
+        total += UNITS[words[j]]
+        j, got = j + 1, True
+    return (total, j) if got else None
+
+
+def _parse_key(words: list[str], i: int):
+    w = words[i]
+    if w == "page" and i + 1 < len(words) and words[i + 1] in ("up", "down"):
+        return "page" + words[i + 1], i + 2
+    if w == "function":
+        num = parse_number(words, i + 1)
+        if num and 1 <= num[0] <= 12:
+            return f"f{num[0]}", num[1]
+        return None
+    if w in SPOKEN_KEYS:
+        return SPOKEN_KEYS[w], i + 1
+    if w in LETTER_WORDS:
+        return LETTER_WORDS[w], i + 1
+    return None
+
+
+def _parse_press(words: list[str], i: int):
+    """Parse everything after 'press'. Returns (list[Chord], next_i)."""
+    n = len(words)
+    chords: list[Chord] = []
+    mods: list[str] = []
+    countable = False           # last chord was a non-digit key a number can repeat
+    while i < n:
+        w = words[i]
+        if w == "[unk]":
+            i += 1
+        elif w in ("left", "right", "double") and words[i + 1:i + 2] == ["click"]:
+            break               # a mouse click, not an arrow key
+        elif w in MODIFIERS:
+            mods.append(MODIFIERS[w])
+            i += 1
+        elif w in UNITS or w in TENS:
+            num = parse_number(words, i) if (chords and not mods and countable) else None
+            if num:             # "down twenty [times]" -> repeat last key
+                c = chords[-1]
+                chords[-1] = Chord(c.mods, c.key, min(num[0], MAX_REPEAT))
+                i = num[1]
+                if i < n and words[i] == "times":
+                    i += 1
+                countable = False
+            elif w in UNITS and UNITS[w] < 10:      # digit key
+                chords.append(Chord(tuple(mods), str(UNITS[w])))
+                mods, countable = [], False
+                i += 1
+            else:
+                break
+        else:
+            key = _parse_key(words, i)
+            if not key:
+                break
+            name, i = key
+            chords.append(Chord(tuple(mods), name))
+            mods, countable = [], True
+    if mods:                    # e.g. "press windows" / "press shift" on their own
+        chords.append(Chord(tuple(mods[:-1]), mods[-1]))
+    return chords, i
+
+
+def parse_commands(text: str) -> list:
+    """Turn recognised text into commands: 'start', 'grid', '1'..'9', ... or KeyPress objects."""
     words = text.lower().split()
-    out: list[str] = []
+    out: list = []
     i = 0
     while i < len(words):
+        if words[i] == "press":
+            chords, i = _parse_press(words, i + 1)
+            if chords:
+                out.append(KeyPress(tuple(chords)))
+            continue
         two = tuple(words[i:i + 2])
         if len(two) == 2 and two in PHRASES:
             out.append(PHRASES[two])
@@ -135,9 +292,10 @@ SLEEPING, AWAKE, GRID = "sleeping", "awake", "grid"
 class Controller:
     """State machine: SLEEPING <-> AWAKE <-> GRID. Talks to `mouse` and `overlay`."""
 
-    def __init__(self, bounds: Region, mouse, overlay, on_state=lambda s: None):
+    def __init__(self, bounds: Region, mouse, overlay, on_state=lambda s: None, keyboard=None):
         self.nav = GridNavigator(bounds)
         self.mouse, self.overlay, self.on_state = mouse, overlay, on_state
+        self.keyboard = keyboard
         self.state = SLEEPING
         self.mark: tuple[int, int] | None = None
 
@@ -154,7 +312,13 @@ class Controller:
         self.nav.reset()
         self._set(new_state)
 
-    def handle(self, cmd: str) -> None:
+    def handle(self, cmd) -> None:
+        if isinstance(cmd, KeyPress):
+            if self.state != SLEEPING and self.keyboard:
+                for ch in cmd.chords:
+                    self.keyboard.press(ch.mods, ch.key, ch.count)
+            return
+
         if self.state == SLEEPING:
             if cmd == "start":
                 self._set(AWAKE)
@@ -257,6 +421,27 @@ class WinMouse:
         self.u.mouse_event(up, 0, 0, 0, 0)
 
 
+class WinKeyboard:
+    def __init__(self):
+        import ctypes
+        self.u = ctypes.windll.user32
+
+    def _event(self, key: str, up: bool) -> None:
+        vk = VK[key]
+        flags = (0x0001 if key in EXTENDED_KEYS else 0) | (0x0002 if up else 0)
+        self.u.keybd_event(vk, self.u.MapVirtualKeyW(vk, 0), flags, 0)
+
+    def press(self, mods, key: str, count: int = 1) -> None:
+        for _ in range(count):
+            for m in mods:
+                self._event(m, False)
+            self._event(key, False)
+            self._event(key, True)
+            for m in reversed(mods):
+                self._event(m, True)
+            time.sleep(0.02 if count > 1 else 0.01)   # let the target app keep up on repeats
+
+
 def make_click_through(widget) -> None:
     """Layered + transparent + no-activate so the window never takes focus or clicks."""
     import ctypes
@@ -319,7 +504,7 @@ class Overlay:
 
 class StatusPill:
     COLORS = {SLEEPING: ("#444444", "Sleeping - say \"start listening\""),
-              AWAKE: ("#1e8e3e", "Listening - say \"mouse grid\""),
+              AWAKE: ("#1e8e3e", "Listening - \"mouse grid\" or \"press ...\""),
               GRID: ("#c5221f", "Grid - say 1-9, back, mark, cancel")}
 
     def __init__(self, root, screen: Region):
@@ -365,9 +550,10 @@ def ensure_model(path: str | None) -> str:
 class SpeechThread(threading.Thread):
     """Mic -> Vosk. Uses a wake-only grammar while asleep and the command grammar otherwise."""
 
-    def __init__(self, model_path, device, min_conf, get_state, out_queue):
+    def __init__(self, model_path, device, min_conf, get_state, out_queue, open_vocab=False):
         super().__init__(daemon=True)
         self.model_path, self.device, self.min_conf = model_path, device, min_conf
+        self.open_vocab = open_vocab
         self.get_state, self.out = get_state, out_queue
         self.audio: queue.Queue[bytes] = queue.Queue()
 
@@ -384,11 +570,13 @@ class SpeechThread(threading.Thread):
         model = Model(self.model_path)
 
         def make(grammar):
-            r = KaldiRecognizer(model, SAMPLE_RATE, json.dumps(grammar))
+            r = (KaldiRecognizer(model, SAMPLE_RATE, json.dumps(grammar)) if grammar
+                 else KaldiRecognizer(model, SAMPLE_RATE))     # no grammar = open vocabulary
             r.SetWords(True)
             return r
 
-        wake, command = make(WAKE_GRAMMAR), make(COMMAND_GRAMMAR)
+        wake = make(WAKE_GRAMMAR)
+        command = make(None if self.open_vocab else COMMAND_GRAMMAR)
         last_asleep = True
 
         def cb(indata, frames, t, status):
@@ -422,6 +610,9 @@ def main() -> None:
     ap.add_argument("--min-conf", type=float, default=0.6,
                     help="ignore results below this average word confidence (default 0.6)")
     ap.add_argument("--start-awake", action="store_true")
+    ap.add_argument("--open-vocab", action="store_true",
+                    help="don't restrict awake-mode recognition to the command words; use this if "
+                         "multi-word chains are being cut short (more false triggers, though)")
     args = ap.parse_args()
 
     if args.list_devices:
@@ -440,18 +631,22 @@ def main() -> None:
     screen = primary_screen()
     pill = StatusPill(root, screen)
     overlay = Overlay(root, screen)
-    ctl = Controller(screen, WinMouse(), overlay, on_state=pill.set)
+    ctl = Controller(screen, WinMouse(), overlay, on_state=pill.set, keyboard=WinKeyboard())
     if args.start_awake:
         ctl.handle("start")
 
     cmds: queue.Queue[str] = queue.Queue()
-    SpeechThread(model_path, args.device, args.min_conf, lambda: ctl.state, cmds).start()
+    SpeechThread(model_path, args.device, args.min_conf, lambda: ctl.state, cmds,
+                 args.open_vocab).start()
 
     def poll():
         try:
             while True:
                 cmd = cmds.get_nowait()
-                ctl.handle(cmd)
+                try:
+                    ctl.handle(cmd)
+                except Exception as e:      # never let one bad command kill the poll loop
+                    print(f"error handling {cmd!r}: {e}")
         except queue.Empty:
             pass
         root.after(30, poll)
