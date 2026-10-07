@@ -622,6 +622,12 @@ def main() -> None:
     if sys.platform != "win32":
         sys.exit("This tool controls the Windows mouse; run it on Windows.")
 
+    try:
+        import sounddevice, vosk  # noqa: F401
+    except ImportError as e:
+        sys.exit(f"Missing package ({e.name}). Install the requirements with:\n"
+                 f"    {os.path.basename(sys.executable)} -m pip install vosk sounddevice")
+
     import tkinter as tk
     make_dpi_aware()
     model_path = ensure_model(args.model)
