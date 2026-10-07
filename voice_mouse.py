@@ -664,11 +664,21 @@ class StatusPill:
         self.screen = screen
         self.level = 0.0
         self.on_click = lambda: None          # set by main(); toggles listening
+        # Bind ONCE on the toplevel: clicks on the label/meter bubble up to it through Tk's
+        # bindtags, so binding every child as well made each click fire twice (wake, then sleep).
+        self._last_click = 0.0
+        self.win.bind("<Button-1>", self._clicked)
         for w in (self.win, self.frame, self.label, self.meter):
-            w.bind("<Button-1>", lambda e: self.on_click())
             w.config(cursor="hand2")
         self.set(SLEEPING)
         make_click_through(self.win, clickable=True)   # takes clicks but never steals focus
+
+    def _clicked(self, event=None) -> None:
+        now = time.monotonic()
+        if now - self._last_click < 0.35:       # ignore bounce / duplicate events
+            return
+        self._last_click = now
+        self.on_click()
 
     def set(self, state: str) -> None:
         colour, text = self.COLORS[state]
