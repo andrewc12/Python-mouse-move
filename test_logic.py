@@ -179,3 +179,14 @@ k.down |= {0x11}; w.poll(); k.down -= {0x11}; assert w.poll() is False
 k.down |= {0x5B}; w.poll(); k.down |= {0x11}; w.poll(); k.down -= {0x11, 0x5B}
 assert w.poll() is True
 print("hotkey ok")
+
+# level meter
+import struct, math as _m
+silence = bytes(1600)
+quiet = struct.pack("<800h", *[int(100 * _m.sin(i / 3)) for i in range(800)])
+loud = struct.pack("<800h", *[int(12000 * _m.sin(i / 3)) for i in range(800)])
+full = struct.pack("<800h", *[32767 if i % 2 else -32768 for i in range(800)])
+ls, lq, ll, lf = (level_from_pcm(x) for x in (silence, quiet, loud, full))
+assert ls == 0 and 0 < lq < ll < lf <= 1.0, (ls, lq, ll, lf)
+assert level_from_pcm(b"") == 0 and level_from_pcm(b"\x01") == 0
+print("meter ok", round(lq, 2), round(ll, 2), round(lf, 2))

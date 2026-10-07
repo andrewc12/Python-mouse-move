@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import queue
 import sys
@@ -143,6 +144,20 @@ COMMAND_GRAMMAR = list(dict.fromkeys(
 # --------------------------------------------------------------------------
 # Pure logic (no Windows / audio dependencies, so it can be unit tested)
 # --------------------------------------------------------------------------
+def level_from_pcm(data: bytes) -> float:
+    """Loudness of a 16-bit mono PCM chunk on a 0..1 scale (-60 dBFS -> 0, -10 dBFS -> 1)."""
+    from array import array
+    a = array("h")
+    a.frombytes(data[: len(data) // 2 * 2])
+    if not a:
+        return 0.0
+    rms = math.sqrt(sum(x * x for x in a) / len(a))
+    if rms < 1:
+        return 0.0
+    db = 20 * math.log10(rms / 32768)
+    return max(0.0, min(1.0, (db + 60) / 50))
+
+
 @dataclass(frozen=True)
 class Chord:
     mods: tuple[str, ...]
@@ -610,6 +625,7 @@ class StatusPill:
     COLORS = {SLEEPING: ("#444444", "Sleeping - say \"start listening\""),
               AWAKE: ("#1e8e3e", "Listening - \"mouse grid\" or \"press ...\""),
               GRID: ("#c5221f", "Grid - say 1-9, back, mark, cancel")}
+    METER_W, METER_H = 90, 10
 
     def __init__(self, root, screen: Region):
         import tkinter as tk
@@ -617,18 +633,33 @@ class StatusPill:
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
         self.win.attributes("-alpha", 0.85)
-        self.label = tk.Label(self.win, font=("Segoe UI", 10, "bold"), fg="white", padx=10, pady=4)
-        self.label.pack()
+        self.frame = tk.Frame(self.win)
+        self.frame.pack()
+        self.label = tk.Label(self.frame, font=("Segoe UI", 10, "bold"), fg="white", padx=10, pady=4)
+        self.label.pack(side="left")
+        self.meter = tk.Canvas(self.frame, width=self.METER_W, height=self.METER_H,
+                               bg="#1b1b1b", highlightthickness=0)
+        self.meter.pack(side="left", padx=(0, 10))
+        self.bar = self.meter.create_rectangle(0, 0, 0, self.METER_H, width=0, fill="#34c759")
         self.screen = screen
+        self.level = 0.0
         self.set(SLEEPING)
         make_click_through(self.win)
 
     def set(self, state: str) -> None:
         colour, text = self.COLORS[state]
         self.label.config(text=text, bg=colour)
+        self.frame.config(bg=colour)
         self.win.update_idletasks()
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
         self.win.geometry(f"+{int(self.screen.w - w - 16)}+{int(self.screen.h - h - 56)}")
+
+    def set_level(self, v: float) -> None:
+        """Fast attack, slow decay so short words are visible."""
+        self.level = max(v, self.level * 0.8)
+        colour = "#34c759" if self.level < 0.6 else "#ffcc00" if self.level < 0.85 else "#ff3b30"
+        self.meter.coords(self.bar, 0, 0, self.level * self.METER_W, self.METER_H)
+        self.meter.itemconfig(self.bar, fill=colour)
 
 
 # --------------------------------------------------------------------------
@@ -658,6 +689,7 @@ class SpeechThread(threading.Thread):
         super().__init__(daemon=True)
         self.model_path, self.device, self.min_conf = model_path, device, min_conf
         self.open_vocab = open_vocab
+        self.level = 0.0         # latest mic loudness, 0..1, read by the UI for the meter
         self.get_state, self.out = get_state, out_queue
         self.audio: queue.Queue[bytes] = queue.Queue()
 
@@ -684,9 +716,11 @@ class SpeechThread(threading.Thread):
         last_asleep = True
 
         def cb(indata, frames, t, status):
-            self.audio.put(bytes(indata))
+            data = bytes(indata)
+            self.level = level_from_pcm(data)
+            self.audio.put(data)
 
-        with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=2000, device=self.device,
+        with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=800, device=self.device,
                                dtype="int16", channels=1, callback=cb):
             print("Microphone open. Say \"start listening\".")
             while True:
@@ -748,8 +782,15 @@ def main() -> None:
         ctl.handle("start")
 
     cmds: queue.Queue[str] = queue.Queue()
-    SpeechThread(model_path, args.device, args.min_conf, lambda: ctl.state, cmds,
-                 args.open_vocab).start()
+    speech = SpeechThread(model_path, args.device, args.min_conf, lambda: ctl.state, cmds,
+                          args.open_vocab)
+    speech.start()
+
+    def meter_poll():
+        pill.set_level(speech.level)
+        root.after(40, meter_poll)
+
+    root.after(40, meter_poll)
 
     def poll():
         try:
