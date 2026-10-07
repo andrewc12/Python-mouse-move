@@ -39,7 +39,8 @@ Hotkey (no voice needed): tap Ctrl + Left-Windows together, then let go. It togg
 sleeping and listening (and leaves the grid). A high beep = now listening, low beep = sleeping.
 Ctrl+Win combined with any other key (e.g. virtual-desktop switching) is left alone.
 Disable with --no-hotkey.
-You can also click the status box in the bottom-right corner to toggle listening.
+You can also click the status box in the bottom-right corner to toggle listening; its \u21c4
+button moves the box to the opposite corner (start on the left with --side left).
 
 Run:  python voice_mouse.py            (downloads the ~40 MB model on first run)
       python voice_mouse.py --list-devices
@@ -647,8 +648,9 @@ class StatusPill:
               GRID: ("#c5221f", "Grid - say 1-9, back, mark, cancel")}
     METER_W, METER_H = 90, 10
 
-    def __init__(self, root, screen: Region):
+    def __init__(self, root, screen: Region, side: str = "right"):
         import tkinter as tk
+        self.side = side                      # which bottom corner the box sits in
         self.win = tk.Toplevel(root)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
@@ -659,7 +661,13 @@ class StatusPill:
         self.label.pack(side="left")
         self.meter = tk.Canvas(self.frame, width=self.METER_W, height=self.METER_H,
                                bg="#1b1b1b", highlightthickness=0)
-        self.meter.pack(side="left", padx=(0, 10))
+        self.meter.pack(side="left", padx=(0, 4))
+        # Move handle: jumps the box to the opposite bottom corner. Its handler returns "break"
+        # so the click does not also reach the toplevel binding that toggles listening.
+        self.mover = tk.Label(self.frame, text="\u21c4", font=("Segoe UI Symbol", 12, "bold"),
+                              fg="white", padx=8, pady=2)
+        self.mover.pack(side="left", padx=(0, 4))
+        self.mover.bind("<Button-1>", self._flip_click)
         self.bar = self.meter.create_rectangle(0, 0, 0, self.METER_H, width=0, fill="#34c759")
         self.screen = screen
         self.level = 0.0
@@ -668,7 +676,7 @@ class StatusPill:
         # bindtags, so binding every child as well made each click fire twice (wake, then sleep).
         self._last_click = 0.0
         self.win.bind("<Button-1>", self._clicked)
-        for w in (self.win, self.frame, self.label, self.meter):
+        for w in (self.win, self.frame, self.label, self.meter, self.mover):
             w.config(cursor="hand2")
         self.set(SLEEPING)
         make_click_through(self.win, clickable=True)   # takes clicks but never steals focus
@@ -680,13 +688,23 @@ class StatusPill:
         self._last_click = now
         self.on_click()
 
+    def _flip_click(self, event=None) -> str:
+        self.side = "left" if self.side == "right" else "right"
+        self._place()
+        return "break"                        # don't let this click toggle listening
+
+    def _place(self) -> None:
+        self.win.update_idletasks()
+        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
+        x = 16 if self.side == "left" else self.screen.w - w - 16
+        self.win.geometry(f"+{int(x)}+{int(self.screen.h - h - 56)}")
+
     def set(self, state: str) -> None:
         colour, text = self.COLORS[state]
         self.label.config(text=text, bg=colour)
+        self.mover.config(bg=colour)
         self.frame.config(bg=colour)
-        self.win.update_idletasks()
-        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
-        self.win.geometry(f"+{int(self.screen.w - w - 16)}+{int(self.screen.h - h - 56)}")
+        self._place()
 
     def set_level(self, v: float) -> None:
         """Fast attack, slow decay so short words are visible."""
@@ -782,6 +800,8 @@ def main() -> None:
     ap.add_argument("--min-conf", type=float, default=0.6,
                     help="ignore results below this average word confidence (default 0.6)")
     ap.add_argument("--start-awake", action="store_true")
+    ap.add_argument("--side", choices=("left", "right"), default="right",
+                    help="which bottom corner the status box starts in (the \u21c4 button swaps it)")
     ap.add_argument("--no-hotkey", action="store_true",
                     help="disable the Ctrl + Left-Windows listen/sleep toggle")
     ap.add_argument("--open-vocab", action="store_true",
@@ -809,7 +829,7 @@ def main() -> None:
     root = tk.Tk()
     root.withdraw()
     screen = primary_screen()
-    pill = StatusPill(root, screen)
+    pill = StatusPill(root, screen, side=args.side)
     overlay = Overlay(root, screen)
     ctl = Controller(screen, WinMouse(), overlay, on_state=pill.set, keyboard=WinKeyboard())
     if args.start_awake:
