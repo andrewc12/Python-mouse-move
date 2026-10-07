@@ -215,3 +215,25 @@ for how in ("voice", "toggle"):
 c, m, o = make(); say(c, "start listening"); o.visible = True; c.mark = (1, 1)
 c._set(SLEEPING); assert not o.visible and c.mark is None
 print("sleep clears grid ok")
+
+# bare page up / page down
+def PG(text):
+    out = parse_commands(text)
+    assert len(out) == 1 and isinstance(out[0], KeyPress), (text, out)
+    return [(c.mods, c.key, c.count) for c in out[0].chords]
+assert PG("page down") == [((), "pagedown", 1)]
+assert PG("page up") == [((), "pageup", 1)]
+assert PG("page down five") == [((), "pagedown", 5)]
+assert PG("page up twenty five times") == [((), "pageup", 25)]
+assert PG("page down nine hundred ninety nine") == [((), "pagedown", MAX_REPEAT)]
+assert parse_commands("page down two page up one") == [KeyPress((Chord((), "pagedown", 2),)), KeyPress((Chord((), "pageup", 1),))]
+assert parse_commands("page") == [] and parse_commands("page banana") == []
+assert PG("press page down three") == [((), "pagedown", 3)]               # old form still works
+assert parse_commands("scroll down five page down")[1] == KeyPress((Chord((), "pagedown", 1),))
+mix = parse_commands("mouse grid five click page down ten")
+assert mix[:3] == ["grid", "5", "left"] and mix[3] == KeyPress((Chord((), "pagedown", 10),))
+kb = FakeKb(); m, o = FakeMouse(), FakeOverlay()
+c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb)
+say(c, "page down three"); assert kb.log == []                              # asleep: ignored
+say(c, "start listening page down three page up"); assert kb.log == [((), "pagedown", 3), ((), "pageup", 1)]
+print("page keys ok")

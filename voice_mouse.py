@@ -29,6 +29,9 @@ Keyboard (awake, or inside the grid)
   letters: say the letter ("a", "bee", "see"...) or NATO words ("alpha", "bravo", ...)
   other keys: enter return tab escape space backspace delete insert home end up down left
               right period comma slash backslash dash equals semicolon
+Page keys (no "press" needed; go to the window with keyboard focus)
+  "page down" / "page up"              one page
+  "page down five [times]"             N pages, e.g. "page up twenty"
 Scrolling (awake, or inside the grid; scrolls whatever window is under the cursor)
   "scroll down" / "scroll up"          default 5 notches
   "scroll down twenty [times]"         N notches (also "scroll left" / "scroll right")
@@ -275,6 +278,16 @@ def parse_commands(text: str) -> list:
                 out.append(Scroll(direction, amount))
             else:
                 i += 1
+            continue
+        if words[i] == "page" and words[i + 1:i + 2] in (["up"], ["down"]):
+            key, i = "page" + words[i + 1], i + 2           # bare "page down [N] [times]"
+            count = 1
+            num = parse_number(words, i)
+            if num:
+                count, i = min(num[0], MAX_REPEAT), num[1]
+                if i < len(words) and words[i] == "times":
+                    i += 1
+            out.append(KeyPress((Chord((), key, count),)))
             continue
         if words[i] == "press":
             chords, i = _parse_press(words, i + 1)
