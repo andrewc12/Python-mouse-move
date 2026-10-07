@@ -190,3 +190,15 @@ ls, lq, ll, lf = (level_from_pcm(x) for x in (silence, quiet, loud, full))
 assert ls == 0 and 0 < lq < ll < lf <= 1.0, (ls, lq, ll, lf)
 assert level_from_pcm(b"") == 0 and level_from_pcm(b"\x01") == 0
 print("meter ok", round(lq, 2), round(ll, 2), round(lf, 2))
+
+# move mouse (no click)
+assert parse_commands("move mouse") == ["move"] and parse_commands("five move") == ["5", "move"]
+c, m, o = make(); say(c, "start listening mouse grid nine five move mouse")
+assert m.log[-1] == ("move", 1706, 960) or m.log[-1][0] == "move", m.log
+assert not any(x[0] in ("click", "drag") for x in m.log) and c.state == AWAKE and not o.visible
+c, m, o = make(); say(c, "start listening move mouse")           # outside the grid: ignored
+assert m.log == [] and c.state == AWAKE
+c, m, o = make(); say(c, "start listening mouse grid one mark five move mouse")
+assert c.mark is None and not any(x[0] in ("click", "drag") for x in m.log)
+assert "move mouse" in COMMAND_GRAMMAR
+print("move ok")

@@ -12,6 +12,8 @@ In grid  : "one" ... "nine"              -> zoom into that cell (cursor moves to
            "mark"                        -> remember this spot as a drag start, restart grid
            "left click" / "right click"  -> click at the aimed spot (or drag from the mark)
            "double click"                -> double-click at the aimed spot
+           "move mouse"                  -> put the cursor at the aimed spot and leave the grid,
+                                            without clicking
            "cancel"                      -> leave the grid (and forget any mark)
 
 Keyboard (awake, or inside the grid)
@@ -70,6 +72,8 @@ PHRASES = {
     ("start", "listening"): "start",
     ("stop", "listening"): "stop",
     ("mouse", "grid"): "grid",
+    ("move", "mouse"): "move",
+    ("move",): "move",          # bare word: Vosk sometimes drops "mouse"
     ("left", "click"): "left",
     ("right", "click"): "right",
     ("double", "click"): "double",
@@ -135,7 +139,7 @@ _KEY_WORDS = (set(SPOKEN_KEYS) | set(LETTER_WORDS) | set(MODIFIERS) | set(UNITS)
 
 WAKE_GRAMMAR = ["start listening", "[unk]"]
 COMMAND_GRAMMAR = list(dict.fromkeys(
-    ["stop listening", "mouse grid", "click", "left click", "right click", "double click",
+    ["stop listening", "mouse grid", "move mouse", "click", "left click", "right click", "double click",
      "mark", "back", "cancel", "start listening"]
     + list(NUMBER_WORDS) + sorted(_KEY_WORDS) + ["[unk]"]
 ))
@@ -414,6 +418,12 @@ class Controller:
             else:
                 self.mouse.click("left" if cmd == "double" else cmd, double=(cmd == "double"))
             self._leave_grid(AWAKE)
+        elif cmd == "move":
+            target = self.nav.current.center
+            self.overlay.hide()
+            self.mouse.move(*target)
+            print(f"moved mouse to {target}")
+            self._leave_grid(AWAKE)         # no click; any pending mark is dropped
         elif cmd == "cancel":
             self._leave_grid(AWAKE)
         elif cmd == "stop":
