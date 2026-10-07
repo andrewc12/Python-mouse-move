@@ -63,6 +63,9 @@ PHRASES = {
     ("left", "click"): "left",
     ("right", "click"): "right",
     ("double", "click"): "double",
+    ("left",): "left",          # bare words: Vosk sometimes drops "click"
+    ("right",): "right",        # (arrow keys always need "press" first)
+    ("double",): "double",
     ("mark",): "mark",
     ("back",): "back",
     ("cancel",): "cancel",
@@ -116,7 +119,7 @@ EXTENDED_KEYS = {"delete", "insert", "home", "end", "pageup", "pagedown",
                  "left", "up", "right", "down", "win"}
 
 _KEY_WORDS = (set(SPOKEN_KEYS) | set(LETTER_WORDS) | set(MODIFIERS) | set(UNITS) | set(TENS)
-              | {"press", "times", "function", "page", "hundred"})
+              | {"press", "times", "function", "page", "hundred", "click"})
 
 WAKE_GRAMMAR = ["start listening", "[unk]"]
 COMMAND_GRAMMAR = list(dict.fromkeys(
@@ -355,6 +358,7 @@ class Controller:
             self.overlay.hide()          # make sure the overlay never eats the click
             time.sleep(0.08)
             self.mouse.move(*target)
+            print(f"{cmd} click at {target}" + (f" (drag from {self.mark})" if self.mark and cmd != "double" else ""))
             if self.mark and cmd != "double":
                 self.mouse.drag(cmd, self.mark, target)
             else:
@@ -472,6 +476,7 @@ class Overlay:
 
     def hide(self) -> None:
         self.win.withdraw()
+        self.win.update()        # process the unmap now; Tk would otherwise defer it until idle
 
     def show(self, r: Region, mark: tuple[int, int] | None) -> None:
         c, s = self.canvas, self.screen
