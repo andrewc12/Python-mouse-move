@@ -136,3 +136,7 @@ say(c, "press down nine hundred ninety nine")
 assert kb.log[-1] == ((), "down", MAX_REPEAT), kb.log[-1]
 
 print("all tests passed")
+
+c, m, o = make(); say(c, "start listening mouse grid five click")
+assert m.log[-1] == ("click", "left", False) and c.state == AWAKE
+print("plain click ok")

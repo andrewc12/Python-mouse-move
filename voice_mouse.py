@@ -63,6 +63,7 @@ PHRASES = {
     ("left", "click"): "left",
     ("right", "click"): "right",
     ("double", "click"): "double",
+    ("click",): "left",         # plain "click" = left click
     ("left",): "left",          # bare words: Vosk sometimes drops "click"
     ("right",): "right",        # (arrow keys always need "press" first)
     ("double",): "double",
@@ -123,7 +124,7 @@ _KEY_WORDS = (set(SPOKEN_KEYS) | set(LETTER_WORDS) | set(MODIFIERS) | set(UNITS)
 
 WAKE_GRAMMAR = ["start listening", "[unk]"]
 COMMAND_GRAMMAR = list(dict.fromkeys(
-    ["stop listening", "mouse grid", "left click", "right click", "double click",
+    ["stop listening", "mouse grid", "click", "left click", "right click", "double click",
      "mark", "back", "cancel", "start listening"]
     + list(NUMBER_WORDS) + sorted(_KEY_WORDS) + ["[unk]"]
 ))
