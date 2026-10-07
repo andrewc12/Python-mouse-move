@@ -27,6 +27,10 @@ Keyboard (awake, or inside the grid)
   letters: say the letter ("a", "bee", "see"...) or NATO words ("alpha", "bravo", ...)
   other keys: enter return tab escape space backspace delete insert home end up down left
               right period comma slash backslash dash equals semicolon
+Scrolling (awake, or inside the grid; scrolls whatever window is under the cursor)
+  "scroll down" / "scroll up"          default 5 notches
+  "scroll down twenty [times]"         N notches (also "scroll left" / "scroll right")
+  "scroll down ten scroll up two"      chainable
 Everything can be chained in one breath: "mouse grid five one left click press hello" style.
 
 Run:  python voice_mouse.py            (downloads the ~40 MB model on first run)
@@ -72,7 +76,8 @@ PHRASES = {
     ("cancel",): "cancel",
 }
 
-MAX_REPEAT = 500          # safety cap for "press down <N>"
+MAX_REPEAT = 500          # safety cap for "press down <N>" / "scroll down <N>"
+SCROLL_DEFAULT = 5        # notches for a bare "scroll down"
 
 # ---- keyboard vocabulary ---------------------------------------------------
 UNITS = {w: i for i, w in enumerate(
@@ -120,7 +125,7 @@ EXTENDED_KEYS = {"delete", "insert", "home", "end", "pageup", "pagedown",
                  "left", "up", "right", "down", "win"}
 
 _KEY_WORDS = (set(SPOKEN_KEYS) | set(LETTER_WORDS) | set(MODIFIERS) | set(UNITS) | set(TENS)
-              | {"press", "times", "function", "page", "hundred", "click"})
+              | {"press", "times", "function", "page", "hundred", "click", "scroll"})
 
 WAKE_GRAMMAR = ["start listening", "[unk]"]
 COMMAND_GRAMMAR = list(dict.fromkeys(
@@ -143,6 +148,12 @@ class Chord:
 @dataclass(frozen=True)
 class KeyPress:
     chords: tuple[Chord, ...]
+
+
+@dataclass(frozen=True)
+class Scroll:
+    direction: str      # up / down / left / right
+    amount: int
 
 
 def parse_number(words: list[str], i: int):
@@ -226,6 +237,19 @@ def parse_commands(text: str) -> list:
     out: list = []
     i = 0
     while i < len(words):
+        if words[i] == "scroll":
+            if i + 1 < len(words) and words[i + 1] in ("up", "down", "left", "right"):
+                direction, i = words[i + 1], i + 2
+                amount = SCROLL_DEFAULT
+                num = parse_number(words, i)
+                if num:
+                    amount, i = min(num[0], MAX_REPEAT), num[1]
+                    if i < len(words) and words[i] == "times":
+                        i += 1
+                out.append(Scroll(direction, amount))
+            else:
+                i += 1
+            continue
         if words[i] == "press":
             chords, i = _parse_press(words, i + 1)
             if chords:
@@ -317,6 +341,11 @@ class Controller:
         self._set(new_state)
 
     def handle(self, cmd) -> None:
+        if isinstance(cmd, Scroll):
+            if self.state != SLEEPING:
+                self.mouse.scroll(cmd.direction, cmd.amount)
+            return
+
         if isinstance(cmd, KeyPress):
             if self.state != SLEEPING and self.keyboard:
                 for ch in cmd.chords:
@@ -410,6 +439,15 @@ class WinMouse:
             self.u.mouse_event(down, 0, 0, 0, 0)
             self.u.mouse_event(up, 0, 0, 0, 0)
             time.sleep(0.05)
+
+    def scroll(self, direction: str, amount: int) -> None:
+        """One wheel notch (120 units) per step, at the current cursor position."""
+        flag = 0x0800 if direction in ("up", "down") else 0x1000        # WHEEL / HWHEEL
+        delta = 120 if direction in ("up", "right") else -120
+        for _ in range(amount):
+            self.u.mouse_event(flag, 0, 0, delta, 0)
+            time.sleep(0.01)
+        print(f"scroll {direction} x{amount}")
 
     def drag(self, button: str, start: tuple[int, int], end: tuple[int, int]) -> None:
         down, up = self._flags(button)

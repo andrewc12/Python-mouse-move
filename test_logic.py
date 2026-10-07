@@ -6,6 +6,7 @@ class FakeMouse:
     def move(self, x, y): self.log.append(("move", x, y))
     def click(self, b, double=False): self.log.append(("click", b, double))
     def drag(self, b, a, c): self.log.append(("drag", b, a, c))
+    def scroll(self, d, n): self.log.append(("scroll", d, n))
 
 
 class FakeOverlay:
@@ -140,3 +141,18 @@ print("all tests passed")
 c, m, o = make(); say(c, "start listening mouse grid five click")
 assert m.log[-1] == ("click", "left", False) and c.state == AWAKE
 print("plain click ok")
+
+# scrolling
+assert parse_commands("scroll down") == [Scroll("down", SCROLL_DEFAULT)]
+assert parse_commands("scroll down twenty") == [Scroll("down", 20)]
+assert parse_commands("scroll up twenty five times") == [Scroll("up", 25)]
+assert parse_commands("scroll down ten scroll up two") == [Scroll("down", 10), Scroll("up", 2)]
+assert parse_commands("scroll left three") == [Scroll("left", 3)]
+assert parse_commands("scroll") == [] and parse_commands("scroll banana") == []
+assert parse_commands("scroll down nine hundred ninety nine") == [Scroll("down", MAX_REPEAT)]
+assert parse_commands("press down scroll down five click")[1:] == [Scroll("down", 5), "left"]
+assert "scroll" in COMMAND_GRAMMAR
+c, m, o = make(); say(c, "scroll down"); assert m.log == []                 # asleep: ignored
+say(c, "start listening scroll down ten mouse grid five scroll up three")
+assert m.log[0] == ("scroll", "down", 10) and m.log[-1] == ("scroll", "up", 3) and c.state == GRID
+print("scroll ok")
