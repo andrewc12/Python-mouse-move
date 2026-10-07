@@ -202,3 +202,16 @@ c, m, o = make(); say(c, "start listening mouse grid one mark five move mouse")
 assert c.mark is None and not any(x[0] in ("click", "drag") for x in m.log)
 assert "move mouse" in COMMAND_GRAMMAR
 print("move ok")
+
+# going to sleep from anywhere clears the grid, zoom levels and mark
+for how in ("voice", "toggle"):
+    c, m, o = make(); say(c, "start listening mouse grid five one mark five")
+    assert c.state == GRID and o.visible and c.mark and len(c.nav.stack) > 1
+    c.handle("stop")                                    # same call the hotkey / box click make
+    assert c.state == SLEEPING and not o.visible and c.mark is None and c.nav.stack == [c.nav.bounds]
+    say(c, "nine left click"); assert not any(x[0] == "click" for x in m.log)   # nothing left to act on
+    say(c, "start listening mouse grid"); assert c.nav.current == c.nav.bounds and o.mark is None
+# forced sleep while the overlay is somehow still showing
+c, m, o = make(); say(c, "start listening"); o.visible = True; c.mark = (1, 1)
+c._set(SLEEPING); assert not o.visible and c.mark is None
+print("sleep clears grid ok")

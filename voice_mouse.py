@@ -353,6 +353,12 @@ class Controller:
         self.mark: tuple[int, int] | None = None
 
     def _set(self, state: str) -> None:
+        if state == SLEEPING:
+            # However we got here (voice, hotkey, status-box click), drop everything in flight:
+            # the grid overlay, any zoom levels and any pending drag mark.
+            self.overlay.hide()
+            self.mark = None
+            self.nav.reset()
         self.state = state
         self.on_state(state)
 
