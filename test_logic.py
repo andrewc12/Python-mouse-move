@@ -156,3 +156,26 @@ c, m, o = make(); say(c, "scroll down"); assert m.log == []                 # as
 say(c, "start listening scroll down ten mouse grid five scroll up three")
 assert m.log[0] == ("scroll", "down", 10) and m.log[-1] == ("scroll", "up", 3) and c.state == GRID
 print("scroll ok")
+
+# hotkey (Ctrl + Left Win, clean tap only)
+class Keys:
+    def __init__(self): self.down = set(); self.masks = 0
+    def is_down(self, vk): return vk in self.down
+    def mask(self): self.masks += 1
+k = Keys(); w = HotkeyWatcher(k.is_down, k.mask)
+assert w.poll() is False
+k.down |= {0x11}; assert w.poll() is False                       # ctrl alone: nothing
+k.down |= {0x5B}; assert w.poll() is False and k.masks == 1      # chord begins, Start masked
+assert w.poll() is False and k.masks == 1
+k.down -= {0x5B}; assert w.poll() is True                        # released: fires once
+k.down -= {0x11}; assert w.poll() is False
+# Ctrl+Win+Right (virtual desktop switch) must not fire
+k.down |= {0x11, 0x5B}; w.poll(); k.down |= {0x27}; w.poll()
+k.down -= {0x27, 0x5B}; assert w.poll() is False
+k.down -= {0x11}; assert w.poll() is False
+# right ctrl variant reports as 0x11 too; ctrl-only taps never fire
+k.down |= {0x11}; w.poll(); k.down -= {0x11}; assert w.poll() is False
+# Win then Ctrl order also works
+k.down |= {0x5B}; w.poll(); k.down |= {0x11}; w.poll(); k.down -= {0x11, 0x5B}
+assert w.poll() is True
+print("hotkey ok")

@@ -33,6 +33,11 @@ Scrolling (awake, or inside the grid; scrolls whatever window is under the curso
   "scroll down ten scroll up two"      chainable
 Everything can be chained in one breath: "mouse grid five one left click press hello" style.
 
+Hotkey (no voice needed): tap Ctrl + Left-Windows together, then let go. It toggles between
+sleeping and listening (and leaves the grid). A high beep = now listening, low beep = sleeping.
+Ctrl+Win combined with any other key (e.g. virtual-desktop switching) is left alone.
+Disable with --no-hotkey.
+
 Run:  python voice_mouse.py            (downloads the ~40 MB model on first run)
       python voice_mouse.py --list-devices
 """
@@ -494,6 +499,52 @@ class WinKeyboard:
             print(f"pressed {'+'.join(mods)}+{key}" + (f" x{count}" if count > 1 else ""))
 
 
+class HotkeyWatcher:
+    """Detects a clean Ctrl + Left-Win tap (no other key pressed during it).
+
+    Polled from the UI loop. `is_down(vk)` and `mask()` are injected so the logic is testable.
+    `mask()` taps an unassigned key while Win is held so Windows doesn't open the Start menu
+    when Win is released.
+    """
+    CTRL, LWIN = (0x11,), 0x5B
+    IGNORE = {0x11, 0xA2, 0xA3, 0x5B, 0xE8}          # ctrl variants, left win, our mask key
+
+    def __init__(self, is_down, mask):
+        self.is_down, self.mask = is_down, mask
+        self.active = False
+        self.dirty = False
+
+    def poll(self) -> bool:
+        """True exactly once when a clean Ctrl+LWin chord has just been released."""
+        if self.is_down(0x11) and self.is_down(self.LWIN):
+            if not self.active:
+                self.active, self.dirty = True, False
+                self.mask()
+            elif not self.dirty:
+                self.dirty = any(self.is_down(vk) for vk in range(0x08, 0xFF)
+                                 if vk not in self.IGNORE)
+            return False
+        if self.active:
+            fired = not self.dirty
+            self.active = False
+            return fired
+        return False
+
+
+def make_win_hotkey() -> HotkeyWatcher:
+    import ctypes
+    u = ctypes.windll.user32
+
+    def is_down(vk: int) -> bool:
+        return bool(u.GetAsyncKeyState(vk) & 0x8000)
+
+    def mask() -> None:
+        u.keybd_event(0xE8, 0, 0, 0)
+        u.keybd_event(0xE8, 0, 0x0002, 0)
+
+    return HotkeyWatcher(is_down, mask)
+
+
 def make_click_through(widget) -> None:
     """Layered + transparent + no-activate so the window never takes focus or clicks."""
     import ctypes
@@ -663,6 +714,8 @@ def main() -> None:
     ap.add_argument("--min-conf", type=float, default=0.6,
                     help="ignore results below this average word confidence (default 0.6)")
     ap.add_argument("--start-awake", action="store_true")
+    ap.add_argument("--no-hotkey", action="store_true",
+                    help="disable the Ctrl + Left-Windows listen/sleep toggle")
     ap.add_argument("--open-vocab", action="store_true",
                     help="don't restrict awake-mode recognition to the command words; use this if "
                          "multi-word chains are being cut short (more false triggers, though)")
@@ -711,6 +764,25 @@ def main() -> None:
         root.after(30, poll)
 
     root.after(30, poll)
+
+    if not args.no_hotkey:
+        import winsound
+        watcher = make_win_hotkey()
+
+        def hotkey_poll():
+            try:
+                if watcher.poll():
+                    ctl.handle("start" if ctl.state == SLEEPING else "stop")
+                    awake = ctl.state != SLEEPING
+                    print("hotkey: listening" if awake else "hotkey: sleeping")
+                    threading.Thread(target=winsound.Beep, args=(1000 if awake else 500, 90),
+                                     daemon=True).start()
+            except Exception as e:
+                print(f"hotkey error: {e}")
+            root.after(20, hotkey_poll)
+
+        root.after(20, hotkey_poll)
+        print("Hotkey: tap Ctrl + Left Windows to toggle listening.")
     try:
         root.mainloop()
     except KeyboardInterrupt:
