@@ -1080,7 +1080,8 @@ class StatusPill:
         # so the click does not also reach the toplevel binding that toggles listening.
         self.mover = tk.Label(self.frame, text="\u21c4", font=("Segoe UI Symbol", 12, "bold"),
                               fg="white", padx=0, pady=0)
-        self.mover.grid(row=0, column=3, padx=P, pady=P)
+        # The arrow glyph sits above the middle of its text box, so nudge the box down to centre it.
+        self.mover.grid(row=0, column=3, padx=P, pady=(P + 3, P - 3))
         self.mover.bind("<Button-1>", self._flip_click)
         self.bar = self.meter.create_rectangle(0, 0, 0, self.METER_H, width=0, fill="#34c759")
         self.screen = screen
