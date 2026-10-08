@@ -18,7 +18,7 @@ In grid  : "one" ... "nine"              -> zoom into that cell (cursor moves to
                                             without clicking
            "cancel"                      -> leave the grid (and forget any mark)
 
-Keyboard (awake, or inside the grid)
+Keyboard (awake only; ignored while the mouse grid is open)
 ------------------------------------
   "press tab"                        one key
   "press down down enter"            keys one after another
@@ -661,8 +661,9 @@ SLEEPING, AWAKE, GRID = "sleeping", "awake", "grid"
 ALLOWED: dict[str, set] = {
     SLEEPING: {"start"},
     AWAKE: {"stop", "grid", "left", "right", "double", "press", "scroll"},
+    # No "press": key presses (and page up/down) are ignored while the grid is open.
     GRID: {"stop", "grid", "back", "mark", "cancel", "move", "left", "right", "double",
-           "press", "scroll", *[str(n) for n in range(1, 10)]},
+           "scroll", *[str(n) for n in range(1, 10)]},
 }
 
 
@@ -747,6 +748,8 @@ class Controller:
         # five" opens the grid (allowed while AWAKE) and only then uses the digit (allowed in GRID).
         token = command_token(cmd)
         if token not in ALLOWED[self.state]:
+            if token == "press" and self.state == GRID:
+                print("key presses are ignored while the mouse grid is open")
             return
 
         if isinstance(cmd, Scroll):

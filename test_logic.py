@@ -125,14 +125,17 @@ for w in list(SPOKEN_KEYS.values()) + list(LETTER_WORDS.values()) + list(MODIFIE
 assert "f12" in VK and "pagedown" in VK and "9" in VK
 assert all(w in COMMAND_GRAMMAR for w in ("press", "times", "twenty", "function", "page", "left", "bravo"))
 
-# controller: keys ignored while asleep, work awake and in grid, cap on repeats
+# controller: keys ignored while asleep and while the grid is open; work when awake; cap on repeats
 kb = FakeKb(); m, o = FakeMouse(), FakeOverlay()
 c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb)
 say(c, "press tab"); assert kb.log == []
 say(c, "start listening press control c press down twenty")
 assert kb.log == [(("ctrl",), "c", 1), ((), "down", 20)], kb.log
-say(c, "mouse grid press tab")
-assert c.state == GRID and kb.log[-1] == ((), "tab", 1) and o.visible
+n_before = len(kb.log)
+say(c, "mouse grid press tab")                        # no key presses while the mouse grid is open
+assert c.state == GRID and len(kb.log) == n_before and o.visible
+say(c, "page down five function five"); assert len(kb.log) == n_before      # page keys are keys too
+say(c, "cancel"); assert c.state == AWAKE
 say(c, "press down nine hundred ninety nine")
 assert kb.log[-1] == ((), "down", MAX_REPEAT), kb.log[-1]
 
@@ -387,9 +390,13 @@ assert V("mouse grid stop listening mouse grid", AWAKE) is None   # asleep after
 for good in ("press tab", "press down down enter", "press down twenty", "press control shift escape",
              "press control c control v", "press function five", "press one two three", "press windows",
              "scroll down", "scroll left three times", "page up twenty five", "press alpha bravo see"):
-    assert V(good, AWAKE) is not None and V(good, GRID) is not None, good
-assert V("press down left click", GRID) == [KeyPress((Chord((), "down", 1),)), "left"]
-assert V("press left click", GRID) is None                        # ambiguous: nothing was pressed
+    assert V(good, AWAKE) is not None, good
+    if good.startswith("press") or good.startswith("page"):
+        assert V(good, GRID) is None, good                 # key presses are off while the grid is open
+    else:
+        assert V(good, GRID) is not None, good             # scrolling still works there
+assert V("press down left click", AWAKE) == [KeyPress((Chord((), "down", 1),)), "left"]
+assert V("press left click", AWAKE) is None                        # ambiguous: nothing was pressed
 # lenient parse is unchanged for existing callers
 assert parse_commands("mouse grid delta five") == ["grid", "5"] and parse_commands("page delta") == []
 
@@ -491,7 +498,7 @@ assert P("press back tick") == [((), "backtick", 1)] and P("press tilde") == [((
 # incomplete / wrong phrases press nothing, and the old words still behave
 assert parse_commands("press question") == []                       # nothing pressed
 assert parse_commands("press back") == ["back"] and parse_commands("press mark") == ["mark"]   # leftover grid words
-assert validate("press back", GRID) is None and validate("press mark", GRID) is None             # strict: rejected
+assert validate("press back", AWAKE) is None and validate("press mark", AWAKE) is None             # strict: rejected
 assert parse_commands("press space") == [KeyPress((Chord((), "space", 1),))]
 assert parse_commands("press left click") == ["left"]                              # click still wins
 assert parse_commands("press down left arrow") == [KeyPress((Chord((), "down", 1), Chord((), "left", 1)))]
@@ -501,7 +508,7 @@ for phrase, (mods, key) in SYMBOL_KEYS.items():
 # the whole utterance must be valid; stray words reject it
 for ok in ("press back space", "press question mark", "press shift question mark", "press left arrow ten",
            "press open paren a close paren enter", "press control back space"):
-    assert V(ok, AWAKE) is not None and V(ok, GRID) is not None and V(ok, SLEEPING) is None, ok
+    assert V(ok, AWAKE) is not None and V(ok, GRID) is None and V(ok, SLEEPING) is None, ok
 for bad in ("press question", "press question delta", "press back", "question mark", "back space",
             "press mark question mark"):
     assert V(bad, AWAKE) is None, bad
@@ -520,3 +527,26 @@ say(c, "press question mark"); assert kb.log == []                              
 say(c, "start listening press back space press question mark three")
 assert kb.log == [((), "backspace", 1), (("shift",), "slash", 3)], kb.log
 print("multi-word keys ok", len(AWAKE_SENTENCES), len(GRID_SENTENCES))
+
+
+# ================= no key presses while the mouse grid is open =================
+assert "press" not in ALLOWED[GRID] and "press" in ALLOWED[AWAKE] and "scroll" in ALLOWED[GRID]
+for key_cmd in ("press tab", "press question mark", "press back space", "page down", "page up three",
+                "press control c", "press function five"):
+    assert V(key_cmd, GRID) is None and V(key_cmd, AWAKE) is not None, key_cmd
+    assert V("mouse grid " + key_cmd, AWAKE) is None, key_cmd         # not even in the same breath
+    assert V("mouse grid five cancel " + key_cmd, AWAKE) is not None, key_cmd   # fine once it is closed
+    assert V("five click " + key_cmd, GRID) is not None, key_cmd     # ...or after a click closes it
+    assert V("five move mouse " + key_cmd, GRID) is not None, key_cmd
+assert V("mouse grid scroll down five", AWAKE) is not None            # scrolling is still allowed
+c, m, o = make(); kb = FakeKb(); c.keyboard = kb
+say(c, "start listening mouse grid five")
+for ignored in ("press tab", "page down", "press question mark three", "press control c"):
+    say(c, ignored)
+assert kb.log == [] and c.state == GRID and o.visible               # nothing pressed, grid untouched
+say(c, "five left click press tab")                                  # a click closes the grid first
+assert c.state == AWAKE and kb.log == [((), "tab", 1)]
+c, m, o = make(); c.keyboard = kb = FakeKb()
+say(c, "start listening mouse grid press tab cancel press tab")      # only the post-cancel press runs
+assert kb.log == [((), "tab", 1)] and c.state == AWAKE
+print("no key presses in grid ok")
