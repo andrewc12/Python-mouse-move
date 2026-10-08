@@ -1075,7 +1075,7 @@ class StatusPill:
         self.canvas = tk.Canvas(self.win, highlightthickness=0, cursor="hand2")
         self.canvas.pack()
         self.f_label = tkfont.Font(family="Segoe UI", size=10, weight="bold")
-        self.f_heard = tkfont.Font(family="Consolas", size=9)
+        self.f_heard = tkfont.Font(family="Calibri", size=10)   # proportional cousin of Consolas (same designer)
         self.f_arrow = tkfont.Font(family="Segoe UI Symbol", size=12, weight="bold")
         self.screen = screen
         self.level = 0.0
