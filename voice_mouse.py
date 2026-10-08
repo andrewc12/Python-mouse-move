@@ -37,7 +37,7 @@ Keyboard (awake only; ignored while the mouse grid is open)
               "open/close bracket", "open/close brace", "open/close paren", "underscore", "hyphen",
               "plus", "asterisk", "at sign", "hash", "dollar sign", "percent", "caret", "ampersand",
               "tilde", "back tick", "pipe", "less than", "greater than"  (US/Australian layout)
-Page keys (no "press" needed; go to the window with keyboard focus)
+Page keys (no "press" needed; go to the window with keyboard focus; ignored in the grid)
   "page down" / "page up"              one page
   "page down five [times]"             N pages, e.g. "page up twenty"
 Scrolling (awake, or inside the grid; scrolls whatever window is under the cursor)
@@ -661,9 +661,8 @@ SLEEPING, AWAKE, GRID = "sleeping", "awake", "grid"
 ALLOWED: dict[str, set] = {
     SLEEPING: {"start"},
     AWAKE: {"stop", "grid", "left", "right", "double", "press", "scroll"},
-    # No "press": key presses (and page up/down) are ignored while the grid is open.
     GRID: {"stop", "grid", "back", "mark", "cancel", "move", "left", "right", "double",
-           "scroll", *[str(n) for n in range(1, 10)]},
+           "scroll", *[str(n) for n in range(1, 10)]},      # no "press": no key presses in the grid
 }
 
 
@@ -749,7 +748,8 @@ class Controller:
         token = command_token(cmd)
         if token not in ALLOWED[self.state]:
             if token == "press" and self.state == GRID:
-                print("key presses are ignored while the mouse grid is open")
+                print("ignored: key presses are off while the mouse grid is open "
+                      "(click, move mouse or cancel first)")
             return
 
         if isinstance(cmd, Scroll):
@@ -996,13 +996,7 @@ class Overlay:
     def show(self, r: Region, mark: tuple[int, int] | None) -> None:
         c, s = self.canvas, self.screen
         c.delete("all")
-        # dim everything outside the active region
-        dim = dict(fill="black", stipple="gray50", outline="")
-        c.create_rectangle(0, 0, s.w, r.y, **dim)
-        c.create_rectangle(0, r.y + r.h, s.w, s.h, **dim)
-        c.create_rectangle(0, r.y, r.x, r.y + r.h, **dim)
-        c.create_rectangle(r.x + r.w, r.y, s.w, r.y + r.h, **dim)
-        # grid
+        # grid (the rest of the screen is left undimmed)
         c.create_rectangle(r.x, r.y, r.x + r.w, r.y + r.h, outline="#ff2d2d", width=3)
         for i in (1, 2):
             c.create_line(r.x + r.w * i / 3, r.y, r.x + r.w * i / 3, r.y + r.h, fill="#ff2d2d", width=2)
