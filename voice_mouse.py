@@ -1231,7 +1231,11 @@ class StatusPill:
 def ensure_model(path: str | None) -> str:
     if path:
         return path
-    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+    # Next to the program. Compiled (Nuitka/PyInstaller) builds may unpack __file__ into a temp
+    # folder, so use the real executable's folder there or the model would re-download every run.
+    frozen = "__compiled__" in globals() or getattr(sys, "frozen", False)
+    here = os.path.dirname(os.path.abspath(sys.argv[0] if frozen else __file__))
+    base = os.path.join(here, "models")
     target = os.path.join(base, MODEL_NAME)
     if os.path.isdir(target):
         return target
