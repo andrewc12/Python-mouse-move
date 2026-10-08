@@ -1069,20 +1069,21 @@ class StatusPill:
         # and button line up: state + hint | last heard | meter | move button.
         # (Plain padx/pady of 0 on the labels themselves; spacing comes from the grid only.)
         self.label = tk.Label(self.frame, font=("Segoe UI", 10, "bold"), fg="white", padx=0, pady=0)
-        self.label.grid(row=0, column=0, padx=(P + 2, 0), pady=P, sticky="w")
+        self.label.grid(row=0, column=0, padx=(P + 2, 0), pady=P, sticky="ns")
         # Last heard phrase (filled in by set_heard; hidden while empty).
         self.heard = tk.Label(self.frame, font=("Consolas", 9), fg="white", padx=0, pady=0)
-        self.heard.grid(row=0, column=1, padx=(P, 0), pady=P)
+        self.heard.grid(row=0, column=1, padx=(P, 0), pady=P, sticky="ns")
         self.meter = tk.Canvas(self.frame, width=self.METER_W, height=self.METER_H,
                                bg="#1b1b1b", highlightthickness=0)
-        self.meter.grid(row=0, column=2, padx=(P, 0), pady=P)
+        self.meter.grid(row=0, column=2, padx=(P, 0), pady=P)     # fixed size, centred (not stretched)
         # Move handle: cycles the box through the four screen corners. Its handler returns "break"
         # so the click does not also reach the toplevel binding that toggles listening.
         self.mover = tk.Label(self.frame, text="\u21c4", font=("Segoe UI Symbol", 12, "bold"),
                               fg="white", padx=0, pady=0)
         # The arrow glyph sits above the middle of its text box, so nudge the box down to centre it.
-        self.mover.grid(row=0, column=3, padx=P, pady=(P + 3, P - 3))
+        self.mover.grid(row=0, column=3, padx=P, pady=(P + 3, P - 3), sticky="ns")
         self.mover.bind("<Button-1>", self._flip_click)
+        self.frame.grid_rowconfigure(0, weight=1)         # every item is centred in the same row
         self.bar = self.meter.create_rectangle(0, 0, 0, self.METER_H, width=0, fill="#34c759")
         self.screen = screen
         self.level = 0.0
