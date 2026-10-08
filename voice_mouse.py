@@ -606,6 +606,35 @@ def parse_commands(text, min_word_conf: float = 0.0, strict: bool = False):
     return out
 
 
+def leading_digits(text: str) -> list[int]:
+    """The run of grid-number words at the start of a (partial) transcript: 'five two' -> [5, 2]."""
+    out = []
+    for w in text.split():
+        if w not in NUMBER_WORDS:
+            break
+        out.append(NUMBER_WORDS[w])
+    return out
+
+
+def stable_prefix(a: list, b: list) -> list:
+    """Common prefix of two lists (what two successive partial results agree on)."""
+    out = []
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        out.append(x)
+    return out
+
+
+def drop_applied_digits(cmds: list, n: int) -> list:
+    """Remove the first `n` leading digit commands (already sent early, from partial results)."""
+    out = list(cmds)
+    while n and out and isinstance(out[0], str) and out[0].isdigit():
+        out.pop(0)
+        n -= 1
+    return out
+
+
 @dataclass(frozen=True)
 class Region:
     x: float
@@ -1128,7 +1157,8 @@ class SpeechThread(threading.Thread):
     ("page delta" is rejected; a lower-ranked "page down" alternative is used if --nbest has one)."""
 
     def __init__(self, model_path, device, min_conf, get_state, out_queue, open_vocab=False,
-                 word_conf=0.0, nbest=0, log_path=None, lenient=False, flat_grammar=False):
+                 word_conf=0.0, nbest=0, log_path=None, lenient=False, flat_grammar=False,
+                 early_digits=True):
         super().__init__(daemon=True)
         self.model_path, self.device, self.min_conf = model_path, device, min_conf
         self.open_vocab = open_vocab
@@ -1137,6 +1167,7 @@ class SpeechThread(threading.Thread):
         self.log_path = log_path      # if set, append each recognition (JSONL) here for analysis
         self.lenient = lenient        # True = old behaviour: skip stray words instead of rejecting
         self.flat_grammar = flat_grammar   # True = old flat word list instead of the BNF sentences
+        self.early_digits = early_digits   # in the grid, zoom on each number as soon as it is stable
         self.level = 0.0         # latest mic loudness, 0..1, read by the UI for the meter
         self.last_heard = ""     # last recognised phrase + confidence summary, read by the UI
         self.get_state, self.out = get_state, out_queue
@@ -1274,6 +1305,7 @@ class SpeechThread(threading.Thread):
                                                           else f"{len(awake_g)}/{len(grid_g)} sentences")
         print(f"Recognisers ready in {time.time() - t0:.1f}s (grammar: {kind})")
         last_state = SLEEPING
+        early, prev_digits = 0, []     # grid numbers already sent from partials; last partial's run
 
         def cb(indata, frames, t, status):
             data = bytes(indata)
@@ -1298,10 +1330,12 @@ class SpeechThread(threading.Thread):
                     if state != last_state:               # state flipped: drop stale audio
                         recs[state].Reset()
                         last_state = state
+                        early, prev_digits = 0, []
                     rec = recs[state]
                     if rec.AcceptWaveform(data):
                         hyps = self._hypotheses(json.loads(rec.Result()))
                         text, _, words = hyps[0]
+                        sent, early, prev_digits = early, 0, []
                         if not text:
                             continue
                         # With --nbest, prefer the highest-ranked alternative that is a valid
@@ -1316,8 +1350,19 @@ class SpeechThread(threading.Thread):
                         if cwords and not self._confident(cwords):
                             continue
                         self._report(hyps, chosen, accepted=bool(cmds))
+                        if sent and cmds:             # those leading numbers have already been acted on
+                            cmds = drop_applied_digits(cmds, sent)
                         for cmd in cmds or ():
                             self.out.put(cmd)
+                    elif state == GRID and self.early_digits:
+                        # Mid-utterance: zoom as soon as a spoken number is stable (unchanged between
+                        # two successive partials), instead of waiting for the whole sequence to end.
+                        part = json.loads(rec.PartialResult()).get("partial", "")
+                        digits = leading_digits(part)
+                        for d in stable_prefix(prev_digits, digits)[early:]:
+                            self.out.put(str(d))
+                            early += 1
+                        prev_digits = digits
         finally:
             if log is not None:
                 log.close()
@@ -1351,6 +1396,9 @@ def main() -> None:
                     help="use the plain word list as the recogniser vocabulary instead of the "
                          "generated BNF sentences (fallback if start-up is slow or recognition is "
                          "worse); the strict grammar check still applies")
+    ap.add_argument("--no-early-digits", action="store_true",
+                    help="in the grid, wait for the end of the whole utterance before zooming "
+                         "(default: zoom on each number as soon as it is recognised)")
     ap.add_argument("--start-awake", action="store_true")
     ap.add_argument("--corner", choices=StatusPill.CORNERS, default="bottom-right",
                     help="screen corner the status box starts in (the arrow button cycles through all four)")
@@ -1390,7 +1438,8 @@ def main() -> None:
 
     cmds: queue.Queue[str] = queue.Queue()
     speech = SpeechThread(model_path, args.device, args.min_conf, lambda: ctl.state, cmds,
-                          args.open_vocab, args.word_conf, args.nbest, log_path, args.lenient, args.flat_grammar)
+                          args.open_vocab, args.word_conf, args.nbest, log_path, args.lenient, args.flat_grammar,
+                          early_digits=not args.no_early_digits)
     speech.start()
 
     def meter_poll():

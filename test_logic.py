@@ -550,3 +550,13 @@ c, m, o = make(); c.keyboard = kb = FakeKb()
 say(c, "start listening mouse grid press tab cancel press tab")      # only the post-cancel press runs
 assert kb.log == [((), "tab", 1)] and c.state == AWAKE
 print("no key presses in grid ok")
+
+
+# ================= early zoom on numbers from partial results =================
+assert leading_digits("five two") == [5, 2] and leading_digits("five left") == [5]
+assert leading_digits("left five") == [] and leading_digits("") == []
+assert stable_prefix([5, 2], [5, 3, 1]) == [5] and stable_prefix([], [5]) == [] and stable_prefix([5], [5]) == [5]
+assert drop_applied_digits(["5", "2", "left"], 2) == ["left"]
+assert drop_applied_digits(["5", "2", "left"], 1) == ["2", "left"]
+assert drop_applied_digits(["left"], 2) == ["left"]
+print("early digits ok")
