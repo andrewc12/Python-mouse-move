@@ -1050,6 +1050,7 @@ class StatusPill:
               AWAKE: ("#1e8e3e", "Listening - \"mouse grid\" or \"press ...\""),
               GRID: ("#c5221f", "Grid - say 1-9, back, mark, cancel")}
     METER_W, METER_H = 90, 10
+    HINT_SECONDS = 6          # how long the "say ..." hint stays beside the state name
 
     CORNERS = ("bottom-right", "bottom-left", "top-left", "top-right")   # order the button cycles
 
@@ -1086,6 +1087,7 @@ class StatusPill:
         self.win.bind("<Button-1>", self._clicked)
         for w in (self.win, self.frame, self.label, self.meter, self.mover):
             w.config(cursor="hand2")
+        self._hint_job = None
         self.set(SLEEPING)
         make_click_through(self.win, clickable=True)   # takes clicks but never steals focus
 
@@ -1112,9 +1114,18 @@ class StatusPill:
     def set(self, state: str) -> None:
         colour, text = self.COLORS[state]
         self.label.config(text=text, bg=colour)
+        if self._hint_job is not None:                      # restart the hint timer on every change
+            self.win.after_cancel(self._hint_job)
+        self._hint_job = self.win.after(int(self.HINT_SECONDS * 1000), self._hide_hint, state)
         self.heard.config(bg=colour)
         self.mover.config(bg=colour)
         self.frame.config(bg=colour)
+        self._place()
+
+    def _hide_hint(self, state: str) -> None:
+        """Shrink 'Listening - "mouse grid" or ...' to just 'Listening' once it has been read."""
+        self._hint_job = None
+        self.label.config(text=self.COLORS[state][1].split(" - ")[0])
         self._place()
 
     def set_heard(self, text: str) -> None:
@@ -1243,11 +1254,7 @@ class SpeechThread(threading.Thread):
             print("        (top guess was not a valid command here; using the chosen alternative)")
         # The status-pill summary reflects what we actually applied.
         ctext, _, cwords = hyps[chosen]
-        cconfs = [float(w.get("conf", 1.0)) for w in cwords]
-        if cconfs:
-            self.last_heard = f"{ctext}  \u00b7  avg {sum(cconfs)/len(cconfs):.2f}  min {min(cconfs):.2f}"
-        else:
-            self.last_heard = ctext
+        self.last_heard = ctext                    # just the phrase; avg/min stay in the console
         if not accepted and ctext:
             self.last_heard = "\u2717 " + self.last_heard          # shows a rejected phrase
 

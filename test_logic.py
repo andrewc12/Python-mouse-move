@@ -298,7 +298,7 @@ h = st._hypotheses(plain)
 assert h == [("grid five", None, plain["result"])]
 st._report(h)
 assert st.last_heard.startswith("grid five")            # shown in the status pill
-assert "avg 0.65" in st.last_heard and "min 0.40" in st.last_heard
+assert st.last_heard == "grid five"                       # pill shows only the phrase, no avg/min
 
 # Alternatives shape (--nbest): each entry carries text, a raw score, and its own words.
 nbest = {"alternatives": [
