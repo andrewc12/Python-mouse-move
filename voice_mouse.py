@@ -608,7 +608,7 @@ def parse_commands(text, min_word_conf: float = 0.0, strict: bool = False):
 
 def is_noise(text: str) -> bool:
     """True for an empty result or one made only of [unk] markers (Vosk's 'heard something, no word')."""
-    return all(w == "[unk]" for w in text.split())
+    return not text.replace("[unk]", "").strip()
 
 
 def leading_digits(text: str) -> list[int]:
