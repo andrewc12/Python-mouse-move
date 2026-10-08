@@ -606,6 +606,11 @@ def parse_commands(text, min_word_conf: float = 0.0, strict: bool = False):
     return out
 
 
+def is_noise(text: str) -> bool:
+    """True for an empty result or one made only of [unk] markers (Vosk's 'heard something, no word')."""
+    return all(w == "[unk]" for w in text.split())
+
+
 def leading_digits(text: str) -> list[int]:
     """The run of grid-number words at the start of a (partial) transcript: 'five two' -> [5, 2]."""
     out = []
@@ -1411,7 +1416,7 @@ class SpeechThread(threading.Thread):
                         hyps = self._hypotheses(json.loads(rec.Result()))
                         text, _, words = hyps[0]
                         sent, early, prev_digits = early, 0, []
-                        if not text:
+                        if is_noise(text):            # "", " " or only [unk]: not worth logging or showing
                             continue
                         # With --nbest, prefer the highest-ranked alternative that is a valid
                         # utterance in this state (so "page delta" loses to "page down").

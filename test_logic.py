@@ -560,3 +560,7 @@ assert drop_applied_digits(["5", "2", "left"], 2) == ["left"]
 assert drop_applied_digits(["5", "2", "left"], 1) == ["2", "left"]
 assert drop_applied_digits(["left"], 2) == ["left"]
 print("early digits ok")
+
+assert is_noise("") and is_noise("  ") and is_noise("[unk]") and is_noise("[unk] [unk]")
+assert not is_noise("left") and not is_noise("[unk] left")
+print("noise filter ok")
