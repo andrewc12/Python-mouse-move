@@ -1088,6 +1088,8 @@ class StatusPill:
         for w in (self.win, self.frame, self.label, self.meter, self.mover):
             w.config(cursor="hand2")
         self._hint_job = None
+        self._heard_job = None
+        self._heard_seq = -1
         self.set(SLEEPING)
         make_click_through(self.win, clickable=True)   # takes clicks but never steals focus
 
@@ -1128,11 +1130,25 @@ class StatusPill:
         self.label.config(text=self.COLORS[state][1].split(" - ")[0])
         self._place()
 
-    def set_heard(self, text: str) -> None:
-        """Show the last recognised phrase and its confidences (called from the UI poll loop)."""
+    def set_heard(self, text: str, seq: int = 0) -> None:
+        """Show the last recognised phrase for a few seconds. `seq` changes with every new recognition
+        (so a repeated phrase refreshes the timer); the UI poll loop calls this constantly."""
+        if seq == self._heard_seq:                      # nothing new since the last poll
+            return
+        self._heard_seq = seq
+        if self._heard_job is not None:
+            self.win.after_cancel(self._heard_job)
+            self._heard_job = None
         if self.heard.cget("text") != text:
             self.heard.config(text=text)
             self._place()
+        if text:                                        # fade out after HINT_SECONDS, like the hint
+            self._heard_job = self.win.after(int(self.HINT_SECONDS * 1000), self._clear_heard)
+
+    def _clear_heard(self) -> None:
+        self._heard_job = None
+        self.heard.config(text="")
+        self._place()
 
     def set_level(self, v: float) -> None:
         """Fast attack, slow decay so short words are visible."""
@@ -1180,7 +1196,8 @@ class SpeechThread(threading.Thread):
         self.flat_grammar = flat_grammar   # True = old flat word list instead of the BNF sentences
         self.early_digits = early_digits   # in the grid, zoom on each number as soon as it is stable
         self.level = 0.0         # latest mic loudness, 0..1, read by the UI for the meter
-        self.last_heard = ""     # last recognised phrase + confidence summary, read by the UI
+        self.last_heard = ""     # last recognised phrase, read by the UI
+        self.heard_seq = 0       # bumped on each recognition so the UI can tell repeats apart
         self.get_state, self.out = get_state, out_queue
         self.audio: queue.Queue[bytes] = queue.Queue()
 
@@ -1254,6 +1271,7 @@ class SpeechThread(threading.Thread):
             print("        (top guess was not a valid command here; using the chosen alternative)")
         # The status-pill summary reflects what we actually applied.
         ctext, _, cwords = hyps[chosen]
+        self.heard_seq += 1
         self.last_heard = ctext                    # just the phrase; avg/min stay in the console
         if not accepted and ctext:
             self.last_heard = "\u2717 " + self.last_heard          # shows a rejected phrase
@@ -1451,7 +1469,7 @@ def main() -> None:
 
     def meter_poll():
         pill.set_level(speech.level)
-        pill.set_heard(speech.last_heard)
+        pill.set_heard(speech.last_heard, speech.heard_seq)
         root.after(40, meter_poll)
 
     root.after(40, meter_poll)
