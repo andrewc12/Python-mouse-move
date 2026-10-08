@@ -463,3 +463,60 @@ assert l1["valid"] is True and "valid" not in l2
 t._report(none_ok, 0, accepted=False); assert t.last_heard.startswith("✗ page delta")
 t._report(alts, 2, accepted=True); assert t.last_heard.startswith("page down")
 print("strict grammar check ok")
+
+
+
+# ================= multi-word keys and punctuation =================
+assert P("press back space") == [((), "backspace", 1)] == P("press backspace")
+assert P("press question mark") == [(("shift",), "slash", 1)]
+assert P("press exclamation mark") == [(("shift",), "1", 1)] == P("press exclamation point")
+assert P("press shift question mark") == [(("shift",), "slash", 1)]                # no duplicate Shift
+assert P("press control back space") == [(("ctrl",), "backspace", 1)]
+assert P("press back space five") == [((), "backspace", 5)]                      # repeat count works
+assert P("press question mark three") == [(("shift",), "slash", 3)]
+assert P("press tab question mark enter") == [((), "tab", 1), (("shift",), "slash", 1), ((), "enter", 1)]
+assert P("press left arrow twenty") == [((), "left", 20)] and P("press alt left arrow") == [(("alt",), "left", 1)]
+assert P("press space bar") == [((), "space", 1)] and P("press caps lock") == [((), "capslock", 1)]
+assert P("press print screen") == [((), "printscreen", 1)]
+assert P("press colon") == [(("shift",), "semicolon", 1)] and P("press apostrophe") == [((), "quote", 1)]
+assert P("press quote") == [(("shift",), "quote", 1)] == P("press double quote")
+assert P("press single quote") == [((), "quote", 1)]
+assert P("press open bracket close bracket") == [((), "lbracket", 1), ((), "rbracket", 1)]
+assert P("press open paren a close paren") == [(("shift",), "9", 1), ((), "a", 1), (("shift",), "0", 1)]
+assert P("press at sign") == [(("shift",), "2", 1)] and P("press dollar sign") == [(("shift",), "4", 1)]
+assert P("press hash") == [(("shift",), "3", 1)] == P("press pound")
+assert P("press underscore") == [(("shift",), "dash", 1)] and P("press plus") == [(("shift",), "equals", 1)]
+assert P("press less than greater than") == [(("shift",), "comma", 1), (("shift",), "period", 1)]
+assert P("press back tick") == [((), "backtick", 1)] and P("press tilde") == [(("shift",), "backtick", 1)]
+# incomplete / wrong phrases press nothing, and the old words still behave
+assert parse_commands("press question") == []                       # nothing pressed
+assert parse_commands("press back") == ["back"] and parse_commands("press mark") == ["mark"]   # leftover grid words
+assert validate("press back", GRID) is None and validate("press mark", GRID) is None             # strict: rejected
+assert parse_commands("press space") == [KeyPress((Chord((), "space", 1),))]
+assert parse_commands("press left click") == ["left"]                              # click still wins
+assert parse_commands("press down left arrow") == [KeyPress((Chord((), "down", 1), Chord((), "left", 1)))]
+# every key and modifier a phrase produces is something WinKeyboard can send
+for phrase, (mods, key) in SYMBOL_KEYS.items():
+    assert key in VK and all(m in VK for m in mods), phrase
+# the whole utterance must be valid; stray words reject it
+for ok in ("press back space", "press question mark", "press shift question mark", "press left arrow ten",
+           "press open paren a close paren enter", "press control back space"):
+    assert V(ok, AWAKE) is not None and V(ok, GRID) is not None and V(ok, SLEEPING) is None, ok
+for bad in ("press question", "press question delta", "press back", "question mark", "back space",
+            "press mark question mark"):
+    assert V(bad, AWAKE) is None, bad
+assert V("mouse grid five click press question mark", AWAKE) is not None
+# the recogniser is taught that "question" is followed only by "mark" and "exclamation" by mark/point
+for sents in (AWAKE_SENTENCES, GRID_SENTENCES):
+    assert _after_in(sents, "question") == {"mark"}, _after_in(sents, "question")
+    assert _after_in(sents, "exclamation") == {"mark", "point"}
+    assert _after_in(sents, "caps") == {"lock"} and _after_in(sents, "print") == {"screen"}
+    assert _after_in(sents, "back") >= {"space", "tick"}
+    assert {"question", "exclamation", "caps"} <= {w for s in sents for w in s.split()}
+# the controller hands the keyboard the shifted chord, only when awake / in the grid
+kb = FakeKb(); m, o = FakeMouse(), FakeOverlay()
+c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb)
+say(c, "press question mark"); assert kb.log == []                                    # asleep
+say(c, "start listening press back space press question mark three")
+assert kb.log == [((), "backspace", 1), (("shift",), "slash", 3)], kb.log
+print("multi-word keys ok", len(AWAKE_SENTENCES), len(GRID_SENTENCES))

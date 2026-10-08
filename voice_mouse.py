@@ -31,6 +31,12 @@ Keyboard (awake, or inside the grid)
   letters: say the letter ("a", "bee", "see"...) or NATO words ("alpha", "bravo", ...)
   other keys: enter return tab escape space backspace delete insert home end up down left
               right period comma slash backslash dash equals semicolon
+  multi-word keys: "back space" (or "backspace"), "space bar", "caps lock", "print screen",
+              "left arrow" / "right arrow" / "up arrow" / "down arrow"
+  punctuation: "question mark", "exclamation mark", "colon", "quote", "single quote", "apostrophe",
+              "open/close bracket", "open/close brace", "open/close paren", "underscore", "hyphen",
+              "plus", "asterisk", "at sign", "hash", "dollar sign", "percent", "caret", "ampersand",
+              "tilde", "back tick", "pipe", "less than", "greater than"  (US/Australian layout)
 Page keys (no "press" needed; go to the window with keyboard focus)
   "page down" / "page up"              one page
   "page down five [times]"             N pages, e.g. "page up twenty"
@@ -144,13 +150,43 @@ VK.update({
     "pagedown": 0x22, "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
     "period": 0xBE, "comma": 0xBC, "slash": 0xBF, "backslash": 0xDC, "dash": 0xBD,
     "equals": 0xBB, "semicolon": 0xBA,
+    "lbracket": 0xDB, "rbracket": 0xDD, "quote": 0xDE, "backtick": 0xC0,
+    "capslock": 0x14, "printscreen": 0x2C,
     "ctrl": 0x11, "alt": 0x12, "shift": 0x10, "win": 0x5B,
 })
 EXTENDED_KEYS = {"delete", "insert", "home", "end", "pageup", "pagedown",
-                 "left", "up", "right", "down", "win"}
+                 "left", "up", "right", "down", "win", "printscreen"}
+
+# Multi-word and punctuation key names: spoken phrase -> (extra modifiers, key). Symbols that need
+# Shift are Shift + the key that carries them on a US layout (the Australian layout is the same).
+# Vosk often hears "backspace" as "back space", so both work.
+SYMBOL_KEYS: dict[tuple[str, ...], tuple[tuple[str, ...], str]] = {
+    ("back", "space"): ((), "backspace"), ("space", "bar"): ((), "space"),
+    ("caps", "lock"): ((), "capslock"), ("print", "screen"): ((), "printscreen"),
+    ("left", "arrow"): ((), "left"), ("right", "arrow"): ((), "right"),
+    ("up", "arrow"): ((), "up"), ("down", "arrow"): ((), "down"),
+    ("question", "mark"): (("shift",), "slash"),
+    ("exclamation", "mark"): (("shift",), "1"), ("exclamation", "point"): (("shift",), "1"),
+    ("colon",): (("shift",), "semicolon"),
+    ("quote",): (("shift",), "quote"), ("double", "quote"): (("shift",), "quote"),
+    ("single", "quote"): ((), "quote"), ("apostrophe",): ((), "quote"),
+    ("open", "bracket"): ((), "lbracket"), ("close", "bracket"): ((), "rbracket"),
+    ("open", "brace"): (("shift",), "lbracket"), ("close", "brace"): (("shift",), "rbracket"),
+    ("open", "paren"): (("shift",), "9"), ("close", "paren"): (("shift",), "0"),
+    ("open", "parenthesis"): (("shift",), "9"), ("close", "parenthesis"): (("shift",), "0"),
+    ("underscore",): (("shift",), "dash"), ("hyphen",): ((), "dash"), ("plus",): (("shift",), "equals"),
+    ("asterisk",): (("shift",), "8"), ("at", "sign"): (("shift",), "2"),
+    ("hash",): (("shift",), "3"), ("pound",): (("shift",), "3"),
+    ("dollar", "sign"): (("shift",), "4"), ("percent",): (("shift",), "5"),
+    ("caret",): (("shift",), "6"), ("ampersand",): (("shift",), "7"),
+    ("tilde",): (("shift",), "backtick"), ("back", "tick"): ((), "backtick"),
+    ("pipe",): (("shift",), "backslash"),
+    ("less", "than"): (("shift",), "comma"), ("greater", "than"): (("shift",), "period"),
+}
 
 _KEY_WORDS = (set(SPOKEN_KEYS) | set(LETTER_WORDS) | set(MODIFIERS) | set(UNITS) | set(TENS)
-              | {"press", "times", "function", "page", "hundred", "click", "scroll"})
+              | {"press", "times", "function", "page", "hundred", "click", "scroll"}
+              | {w for phrase in SYMBOL_KEYS for w in phrase})
 
 WAKE_GRAMMAR = ["start listening", "[unk]"]
 # Flat word list: only used by tests / as a reference; recognition uses the generated sentences below.
@@ -180,7 +216,7 @@ COMMAND_GRAMMAR = list(dict.fromkeys(
 #              | "press" (modifier* key | modifier+) [count] ...   (repeated)
 #   count     := number ["times"]
 #   key       := letter | NATO word | named key | "page" (up|down) | "function" number | digit
-GRAMMAR_REPEAT = 4          # each covering sentence is repeated this often (stronger constraint)
+GRAMMAR_REPEAT = 2          # each covering sentence is repeated this often (stronger constraint)
 GRAMMAR_MAX_LEN = 16        # words per generated sentence
 
 
@@ -247,7 +283,8 @@ def build_command_grammar(mode: str = "any") -> _G:
     mods = _words(MODIFIERS)
     key = _alt(_words(set(LETTER_WORDS) | set(SPOKEN_KEYS) | set(digit_words)),
                _seq(_W("page"), _words(["up", "down"])),
-               _seq(_W("function"), _words(units19 + ["ten", "eleven", "twelve"])))
+               _seq(_W("function"), _words(units19 + ["ten", "eleven", "twelve"])),
+               *[_phrase(" ".join(k)) for k in SYMBOL_KEYS])
     key_item = _alt(_seq(_opt(_plus(mods)), key), _plus(mods))
     press = _seq(_W("press"), _plus(_seq(key_item, _opt(count))))
     page = _seq(_W("page"), _words(["up", "down"]), _opt(count))
@@ -271,7 +308,8 @@ def build_command_grammar(mode: str = "any") -> _G:
 _CLICKS = ["left click", "right click", "double click", "click"]
 _COMMON_EXAMPLES = ["mouse grid", "page down", "page up", "scroll down", "scroll up",
                     "page down five", "scroll down ten times", "press tab", "press enter",
-                    "press control c", "press down twenty", "stop listening"] + _CLICKS
+                    "press control c", "press down twenty", "press back space", "press question mark",
+                    "press left arrow", "stop listening"] + _CLICKS
 BASE_EXAMPLES = _COMMON_EXAMPLES + ["move mouse", "mark", "back", "cancel", "start listening"] + list(NUMBER_WORDS)
 GRID_BASE_EXAMPLES = [e for e in BASE_EXAMPLES if e != "start listening"]
 AWAKE_BASE_EXAMPLES = list(_COMMON_EXAMPLES)
@@ -434,6 +472,15 @@ def _parse_key(words: list[str], i: int):
     return None
 
 
+def _parse_symbol(words: list[str], i: int):
+    """Longest multi-word / punctuation key name at words[i]: (mods, key, next_i) or None."""
+    for n in (3, 2, 1):
+        hit = SYMBOL_KEYS.get(tuple(words[i:i + n]))
+        if len(words[i:i + n]) == n and hit:
+            return hit[0], hit[1], i + n
+    return None
+
+
 def _parse_press(words: list[str], i: int, strict: bool = False):
     """Parse everything after 'press'. Returns (list[Chord], next_i)."""
     n = len(words)
@@ -467,6 +514,12 @@ def _parse_press(words: list[str], i: int, strict: bool = False):
             else:
                 break
         else:
+            sym = _parse_symbol(words, i)
+            if sym:                 # "question mark", "back space", "left arrow" ...
+                smods, name, i = sym
+                chords.append(Chord(tuple(dict.fromkeys([*mods, *smods])), name))
+                mods, countable = [], True
+                continue
             key = _parse_key(words, i)
             if not key:
                 break
