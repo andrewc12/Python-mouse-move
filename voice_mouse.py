@@ -1096,14 +1096,25 @@ class StatusPill:
         make_click_through(self.win, clickable=True)   # takes clicks but never steals focus
 
     # ---- drawing -----------------------------------------------------------
-    def _text_y(self, font) -> float:
-        """y for anchor='w' text so that its visual middle lands on the shared centre line."""
+    def _em_px(self, font) -> float:
+        size = font.cget("size")
+        return abs(size) if size < 0 else size * self.win.winfo_fpixels("1i") / 72.0
+
+    def _baseline(self) -> float:
+        """The one baseline shared by the state text and the heard phrase, chosen so the state
+        text's visual middle sits on the centre line. (Centring each font separately put the
+        monospace phrase about a pixel higher than the state text.)"""
+        return self._text_y(self.f_label) + (self.f_label.metrics("ascent")
+                                             - self.f_label.metrics("linespace") / 2.0)
+
+    def _text_y(self, font, baseline: float | None = None) -> float:
+        """y for anchor='w' text. With `baseline`, the text's baseline lands exactly there;
+        without it, its visual middle lands on the centre line (used for the arrow glyph)."""
         m = font.metrics()
-        em = font.cget("size")
-        em = abs(em) if em < 0 else em * self.win.winfo_fpixels("1i") / 72.0   # font size in px
-        box_mid = m["linespace"] / 2.0
-        visual_mid = m["ascent"] - self.VISUAL_MID * em
-        return self.cy + (box_mid - visual_mid)
+        if baseline is not None:
+            return baseline - (m["ascent"] - m["linespace"] / 2.0)
+        visual_mid = m["ascent"] - self.VISUAL_MID * self._em_px(font)
+        return self.cy + (m["linespace"] / 2.0 - visual_mid)
 
     def _draw(self) -> None:
         P, c = self.PAD, self.canvas
@@ -1120,12 +1131,13 @@ class StatusPill:
                  + P + self.METER_W + P + arrow_w + P)
         c.config(width=int(width), height=int(height), bg=colour)
         self.cy = height / 2.0
-        c.create_text(x, self._text_y(self.f_label), text=self.label_text, anchor="w",
+        base = self._baseline()
+        c.create_text(x, self._text_y(self.f_label, base), text=self.label_text, anchor="w",
                       font=self.f_label, fill="white")
         x += label_w
         if heard_w:
             x += P
-            c.create_text(x, self._text_y(self.f_heard), text=self.heard_text, anchor="w",
+            c.create_text(x, self._text_y(self.f_heard, base), text=self.heard_text, anchor="w",
                           font=self.f_heard, fill="white")
             x += heard_w
         x += P
