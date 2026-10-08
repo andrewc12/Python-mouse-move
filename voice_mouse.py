@@ -7,6 +7,8 @@ Voice commands
 Asleep   : "start listening"             -> wake up (only phrase heard while asleep)
 Awake    : "stop listening"              -> go back to sleep
            "mouse grid"                  -> open the 3x3 grid over the whole screen
+           "left click" / "right click"  -> click at the current cursor position (no grid needed)
+           "double click"                -> double-click at the current cursor position
 In grid  : "one" ... "nine"              -> zoom into that cell (cursor moves to its centre)
            "back"                        -> undo the last zoom
            "mark"                        -> remember this spot as a drag start, restart grid
@@ -45,12 +47,20 @@ Disable with --no-hotkey.
 You can also click the status box in the bottom-right corner to toggle listening; its \u21c4
 button moves the box round the four screen corners (start somewhere else with --corner top-left).
 
+How recognition is kept tidy (the "page delta" problem): (1) the recogniser's vocabulary comes from
+the BNF-style grammar in this file, with a separate grammar per state (asleep / awake / grid);
+(2) every result is then checked strictly against the same rules and ignored unless it is a
+complete, well-ordered command for the current state ("page" only before up/down, a count only
+after a key, grid words only in the grid ...); (3) with --nbest the best-ranked alternative that
+passes the check wins. --lenient restores the old skip-stray-words behaviour.
+
 Run:  python voice_mouse.py            (downloads the ~40 MB model on first run)
       python voice_mouse.py --list-devices
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import math
 import os
@@ -143,11 +153,217 @@ _KEY_WORDS = (set(SPOKEN_KEYS) | set(LETTER_WORDS) | set(MODIFIERS) | set(UNITS)
               | {"press", "times", "function", "page", "hundred", "click", "scroll"})
 
 WAKE_GRAMMAR = ["start listening", "[unk]"]
+# Flat word list: only used by tests / as a reference; recognition uses the generated sentences below.
 COMMAND_GRAMMAR = list(dict.fromkeys(
     ["stop listening", "mouse grid", "move mouse", "click", "left click", "right click", "double click",
      "mark", "back", "cancel", "start listening"]
     + list(NUMBER_WORDS) + sorted(_KEY_WORDS) + ["[unk]"]
 ))
+
+# ---- the command grammar ------------------------------------------------------------------
+# Vosk does not take a real grammar. As I read recognizer.cc (not testable here), the list you give it becomes a *bigram*
+# language model (ngram_order = 2, discount = 0.5): it only learns "which word may follow which
+# word", counted from the phrases supplied. Handing it loose single words therefore teaches it
+# nothing about order, which is how "page" ended up followed by "delta".
+#
+# So we write the grammar once, BNF-style, below, work out every legal word->word transition
+# (the "bigrams") and emit enough example sentences to cover every legal pair, several times
+# each. Pairs that are not legal ("page" -> "delta") never appear, so they only get the small
+# back-off probability. Constraints are therefore strong but soft, and only one word deep.
+#
+#   utterance := command+
+#   command   := "start listening" | "stop listening" | "mouse grid" | "move mouse"   (per state: see build_command_grammar)
+#              | "left click" | "right click" | "double click" | "click" | mark | back | cancel
+#              | one..nine | left | right | double | move                  (bare forms, see parser)
+#              | "page" (up|down) [count]
+#              | "scroll" (up|down|left|right) [count]
+#              | "press" (modifier* key | modifier+) [count] ...   (repeated)
+#   count     := number ["times"]
+#   key       := letter | NATO word | named key | "page" (up|down) | "function" number | digit
+GRAMMAR_REPEAT = 4          # each covering sentence is repeated this often (stronger constraint)
+GRAMMAR_MAX_LEN = 16        # words per generated sentence
+
+
+class _G:
+    """Glushkov summary of a regular expression over words: enough to list every bigram."""
+    __slots__ = ("nullable", "first", "last", "pairs")
+
+    def __init__(self, nullable, first, last, pairs):
+        self.nullable, self.first, self.last, self.pairs = nullable, first, last, pairs
+
+
+def _W(w):
+    return _G(False, {w}, {w}, set())
+
+
+def _seq(*xs):
+    r = xs[0]
+    for b in xs[1:]:
+        a = r
+        r = _G(a.nullable and b.nullable,
+               a.first | (b.first if a.nullable else set()),
+               b.last | (a.last if b.nullable else set()),
+               a.pairs | b.pairs | {(x, y) for x in a.last for y in b.first})
+    return r
+
+
+def _alt(*xs):
+    return _G(any(x.nullable for x in xs), set().union(*(x.first for x in xs)),
+              set().union(*(x.last for x in xs)), set().union(*(x.pairs for x in xs)))
+
+
+def _opt(x):
+    return _G(True, x.first, x.last, x.pairs)
+
+
+def _plus(x):
+    return _G(x.nullable, x.first, x.last, x.pairs | {(l, f) for l in x.last for f in x.first})
+
+
+def _words(ws):
+    return _alt(*[_W(w) for w in ws])
+
+
+def _phrase(text):
+    return _seq(*[_W(w) for w in text.split()])
+
+
+def build_command_grammar(mode: str = "any") -> _G:
+    """The grammar as word-order rules, one per state.
+
+    mode "any"  : every command anywhere (state-blind).
+    mode "grid" : what can be said while the mouse grid is open.
+    mode "awake": what can be said when awake and NOT in the grid. Clicks, page, scroll, press and
+                  "mouse grid" start an utterance; the grid-only words (1-9, back, mark, cancel,
+                  move mouse) are legal only after "mouse grid" in the same breath.
+    It mirrors ALLOWED / next_state() below, and a test keeps the two in step.
+    """
+    units19 = [w for w, v in UNITS.items() if 1 <= v <= 9]
+    digit_words = [w for w, v in UNITS.items() if v < 10]
+    tens_part = _seq(_words(TENS), _opt(_words(units19)))
+    number = _alt(_words(UNITS), tens_part,
+                  _seq(_words(units19), _W("hundred"), _opt(_alt(_words(UNITS), tens_part))))
+    count = _seq(number, _opt(_W("times")))
+    mods = _words(MODIFIERS)
+    key = _alt(_words(set(LETTER_WORDS) | set(SPOKEN_KEYS) | set(digit_words)),
+               _seq(_W("page"), _words(["up", "down"])),
+               _seq(_W("function"), _words(units19 + ["ten", "eleven", "twelve"])))
+    key_item = _alt(_seq(_opt(_plus(mods)), key), _plus(mods))
+    press = _seq(_W("press"), _plus(_seq(key_item, _opt(count))))
+    page = _seq(_W("page"), _words(["up", "down"]), _opt(count))
+    scroll = _seq(_W("scroll"), _words(["up", "down", "left", "right"]), _opt(count))
+    clicks = _alt(*[_phrase(p) for p in ("left click", "right click", "double click")],
+                  _words(["click", "left", "right", "double"]))
+    grid_only = _alt(_phrase("move mouse"), _words(["move", "mark", "back", "cancel"] + list(NUMBER_WORDS)))
+    stop, mouse_grid = _phrase("stop listening"), _phrase("mouse grid")
+    common = [page, scroll, press, clicks, mouse_grid, stop]
+    if mode == "any":
+        return _plus(_alt(_phrase("start listening"), *common, grid_only))
+    if mode == "grid":
+        return _plus(_alt(*common, grid_only))
+    if mode == "awake":
+        in_grid = _alt(*common, grid_only)              # after "mouse grid" anything may follow
+        return _plus(_alt(page, scroll, press, clicks, stop,
+                          _seq(mouse_grid, _opt(_plus(in_grid)))))
+    raise ValueError(mode)
+
+
+_CLICKS = ["left click", "right click", "double click", "click"]
+_COMMON_EXAMPLES = ["mouse grid", "page down", "page up", "scroll down", "scroll up",
+                    "page down five", "scroll down ten times", "press tab", "press enter",
+                    "press control c", "press down twenty", "stop listening"] + _CLICKS
+BASE_EXAMPLES = _COMMON_EXAMPLES + ["move mouse", "mark", "back", "cancel", "start listening"] + list(NUMBER_WORDS)
+GRID_BASE_EXAMPLES = [e for e in BASE_EXAMPLES if e != "start listening"]
+AWAKE_BASE_EXAMPLES = list(_COMMON_EXAMPLES)
+
+
+def grammar_sentences(g: _G, repeat: int = GRAMMAR_REPEAT, max_len: int = GRAMMAR_MAX_LEN,
+                      base=None) -> list[str]:
+    """Example sentences covering every legal word pair of `g` (plus start/end), repeated."""
+    from collections import deque
+    START, END = "<s>", "</s>"
+    adj: dict[str, list[str]] = {}
+    for a, b in g.pairs:
+        adj.setdefault(a, []).append(b)
+    for f in g.first:
+        adj.setdefault(START, []).append(f)
+    for l in g.last:
+        adj.setdefault(l, []).append(END)
+    for k in adj:
+        adj[k].sort()
+    unc = {a: set(bs) for a, bs in adj.items()}
+
+    parent = {START: None}                               # shortest path START -> node
+    q = deque([START])
+    while q:
+        n = q.popleft()
+        for m in adj.get(n, ()):
+            if m != END and m not in parent:
+                parent[m] = n
+                q.append(m)
+    radj: dict[str, list[str]] = {}
+    for a, bs in adj.items():
+        for b in bs:
+            radj.setdefault(b, []).append(a)
+    to_end = {END: None}                                 # next hop on the shortest path -> END
+    q = deque([END])
+    while q:
+        n = q.popleft()
+        for m in radj.get(n, ()):
+            if m not in to_end:
+                to_end[m] = n
+                q.append(m)
+
+    def cover(a, b):
+        unc[a].discard(b)
+
+    nodes = sorted(adj)
+    out: list[str] = []
+    while True:
+        n0 = next((n for n in nodes if unc[n]), None)
+        if n0 is None:
+            break
+        path, n = [], n0                                  # START ... n0
+        while parent[n] is not None:
+            path.append(n)
+            n = parent[n]
+        path.append(START)
+        path.reverse()                                    # [START, ..., n0]
+        for a, b in zip(path, path[1:]):
+            cover(a, b)
+        sent, cur = path[1:], n0
+        while len(sent) < max_len:
+            nxt = next((m for m in sorted(unc[cur]) if m != END), None)
+            if nxt is None:                               # hop to the most useful legal successor
+                best = max((m for m in adj[cur] if m != END), key=lambda m: len(unc[m]), default=None)
+                if best is None or not unc[best]:
+                    break
+                nxt = best
+            cover(cur, nxt)
+            sent.append(nxt)
+            cur = nxt
+        while cur != END:                                 # finish along the shortest legal ending
+            nxt = to_end[cur]
+            cover(cur, nxt)
+            if nxt != END:
+                sent.append(nxt)
+            cur = nxt
+        out.append(" ".join(sent))
+    base = BASE_EXAMPLES if base is None else base
+    return out * repeat + base * (repeat * 3) + ["[unk]"] * (repeat * 3)
+
+
+COMMAND_GRAMMAR_G = build_command_grammar()
+COMMAND_SENTENCES = grammar_sentences(COMMAND_GRAMMAR_G)
+# every word the command grammar uses (handy for tests)
+COMMAND_VOCAB = {w for sent in COMMAND_SENTENCES for w in sent.split()}
+
+# One recogniser per state, so e.g. "five" or "click" cannot even be heard while the grid is closed
+# (unless said right after "mouse grid"), and nothing but the wake phrase is heard while asleep.
+AWAKE_GRAMMAR_G = build_command_grammar("awake")
+GRID_GRAMMAR_G = build_command_grammar("grid")
+AWAKE_SENTENCES = grammar_sentences(AWAKE_GRAMMAR_G, base=AWAKE_BASE_EXAMPLES)
+GRID_SENTENCES = grammar_sentences(GRID_GRAMMAR_G, base=GRID_BASE_EXAMPLES)
 
 
 # --------------------------------------------------------------------------
@@ -218,7 +434,7 @@ def _parse_key(words: list[str], i: int):
     return None
 
 
-def _parse_press(words: list[str], i: int):
+def _parse_press(words: list[str], i: int, strict: bool = False):
     """Parse everything after 'press'. Returns (list[Chord], next_i)."""
     n = len(words)
     chords: list[Chord] = []
@@ -227,6 +443,8 @@ def _parse_press(words: list[str], i: int):
     while i < n:
         w = words[i]
         if w == "[unk]":
+            if strict:
+                break
             i += 1
         elif w in ("left", "right", "double") and words[i + 1:i + 2] == ["click"]:
             break               # a mouse click, not an arrow key
@@ -260,9 +478,29 @@ def _parse_press(words: list[str], i: int):
     return chords, i
 
 
-def parse_commands(text: str) -> list:
-    """Turn recognised text into commands: 'start', 'grid', '1'..'9', ... or KeyPress objects."""
-    words = text.lower().split()
+def parse_commands(text, min_word_conf: float = 0.0, strict: bool = False):
+    """Turn recognised words into commands: 'start', 'grid', '1'..'9', ... or KeyPress objects.
+
+    `text` may be the raw recognised string or Vosk's per-word result list
+    (``[{"word": ..., "conf": ...}, ...]``). Any word whose confidence is below
+    `min_word_conf` is dropped before parsing, so a single mis-heard word inside an
+    otherwise good phrase cannot fire a command. A plain string counts as fully
+    confident, which keeps callers (and tests) that pass text unchanged.
+
+    Lenient (default): words that fit nothing, or fall below the floor, are skipped.
+    strict=True: the WHOLE utterance must be well formed ("page" only before up/down, a count only
+    after a key, no leftover words, no word under the floor) or the result is None. A mis-heard
+    word then rejects the utterance instead of being silently dropped, because dropping can change
+    the meaning ("scroll down <twenty>" would become the default 5).
+    """
+    bad = False
+    if isinstance(text, str):
+        words = text.lower().split()
+    else:
+        items = list(text or [])
+        words = [str(w.get("word", "")).lower()
+                 for w in items if float(w.get("conf", 1.0)) >= min_word_conf]
+        bad = len(words) != len(items)
     out: list = []
     i = 0
     while i < len(words):
@@ -277,6 +515,7 @@ def parse_commands(text: str) -> list:
                         i += 1
                 out.append(Scroll(direction, amount))
             else:
+                bad = True
                 i += 1
             continue
         if words[i] == "page" and words[i + 1:i + 2] in (["up"], ["down"]):
@@ -290,9 +529,11 @@ def parse_commands(text: str) -> list:
             out.append(KeyPress((Chord((), key, count),)))
             continue
         if words[i] == "press":
-            chords, i = _parse_press(words, i + 1)
+            chords, i = _parse_press(words, i + 1, strict)
             if chords:
                 out.append(KeyPress(tuple(chords)))
+            else:
+                bad = True
             continue
         two = tuple(words[i:i + 2])
         if len(two) == 2 and two in PHRASES:
@@ -305,7 +546,10 @@ def parse_commands(text: str) -> list:
             out.append(str(NUMBER_WORDS[words[i]]))
             i += 1
         else:
+            bad = True
             i += 1   # [unk] or a stray word
+    if strict and (bad or not out):
+        return None
     return out
 
 
@@ -355,6 +599,58 @@ class GridNavigator:
 
 SLEEPING, AWAKE, GRID = "sleeping", "awake", "grid"
 
+# Which canonical commands have any effect in each state (keys are the canonical strings produced
+# by parse_commands; "press"/"scroll" stand for any KeyPress/Scroll object and the digits are the
+# grid cells). The controller consults this so "what is appropriate right now" lives in one place.
+# AWAKE and GRID share the same two-tier *grammar* in the speech thread (a single breath can cross
+# the boundary, e.g. "mouse grid five"), but they are listed separately here because these sets are
+# read in execution order, after the state has actually advanced.
+ALLOWED: dict[str, set] = {
+    SLEEPING: {"start"},
+    AWAKE: {"stop", "grid", "left", "right", "double", "press", "scroll"},
+    GRID: {"stop", "grid", "back", "mark", "cancel", "move", "left", "right", "double",
+           "press", "scroll", *[str(n) for n in range(1, 10)]},
+}
+
+
+def command_token(cmd) -> str:
+    """The ALLOWED key for a parsed command (KeyPress/Scroll collapse to 'press'/'scroll')."""
+    if isinstance(cmd, KeyPress):
+        return "press"
+    if isinstance(cmd, Scroll):
+        return "scroll"
+    return cmd
+
+
+def next_state(state: str, token: str) -> str:
+    """State after an (allowed) command; mirrors what Controller.handle does."""
+    if token == "stop":
+        return SLEEPING
+    if state == SLEEPING:
+        return AWAKE if token == "start" else state
+    if state == AWAKE:
+        return GRID if token == "grid" else state
+    return AWAKE if token in ("left", "right", "double", "move", "cancel") else state   # GRID
+
+
+def sequence_valid(cmds: list, state: str) -> bool:
+    """Can this command sequence be said starting in `state`? Uses ALLOWED and next_state, so
+    grid words only count inside the grid (or right after "mouse grid"), "start listening" only
+    when asleep, nothing but "start" while asleep, and so on."""
+    for c in cmds:
+        token = command_token(c)
+        if token not in ALLOWED[state]:
+            return False
+        state = next_state(state, token)
+    return True
+
+
+def validate(text, state: str, min_word_conf: float = 0.0):
+    """Commands for `text` (a string or Vosk's word list) if it is a complete, well-ordered
+    utterance in `state`; None if anything is stray, incomplete or out of place."""
+    cmds = parse_commands(text, min_word_conf=min_word_conf, strict=True)
+    return cmds if cmds and sequence_valid(cmds, state) else None
+
 
 class Controller:
     """State machine: SLEEPING <-> AWAKE <-> GRID. Talks to `mouse` and `overlay`."""
@@ -385,14 +681,27 @@ class Controller:
         self.nav.reset()
         self._set(new_state)
 
+    def _click_here(self, cmd: str) -> None:
+        """Click at the current cursor position (used while awake, with no grid open)."""
+        button = "left" if cmd == "double" else cmd
+        self.mouse.click(button, double=(cmd == "double"))
+        print(f"{cmd} click at cursor")
+
     def handle(self, cmd) -> None:
+        # One gate decides whether a command is appropriate right now (see ALLOWED); anything else
+        # is dropped here instead of silently by whichever branch happened to run. This is evaluated
+        # in execution order, so a single utterance can advance the state mid-breath: "mouse grid
+        # five" opens the grid (allowed while AWAKE) and only then uses the digit (allowed in GRID).
+        token = command_token(cmd)
+        if token not in ALLOWED[self.state]:
+            return
+
         if isinstance(cmd, Scroll):
-            if self.state != SLEEPING:
-                self.mouse.scroll(cmd.direction, cmd.amount)
+            self.mouse.scroll(cmd.direction, cmd.amount)
             return
 
         if isinstance(cmd, KeyPress):
-            if self.state != SLEEPING and self.keyboard:
+            if self.keyboard:
                 for ch in cmd.chords:
                     self.keyboard.press(ch.mods, ch.key, ch.count)
             return
@@ -410,6 +719,8 @@ class Controller:
                 self.mark = None
                 self._set(GRID)
                 self._show()
+            elif cmd in ("left", "right", "double"):
+                self._click_here(cmd)       # click wherever the cursor already is, no grid needed
             return
 
         # ---- GRID ----
@@ -674,6 +985,9 @@ class StatusPill:
         self.frame.pack()
         self.label = tk.Label(self.frame, font=("Segoe UI", 10, "bold"), fg="white", padx=10, pady=4)
         self.label.pack(side="left")
+        # Last heard phrase + confidence summary (filled in by set_heard; invisible while empty).
+        self.heard = tk.Label(self.frame, font=("Consolas", 9), fg="white", padx=6)
+        self.heard.pack(side="left")
         self.meter = tk.Canvas(self.frame, width=self.METER_W, height=self.METER_H,
                                bg="#1b1b1b", highlightthickness=0)
         self.meter.pack(side="left", padx=(0, 4))
@@ -719,9 +1033,16 @@ class StatusPill:
     def set(self, state: str) -> None:
         colour, text = self.COLORS[state]
         self.label.config(text=text, bg=colour)
+        self.heard.config(bg=colour)
         self.mover.config(bg=colour)
         self.frame.config(bg=colour)
         self._place()
+
+    def set_heard(self, text: str) -> None:
+        """Show the last recognised phrase and its confidences (called from the UI poll loop)."""
+        if self.heard.cget("text") != text:
+            self.heard.config(text=text)
+            self._place()
 
     def set_level(self, v: float) -> None:
         """Fast attack, slow decay so short words are visible."""
@@ -752,21 +1073,130 @@ def ensure_model(path: str | None) -> str:
 
 
 class SpeechThread(threading.Thread):
-    """Mic -> Vosk. Uses a wake-only grammar while asleep and the command grammar otherwise."""
+    """Mic -> Vosk with one recogniser per state (wake-only / awake / grid), then a hard grammar
+    check: an utterance is acted on only if it is complete and well-ordered for the current state
+    ("page delta" is rejected; a lower-ranked "page down" alternative is used if --nbest has one)."""
 
-    def __init__(self, model_path, device, min_conf, get_state, out_queue, open_vocab=False):
+    def __init__(self, model_path, device, min_conf, get_state, out_queue, open_vocab=False,
+                 word_conf=0.0, nbest=0, log_path=None, lenient=False, flat_grammar=False):
         super().__init__(daemon=True)
         self.model_path, self.device, self.min_conf = model_path, device, min_conf
         self.open_vocab = open_vocab
+        self.word_conf = word_conf    # per-word floor: drop single words the model isn't sure of
+        self.nbest = nbest            # 0 = single result; N>0 = ask for N alternative hypotheses
+        self.log_path = log_path      # if set, append each recognition (JSONL) here for analysis
+        self.lenient = lenient        # True = old behaviour: skip stray words instead of rejecting
+        self.flat_grammar = flat_grammar   # True = old flat word list instead of the BNF sentences
         self.level = 0.0         # latest mic loudness, 0..1, read by the UI for the meter
+        self.last_heard = ""     # last recognised phrase + confidence summary, read by the UI
         self.get_state, self.out = get_state, out_queue
         self.audio: queue.Queue[bytes] = queue.Queue()
 
-    def _confident(self, result: dict) -> bool:
-        words = result.get("result") or []
+    def _confident(self, words: list) -> bool:
         if not words:
             return False
         return sum(w.get("conf", 1.0) for w in words) / len(words) >= self.min_conf
+
+    @staticmethod
+    def _hypotheses(result: dict) -> list:
+        """Return [(text, confidence, words), ...] best-first, for both result shapes.
+
+        Without alternatives the recogniser returns {"text": ..., "result": [...]}. With
+        SetMaxAlternatives(n) it returns {"alternatives": [{"text","confidence","words"}, ...]}
+        where "confidence" is a raw acoustic score (not a probability).
+        """
+        alts = result.get("alternatives")
+        if alts is not None:
+            return [(a.get("text", ""), a.get("confidence"),
+                     a.get("words") or a.get("result") or []) for a in alts]
+        return [(result.get("text", ""), None, result.get("result") or [])]
+
+    def _acceptable(self, text: str, words: list, state: str) -> bool:
+        src = words or text
+        if self.lenient:        # old rule: anything that parses to some command valid in this state
+            return any(command_token(c) in ALLOWED[state]
+                       for c in parse_commands(src, min_word_conf=self.word_conf))
+        return validate(src, state, self.word_conf) is not None
+
+    def _commands(self, text: str, words: list, state: str):
+        """The commands to run for one hypothesis, or None to ignore it."""
+        src = words or text
+        if self.lenient:
+            return parse_commands(src, min_word_conf=self.word_conf) or None
+        return validate(src, state, self.word_conf)
+
+    def _choose(self, hyps: list, state: str) -> int:
+        """Index of the best hypothesis that is a valid utterance in `state`.
+
+        Grammar decoding flattens per-word confidences, so the alternatives' own ordering is the
+        only usable signal. The top guess is sometimes junk ("h down", "page delta" for "page
+        down"), so take the highest-ranked hypothesis that passes the strict grammar check. If
+        none does, return 0 (the caller then ignores the utterance rather than guessing).
+        """
+        for i, (text, _, words) in enumerate(hyps):
+            if self._acceptable(text, words, state):
+                return i
+        return 0
+
+    def _report(self, hyps: list, chosen: int = 0, accepted: bool = True) -> None:
+        """Log each recognised word with its confidence and remember a short summary for the UI.
+
+        The per-word numbers are what --word-conf acts on; avg is what --min-conf gates, and min
+        is the weakest word (the first one dropped). Competing hypotheses from --nbest are listed
+        too, each with the recogniser's own (raw, non-probability) score; `chosen` marks the one
+        actually used (0 = the top guess, which the chooser only overrides on --nbest).
+        """
+        text, _, words = hyps[0]
+        confs = [float(w.get("conf", 1.0)) for w in words]
+        label = "heard" if accepted else "ignored (not a valid command here)"
+        if confs:
+            detail = " ".join(f"{w.get('word', '?')}={c:.2f}" for w, c in zip(words, confs))
+            print(f"{label}: {text}   [{detail}]   avg {sum(confs)/len(confs):.2f}  min {min(confs):.2f}")
+        else:
+            print(f"{label}: {text}")
+        for j, (alt_text, alt_conf, _) in enumerate(hyps[1:], start=1):
+            score = f"{alt_conf:.1f}" if isinstance(alt_conf, (int, float)) else "?"
+            mark = "   <- chosen" if j == chosen else ""
+            print(f"        alt: {alt_text}   (score {score}){mark}")
+        if chosen > 0 and accepted:
+            print("        (top guess was not a valid command here; using the chosen alternative)")
+        # The status-pill summary reflects what we actually applied.
+        ctext, _, cwords = hyps[chosen]
+        cconfs = [float(w.get("conf", 1.0)) for w in cwords]
+        if cconfs:
+            self.last_heard = f"{ctext}  \u00b7  avg {sum(cconfs)/len(cconfs):.2f}  min {min(cconfs):.2f}"
+        else:
+            self.last_heard = ctext
+        if not accepted and ctext:
+            self.last_heard = "\u2717 " + self.last_heard          # shows a rejected phrase
+
+    def _write_log(self, fh, state: str, asleep: bool, hyps: list, chosen: int,
+                   valid=None) -> None:
+        """Append one JSON object (one line) describing this recognition to the JSONL log.
+
+        Everything the recogniser produced is kept - the top guess, the alternatives with their
+        raw scores, and each word with its confidence - plus the state and which hypothesis ran, so
+        common mishearings can be mined later (e.g. group by `heard` and inspect `hypotheses`).
+        """
+        record = {
+            "ts": datetime.datetime.now().isoformat(timespec="milliseconds"),
+            "state": state,
+            "asleep": asleep,
+            "heard": hyps[0][0],                       # the recogniser's top guess
+            "chosen": chosen,                          # index into hypotheses that was applied
+            "used": hyps[chosen][0],                   # the phrase actually acted on
+            "hypotheses": [
+                {"text": t, "score": s,
+                 "words": [{"word": w.get("word"), "conf": w.get("conf")} for w in ws]}
+                for t, s, ws in hyps],
+        }
+        if valid is not None:
+            record["valid"] = bool(valid)              # did the chosen phrase pass the grammar check
+        try:
+            fh.write(json.dumps(record) + "\n")
+            fh.flush()
+        except OSError as e:
+            print(f"warning: log write failed: {e}")
 
     def run(self) -> None:
         import sounddevice as sd
@@ -778,34 +1208,69 @@ class SpeechThread(threading.Thread):
             r = (KaldiRecognizer(model, SAMPLE_RATE, json.dumps(grammar)) if grammar
                  else KaldiRecognizer(model, SAMPLE_RATE))     # no grammar = open vocabulary
             r.SetWords(True)
+            if self.nbest > 0:
+                r.SetMaxAlternatives(self.nbest)   # n-best hypotheses (changes the JSON shape)
             return r
 
-        wake = make(WAKE_GRAMMAR)
-        command = make(None if self.open_vocab else COMMAND_GRAMMAR)
-        last_asleep = True
+        t0 = time.time()
+        if self.open_vocab:
+            awake_g = grid_g = None
+        elif self.flat_grammar:
+            awake_g = grid_g = COMMAND_GRAMMAR
+        else:
+            awake_g, grid_g = AWAKE_SENTENCES, GRID_SENTENCES
+        recs = {SLEEPING: make(WAKE_GRAMMAR), AWAKE: make(awake_g), GRID: make(grid_g)}
+        kind = "open vocabulary" if self.open_vocab else ("flat word list" if self.flat_grammar
+                                                          else f"{len(awake_g)}/{len(grid_g)} sentences")
+        print(f"Recognisers ready in {time.time() - t0:.1f}s (grammar: {kind})")
+        last_state = SLEEPING
 
         def cb(indata, frames, t, status):
             data = bytes(indata)
             self.level = level_from_pcm(data)
             self.audio.put(data)
 
-        with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=800, device=self.device,
-                               dtype="int16", channels=1, callback=cb):
-            print("Microphone open. Say \"start listening\".")
-            while True:
-                data = self.audio.get()
-                asleep = self.get_state() == SLEEPING
-                if asleep != last_asleep:                 # state flipped: drop stale audio
-                    (wake if asleep else command).Reset()
-                    last_asleep = asleep
-                rec = wake if asleep else command
-                if rec.AcceptWaveform(data):
-                    res = json.loads(rec.Result())
-                    text = res.get("text", "")
-                    if text and self._confident(res):
-                        print(f"heard: {text}")
-                        for cmd in parse_commands(text):
+        log = None
+        if self.log_path:
+            try:
+                log = open(self.log_path, "a", encoding="utf-8")
+                print(f"Logging recognitions to {self.log_path}")
+            except OSError as e:
+                print(f"warning: cannot write log file {self.log_path}: {e}")
+        try:
+            with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=800, device=self.device,
+                                   dtype="int16", channels=1, callback=cb):
+                print("Microphone open. Say \"start listening\".")
+                while True:
+                    data = self.audio.get()
+                    state = self.get_state()
+                    asleep = state == SLEEPING
+                    if state != last_state:               # state flipped: drop stale audio
+                        recs[state].Reset()
+                        last_state = state
+                    rec = recs[state]
+                    if rec.AcceptWaveform(data):
+                        hyps = self._hypotheses(json.loads(rec.Result()))
+                        text, _, words = hyps[0]
+                        if not text:
+                            continue
+                        # With --nbest, prefer the highest-ranked alternative that is a valid
+                        # utterance in this state (so "page delta" loses to "page down").
+                        chosen = self._choose(hyps, state) if len(hyps) > 1 else 0
+                        ctext, _, cwords = hyps[chosen]
+                        cmds = self._commands(ctext, cwords, state)
+                        if log is not None:               # record every recognition, even weak ones
+                            self._write_log(log, state, asleep, hyps, chosen, valid=cmds)
+                        # Weak overall confidence is ignored as before; no per-word data (some
+                        # result shapes have none) cannot be judged, so the grammar check decides.
+                        if cwords and not self._confident(cwords):
+                            continue
+                        self._report(hyps, chosen, accepted=bool(cmds))
+                        for cmd in cmds or ():
                             self.out.put(cmd)
+        finally:
+            if log is not None:
+                log.close()
 
 
 # --------------------------------------------------------------------------
@@ -816,9 +1281,29 @@ def main() -> None:
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--min-conf", type=float, default=0.6,
                     help="ignore results below this average word confidence (default 0.6)")
+    ap.add_argument("--word-conf", type=float, default=0.5,
+                    help="drop individual recognised words below this confidence before parsing "
+                         "them into commands (0 disables; default 0.5)")
+    ap.add_argument("--nbest", type=int, default=3, metavar="N",
+                    help="ask the recogniser for up to N alternative hypotheses, log them, and use "
+                         "the best one that parses to a command valid in the current state "
+                         "(0 = off; default 3). Their 'score' is a raw acoustic score, not a "
+                         "probability.")
+    ap.add_argument("--log", metavar="FILE", default="heard.jsonl",
+                    help="append every recognition (heard text, alternatives, scores, per-word "
+                         "confidences, state, timestamp) to FILE as one JSON object per line, for "
+                         "later analysis of common mishearings (default: heard.jsonl)")
+    ap.add_argument("--no-log", action="store_true", help="disable the JSONL recognition log")
+    ap.add_argument("--lenient", action="store_true",
+                    help="old behaviour: skip words that don't fit and run whatever is left, instead "
+                         "of ignoring the whole utterance when any part is out of place")
+    ap.add_argument("--flat-grammar", action="store_true",
+                    help="use the plain word list as the recogniser vocabulary instead of the "
+                         "generated BNF sentences (fallback if start-up is slow or recognition is "
+                         "worse); the strict grammar check still applies")
     ap.add_argument("--start-awake", action="store_true")
     ap.add_argument("--corner", choices=StatusPill.CORNERS, default="bottom-right",
-                    help="screen corner the status box starts in (the \u21c4 button cycles through all four)")
+                    help="screen corner the status box starts in (the arrow button cycles through all four)")
     ap.add_argument("--no-hotkey", action="store_true",
                     help="disable the Ctrl + Left-Windows listen/sleep toggle")
     ap.add_argument("--open-vocab", action="store_true",
@@ -842,6 +1327,7 @@ def main() -> None:
     import tkinter as tk
     make_dpi_aware()
     model_path = ensure_model(args.model)
+    log_path = None if args.no_log else os.path.abspath(args.log)
 
     root = tk.Tk()
     root.withdraw()
@@ -854,11 +1340,12 @@ def main() -> None:
 
     cmds: queue.Queue[str] = queue.Queue()
     speech = SpeechThread(model_path, args.device, args.min_conf, lambda: ctl.state, cmds,
-                          args.open_vocab)
+                          args.open_vocab, args.word_conf, args.nbest, log_path, args.lenient, args.flat_grammar)
     speech.start()
 
     def meter_poll():
         pill.set_level(speech.level)
+        pill.set_heard(speech.last_heard)
         root.after(40, meter_poll)
 
     root.after(40, meter_poll)

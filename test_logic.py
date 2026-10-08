@@ -38,7 +38,7 @@ assert c.state == SLEEPING and not m.log
 say(c, "start listening")
 assert c.state == AWAKE
 say(c, "left click")
-assert not m.log                                   # clicks only work inside the grid
+assert m.log[-1] == ("click", "left", False)       # clicks work while awake too (at the cursor)
 
 # zoom: 5 = centre cell, then 1 = its top-left
 say(c, "mouse grid")
@@ -142,6 +142,18 @@ c, m, o = make(); say(c, "start listening mouse grid five click")
 assert m.log[-1] == ("click", "left", False) and c.state == AWAKE
 print("plain click ok")
 
+# clicking works while awake, at the current cursor position, with no grid open
+c, m, o = make(); say(c, "start listening")
+say(c, "left click")
+assert m.log == [("click", "left", False)] and c.state == AWAKE and not o.visible
+say(c, "right click"); assert m.log[-1] == ("click", "right", False)
+say(c, "double click"); assert m.log[-1] == ("click", "left", True)
+say(c, "click"); assert m.log[-1] == ("click", "left", False)
+assert not any(x[0] == "move" for x in m.log)       # never moves the cursor while awake
+c, m, o = make(); say(c, "left click")              # still asleep: ignored
+assert m.log == [] and c.state == SLEEPING
+print("awake click ok")
+
 # scrolling
 assert parse_commands("scroll down") == [Scroll("down", SCROLL_DEFAULT)]
 assert parse_commands("scroll down twenty") == [Scroll("down", 20)]
@@ -237,3 +249,217 @@ c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb)
 say(c, "page down three"); assert kb.log == []                              # asleep: ignored
 say(c, "start listening page down three page up"); assert kb.log == [((), "pagedown", 3), ((), "pageup", 1)]
 print("page keys ok")
+
+
+# ---------------- per-word confidence + state policy ----------------
+# A plain string counts as fully confident, so the existing callers above are unaffected.
+assert parse_commands("left click", min_word_conf=0.9) == ["left"]
+
+# Vosk's per-word result list: words below the floor are dropped before parsing.
+words = [{"word": "mouse", "conf": 0.90}, {"word": "grid", "conf": 0.20}]
+assert parse_commands(words, min_word_conf=0.5) == []            # "grid" dropped -> nothing useful
+assert parse_commands(words, min_word_conf=0.1) == ["grid"]      # both kept -> "mouse grid"
+assert parse_commands([{"word": "mark", "conf": 0.50}], min_word_conf=0.5) == ["mark"]   # >= kept
+assert parse_commands([{"word": "mark", "conf": 0.49}], min_word_conf=0.5) == []         # < dropped
+assert parse_commands([{"word": "mark"}]) == ["mark"]            # missing conf defaults to 1.0
+
+# ALLOWED is the single source of truth for "what is appropriate in this state".
+assert ALLOWED[SLEEPING] == {"start"}
+assert "5" not in ALLOWED[AWAKE] and "5" in ALLOWED[GRID]
+assert "move" not in ALLOWED[AWAKE] and "move" in ALLOWED[GRID]
+assert "press" in ALLOWED[AWAKE] and "scroll" in ALLOWED[GRID]
+assert "scroll" not in ALLOWED[SLEEPING] and "press" not in ALLOWED[SLEEPING]
+
+# ...and it is enforced by the controller (in execution order, so chaining still works).
+c, m, o = make()
+say(c, "five"); assert m.log == [] and c.state == SLEEPING       # digit while asleep: no-op
+say(c, "start listening"); assert c.state == AWAKE
+say(c, "five"); assert m.log == [] and c.state == AWAKE          # digit while awake: no-op
+say(c, "mouse grid five")                                        # one breath crosses AWAKE -> GRID
+assert c.state == GRID and m.log[-1] == ("move", 960, 540)       # ...and the digit still applies
+print("word-conf + allowed ok")
+
+
+# ---------------- confidence reporting + n-best hypotheses ----------------
+import queue as _q
+st = SpeechThread("model", None, 0.6, lambda: SLEEPING, _q.Queue())
+
+# _confident gates on the mean per-word confidence.
+assert st._confident([{"word": "a", "conf": 0.7}, {"word": "b", "conf": 0.7}]) is True
+assert st._confident([{"word": "a", "conf": 0.3}]) is False
+assert st._confident([]) is False
+
+# Plain result shape (no alternatives).
+plain = {"text": "grid five", "result": [{"word": "grid", "conf": 0.90}, {"word": "five", "conf": 0.40}]}
+h = st._hypotheses(plain)
+assert h == [("grid five", None, plain["result"])]
+st._report(h)
+assert st.last_heard.startswith("grid five")            # shown in the status pill
+assert "avg 0.65" in st.last_heard and "min 0.40" in st.last_heard
+
+# Alternatives shape (--nbest): each entry carries text, a raw score, and its own words.
+nbest = {"alternatives": [
+    {"text": "mouse grid five", "confidence": 134.6,
+     "words": [{"word": "mouse", "conf": 0.9}, {"word": "grid", "conf": 0.9}, {"word": "five", "conf": 0.6}]},
+    {"text": "mouse grid fine", "confidence": 88.1, "words": [{"word": "fine", "conf": 0.2}]}]}
+h2 = st._hypotheses(nbest)
+assert h2[0][0] == "mouse grid five" and h2[0][1] == 134.6 and len(h2[0][2]) == 3
+assert h2[1] == ("mouse grid fine", 88.1, [{"word": "fine", "conf": 0.2}])
+st._report(h2)                                          # logs best + one competing line, no crash
+assert st.last_heard.startswith("mouse grid five")
+
+# Defensive: alternatives missing "words" (falls back to "result"), and empty result.
+assert st._hypotheses({"alternatives": [{"text": "x", "result": [{"word": "x"}]}]})[0][2] == [{"word": "x"}]
+st._report(st._hypotheses({}))                          # nothing heard: empty summary, no crash
+assert st.last_heard == ""
+print("conf report + nbest ok")
+
+# ---------------- n-best rescoring ----------------
+# "h down"/"page delta" parse to nothing; "page down" is a real PageDown key.
+hx = st._hypotheses({"alternatives": [
+    {"text": "h down", "confidence": 209.8, "words": [{"word": "h", "conf": 1.0}, {"word": "down", "conf": 1.0}]},
+    {"text": "page down", "confidence": 205.0, "words": [{"word": "page", "conf": 1.0}, {"word": "down", "conf": 1.0}]}]})
+assert parse_commands("h down") == [] and parse_commands("page down") == [KeyPress((Chord((), "pagedown", 1),))]
+assert st._choose(hx, AWAKE) == 1                       # skip the junk top guess
+assert st._choose(hx, SLEEPING) == 0                    # neither valid asleep -> fall back to best
+hx2 = st._hypotheses({"alternatives": [
+    {"text": "page down", "confidence": 300.0, "words": [{"word": "page"}, {"word": "down"}]},
+    {"text": "h down", "confidence": 250.0, "words": [{"word": "h"}, {"word": "down"}]}]})
+assert st._choose(hx2, AWAKE) == 0                      # top guess already actionable -> kept
+st._report(hx, chosen=1)                                # marks the chosen alt, no crash
+assert st.last_heard.startswith("page down")            # pill shows what was actually used
+# command_token maps objects/strings to their ALLOWED names
+assert command_token("start") == "start"
+assert command_token(KeyPress((Chord((), "pagedown", 1),))) == "press"
+assert command_token(Scroll("down", 5)) == "scroll"
+print("nbest rescore ok")
+
+
+# ---------------- JSONL recognition log ----------------
+import io as _io
+st.log_path = None                                       # default: no log
+buf = _io.StringIO()
+st._write_log(buf, AWAKE, False, hx, 1)                  # hx = the h-down/page-down alternatives
+lines = buf.getvalue().splitlines()
+assert len(lines) == 1                                   # one JSON object per line
+rec = json.loads(lines[0])
+assert rec["state"] == "awake" and rec["asleep"] is False
+assert rec["heard"] == "h down" and rec["chosen"] == 1 and rec["used"] == "page down"
+assert rec["hypotheses"][1] == {"text": "page down", "score": 205.0,
+                                "words": [{"word": "page", "conf": 1.0}, {"word": "down", "conf": 1.0}]}
+assert "ts" in rec
+st._write_log(buf, SLEEPING, True, st._hypotheses({"text": "[unk]", "result": []}), 0)
+assert len(buf.getvalue().splitlines()) == 2             # appends, never overwrites
+assert json.loads(buf.getvalue().splitlines()[1])["heard"] == "[unk]"
+print("jsonl log ok")
+
+
+# ================= strict grammar check (whole utterance, per state) =================
+V = lambda text, st, **kw: validate(text, st, **kw)
+# the reported mishearing: "page" may only be followed by up / down
+assert V("page delta", AWAKE) is None and V("page delta", GRID) is None
+assert V("page down", AWAKE) is not None and V("press page delta", AWAKE) is None
+assert V("press page down three", AWAKE) is not None
+for bad in ("scroll delta", "scroll", "page", "press", "function", "function thirteen", "press function",
+            "times", "twenty", "hundred", "down", "scroll down banana", "mouse grid delta", "[unk]",
+            "page [unk] down", "press tab [unk]", "h down", ""):
+    assert V(bad, AWAKE) is None and V(bad, GRID) is None, bad
+assert V("mouse grid five delta", AWAKE) is None and V("delta page down", AWAKE) is None  # no half-runs
+
+# clicks work awake (no grid); the grid-only words need the grid or "mouse grid" in the same breath
+for ok in ("click", "left click", "right click", "double click", "left", "page down", "scroll up three",
+           "press tab", "mouse grid", "stop listening"):
+    assert V(ok, AWAKE) is not None, ok
+for grid_word in ("five", "back", "mark", "cancel", "move mouse", "move"):
+    assert V(grid_word, AWAKE) is None, grid_word
+    assert V(grid_word, GRID) is not None, grid_word
+assert V("mouse grid five one click", AWAKE) == ["grid", "5", "1", "left"]
+assert V("mouse grid five click page down ten", AWAKE) is not None
+assert V("mouse grid five click five", AWAKE) is None             # grid closed by the click
+assert V("click click double click", AWAKE) is not None           # clicks don't change state
+assert V("five click mouse grid six", GRID) is not None
+# wake word only while asleep; "start listening" means nothing once awake
+assert V("start listening", SLEEPING) == ["start"] and V("start listening", AWAKE) is None
+assert V("page down", SLEEPING) is None and V("mouse grid", SLEEPING) is None and V("click", SLEEPING) is None
+assert V("stop listening", AWAKE) == ["stop"] and V("stop listening", GRID) == ["stop"]
+assert V("mouse grid stop listening mouse grid", AWAKE) is None   # asleep after "stop"
+# everything the docs promise still passes
+for good in ("press tab", "press down down enter", "press down twenty", "press control shift escape",
+             "press control c control v", "press function five", "press one two three", "press windows",
+             "scroll down", "scroll left three times", "page up twenty five", "press alpha bravo see"):
+    assert V(good, AWAKE) is not None and V(good, GRID) is not None, good
+assert V("press down left click", GRID) == [KeyPress((Chord((), "down", 1),)), "left"]
+assert V("press left click", GRID) is None                        # ambiguous: nothing was pressed
+# lenient parse is unchanged for existing callers
+assert parse_commands("mouse grid delta five") == ["grid", "5"] and parse_commands("page delta") == []
+
+# Vosk word lists: in strict mode a word under the confidence floor rejects the utterance
+# (lenient mode drops it, which could change a count: "scroll down <twenty>" -> default 5)
+W = lambda *ws: [{"word": w, "conf": c} for w, c in ws]
+assert V(W(("page", .9), ("down", .9)), AWAKE, min_word_conf=.5) == V("page down", AWAKE)
+assert V(W(("page", .9), ("down", .2)), AWAKE, min_word_conf=.5) is None
+assert V(W(("scroll", .9), ("down", .9), ("twenty", .2)), AWAKE, min_word_conf=.5) is None
+assert parse_commands(W(("scroll", .9), ("down", .9), ("twenty", .2)), .5) == [Scroll("down", 5)]
+assert V(W(("page", .9), ("down", .2)), AWAKE, min_word_conf=0.0) is not None
+
+# next_state mirrors Controller.handle: random command sequences must end in the same state
+import random
+rng = random.Random(7)
+pool = ["start", "stop", "grid", "left", "right", "double", "move", "cancel", "mark", "back", "5", "1"]
+extra = [KeyPress((Chord((), "tab", 1),)), Scroll("down", 3)]
+for _ in range(400):
+    c, m, o = make(); cur = SLEEPING
+    for _ in range(rng.randint(1, 12)):
+        cmd = rng.choice(pool + extra)
+        tok = command_token(cmd)
+        if tok in ALLOWED[cur]:
+            cur = next_state(cur, tok)
+        c.handle(cmd)
+        assert c.state == cur, (c.state, cur, cmd)
+        assert o.visible == (cur == GRID) or cur != GRID   # grid open => overlay shown
+print("next_state matches controller ok")
+
+# ---- per-state grammars: what an utterance may START with, and which pairs are taught ----
+assert AWAKE_GRAMMAR_G.first == {"click", "left", "right", "double", "mouse", "page", "press",
+                                 "scroll", "stop"}, AWAKE_GRAMMAR_G.first
+assert {"five", "mark", "cancel", "back", "move"} <= GRID_GRAMMAR_G.first
+assert not ({"five", "mark", "cancel", "back", "move"} & AWAKE_GRAMMAR_G.first)
+assert "start" not in GRID_GRAMMAR_G.first | AWAKE_GRAMMAR_G.first
+assert ("mouse", "grid") in AWAKE_GRAMMAR_G.pairs and ("grid", "five") in AWAKE_GRAMMAR_G.pairs
+def _after_in(sents, a):
+    return {y for s in sents for x, y in zip(s.split(), s.split()[1:]) if x == a}
+for sents in (AWAKE_SENTENCES, GRID_SENTENCES):
+    assert _after_in(sents, "page") == {"up", "down"}
+    assert "delta" not in _after_in(sents, "scroll") | _after_in(sents, "function")
+firsts = lambda sents: {s.split()[0] for s in sents if s != "[unk]"}
+assert firsts(AWAKE_SENTENCES) <= AWAKE_GRAMMAR_G.first and firsts(GRID_SENTENCES) <= GRID_GRAMMAR_G.first
+assert "start" not in firsts(AWAKE_SENTENCES) | firsts(GRID_SENTENCES)
+
+# ---- SpeechThread decision logic (no audio / vosk needed) ----
+def mk(**kw):
+    return SpeechThread("m", None, 0.6, lambda: AWAKE, _q.Queue(), **kw)
+t = mk()
+alts = st._hypotheses({"alternatives": [
+    {"text": "page delta", "confidence": 290.0, "words": W(("page", 1), ("delta", 1))},
+    {"text": "page", "confidence": 288.0, "words": W(("page", 1))},
+    {"text": "page down", "confidence": 287.5, "words": W(("page", 1), ("down", 1))}]})
+assert t._choose(alts, AWAKE) == 2                                  # skips the two invalid guesses
+assert t._commands(*alts[2][::2], AWAKE) == V("page down", AWAKE)
+none_ok = st._hypotheses({"alternatives": [{"text": "page delta", "words": W(("page", 1), ("delta", 1))}]})
+assert t._choose(none_ok, AWAKE) == 0 and t._commands("page delta", none_ok[0][2], AWAKE) is None  # ignored
+# a phrase that is valid in the grid but not awake is rejected awake, accepted in the grid
+assert t._commands("five", [], AWAKE) is None and t._commands("five", [], GRID) == ["5"]
+# no per-word data (shape without it): decided by the grammar check alone
+assert t._commands("page down", [], AWAKE) == V("page down", AWAKE)
+# lenient mode keeps the old skip-stray-words behaviour
+tl = mk(lenient=True)
+assert tl._commands("mouse grid delta five", [], AWAKE) == ["grid", "5"] and tl._commands("page delta", [], AWAKE) is None
+# JSONL log records whether the chosen phrase passed
+import io as _io
+buf = _io.StringIO(); t._write_log(buf, AWAKE, False, alts, 2, valid=True); t._write_log(buf, AWAKE, False, none_ok, 0, valid=None)
+l1, l2 = (json.loads(x) for x in buf.getvalue().splitlines())
+assert l1["valid"] is True and "valid" not in l2
+# rejected phrases show a cross in the status pill and say so on the console
+t._report(none_ok, 0, accepted=False); assert t.last_heard.startswith("✗ page delta")
+t._report(alts, 2, accepted=True); assert t.last_heard.startswith("page down")
+print("strict grammar check ok")
