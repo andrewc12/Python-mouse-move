@@ -1231,14 +1231,17 @@ class StatusPill:
 def ensure_model(path: str | None) -> str:
     if path:
         return path
-    # Next to the program. Compiled (Nuitka/PyInstaller) builds may unpack __file__ into a temp
-    # folder, so use the real executable's folder there or the model would re-download every run.
+    # Look in order: bundled inside the program (onefile builds unpack beside __file__), next to
+    # the executable (compiled __file__ may be a temp folder, so use argv[0] there), else download.
     frozen = "__compiled__" in globals() or getattr(sys, "frozen", False)
-    here = os.path.dirname(os.path.abspath(sys.argv[0] if frozen else __file__))
-    base = os.path.join(here, "models")
+    exe_dir = os.path.dirname(os.path.abspath(sys.argv[0] if frozen else __file__))
+    bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", MODEL_NAME)
+    beside = os.path.join(exe_dir, "models", MODEL_NAME)
+    for candidate in (bundled, beside):
+        if os.path.isdir(candidate):
+            return candidate
+    base = os.path.join(exe_dir, "models")
     target = os.path.join(base, MODEL_NAME)
-    if os.path.isdir(target):
-        return target
     os.makedirs(base, exist_ok=True)
     zip_path = target + ".zip"
     print(f"Downloading speech model (~40 MB) from {MODEL_URL} ...")
