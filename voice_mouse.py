@@ -1046,84 +1046,56 @@ class Overlay:
 
 
 class StatusPill:
-    """Small always-on-top status card. One dark theme throughout; only the dot (and the meter's
-    level colours) change with state, so every part - text, meter, button - shares the same
-    fonts, spacing and palette."""
-
-    # state -> (accent colour, name, hint shown briefly beside the name)
-    STATES = {SLEEPING: ("#8a8f98", "Sleeping", "say \"start listening\""),
-              AWAKE: ("#34c759", "Listening", "\"mouse grid\" or \"press ...\""),
-              GRID: ("#ff5f57", "Grid", "say 1-9, back, mark, cancel")}
-    THEME = {"bg": "#1f2125", "border": "#3a3d44", "text": "#f2f3f5", "muted": "#9aa0a8",
-             "track": "#2c2f35", "button": "#2c2f35", "button_hover": "#3d4148"}
-    FONT = "Segoe UI"
-    PAD = 10                  # one spacing unit used between and around every element
-    METER_W, METER_H = 90, 8
+    COLORS = {SLEEPING: ("#444444", "Sleeping", "say \"start listening\""),
+              AWAKE: ("#1e8e3e", "Listening", "\"mouse grid\" or \"press ...\""),
+              GRID: ("#c5221f", "Grid", "say 1-9, back, mark, cancel")}
+    METER_W, METER_H = 90, 10
     HINT_SECONDS = 6          # how long the hint / last-heard phrase stay visible
+    PAD = 8                   # one spacing unit between every element and around the edge
 
     CORNERS = ("bottom-right", "bottom-left", "top-left", "top-right")   # order the button cycles
 
     def __init__(self, root, screen: Region, corner: str = "bottom-right"):
         import tkinter as tk
-        T, P = self.THEME, self.PAD
+        P = self.PAD
         self.corner = corner                  # which screen corner the box sits in
         self.win = tk.Toplevel(root)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
-        self.win.attributes("-alpha", 0.94)
-        self.win.config(bg=T["border"])
-        # 1px border: the outer window is the border colour, the card sits inside with a 1px gap.
-        self.frame = tk.Frame(self.win, bg=T["bg"])
-        self.frame.pack(padx=1, pady=1)
-
-        def label(**kw):
-            return tk.Label(self.frame, bg=T["bg"], fg=T["text"], font=(self.FONT, 10), **kw)
-
-        # Row layout (all vertically centred): dot | state + hint | heard | meter | move button
-        self.dot = tk.Canvas(self.frame, width=12, height=12, bg=T["bg"], highlightthickness=0)
-        self.dot.grid(row=0, column=0, padx=(P, 0), pady=P)
-        self._dot_item = self.dot.create_oval(1, 1, 11, 11, width=0, fill=self.STATES[SLEEPING][0])
-        self.name = label(font=(self.FONT, 10, "bold"))
-        self.name.grid(row=0, column=1, padx=(P - 2, 0))
-        self.hint = label(fg=T["muted"])
-        self.hint.grid(row=0, column=2, padx=(6, 0))
-        self.heard = label(fg=T["muted"], font=(self.FONT, 10, "italic"))
-        self.heard.grid(row=0, column=3, padx=(P, 0))
+        self.win.attributes("-alpha", 0.85)
+        self.frame = tk.Frame(self.win)
+        self.frame.pack()
+        # One row, every piece vertically centred with the same outer padding, so the text, meter
+        # and button line up: state + hint | last heard | meter | move button.
+        # (Plain padx/pady of 0 on the labels themselves; spacing comes from the grid only.)
+        self.label = tk.Label(self.frame, font=("Segoe UI", 10, "bold"), fg="white", padx=0, pady=0)
+        self.label.grid(row=0, column=0, padx=(P + 2, 0), pady=P, sticky="w")
+        # Last heard phrase (filled in by set_heard; hidden while empty).
+        self.heard = tk.Label(self.frame, font=("Consolas", 9), fg="white", padx=0, pady=0)
+        self.heard.grid(row=0, column=1, padx=(P, 0), pady=P)
         self.meter = tk.Canvas(self.frame, width=self.METER_W, height=self.METER_H,
-                               bg=T["track"], highlightthickness=0)
-        self.meter.grid(row=0, column=4, padx=(P, 0))
-        self.bar = self.meter.create_rectangle(0, 0, 0, self.METER_H, width=0, fill="#34c759")
+                               bg="#1b1b1b", highlightthickness=0)
+        self.meter.grid(row=0, column=2, padx=(P, 0), pady=P)
         # Move handle: cycles the box through the four screen corners. Its handler returns "break"
         # so the click does not also reach the toplevel binding that toggles listening.
-        self.mover = tk.Label(self.frame, text="\u21c4", font=("Segoe UI Symbol", 10, "bold"),
-                              bg=T["button"], fg=T["text"], width=3)
-        self.mover.grid(row=0, column=5, padx=P, pady=P)
+        self.mover = tk.Label(self.frame, text="\u21c4", font=("Segoe UI Symbol", 12, "bold"),
+                              fg="white", padx=0, pady=0)
+        self.mover.grid(row=0, column=3, padx=P, pady=P)
         self.mover.bind("<Button-1>", self._flip_click)
-        self.mover.bind("<Enter>", lambda e: self.mover.config(bg=T["button_hover"]))
-        self.mover.bind("<Leave>", lambda e: self.mover.config(bg=T["button"]))
+        self.bar = self.meter.create_rectangle(0, 0, 0, self.METER_H, width=0, fill="#34c759")
         self.screen = screen
         self.level = 0.0
         self.on_click = lambda: None          # set by main(); toggles listening
-        # Bind ONCE on the toplevel: clicks on the children bubble up to it through Tk's
+        # Bind ONCE on the toplevel: clicks on the label/meter bubble up to it through Tk's
         # bindtags, so binding every child as well made each click fire twice (wake, then sleep).
         self._last_click = 0.0
         self.win.bind("<Button-1>", self._clicked)
-        for w in (self.win, self.frame, self.dot, self.name, self.hint, self.heard,
-                  self.meter, self.mover):
+        for w in (self.win, self.frame, self.label, self.heard, self.meter, self.mover):
             w.config(cursor="hand2")
         self._hint_job = self._heard_job = None
         self._heard_seq = -1
-        self._sync_visibility()
         self.set(SLEEPING)
         make_click_through(self.win, clickable=True)   # takes clicks but never steals focus
-
-    def _sync_visibility(self) -> None:
-        """Empty hint / heard labels take no space (no stray padding or gaps)."""
-        for w in (self.hint, self.heard):
-            if w.cget("text"):
-                w.grid()
-            else:
-                w.grid_remove()
 
     def _clicked(self, event=None) -> None:
         now = time.monotonic()
@@ -1139,7 +1111,10 @@ class StatusPill:
         return "break"                        # don't let this click toggle listening
 
     def _place(self) -> None:
-        self._sync_visibility()
+        if self.heard.cget("text"):            # an empty phrase takes no space at all
+            self.heard.grid()
+        else:
+            self.heard.grid_remove()
         self.win.update_idletasks()
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
         x = 16 if "left" in self.corner else self.screen.w - w - 16
@@ -1147,19 +1122,21 @@ class StatusPill:
         self.win.geometry(f"+{int(x)}+{int(y)}")
 
     def set(self, state: str) -> None:
-        accent, name, hint = self.STATES[state]
-        self.dot.itemconfig(self._dot_item, fill=accent)
-        self.name.config(text=name)
-        self.hint.config(text=hint)
+        colour, name, hint = self.COLORS[state]
+        self._state = state
+        self.label.config(text=f"{name} - {hint}", bg=colour)
+        self.heard.config(bg=colour)
+        self.mover.config(bg=colour)
+        self.frame.config(bg=colour)
         if self._hint_job is not None:                      # restart the hint timer on every change
             self.win.after_cancel(self._hint_job)
         self._hint_job = self.win.after(int(self.HINT_SECONDS * 1000), self._hide_hint)
         self._place()
 
     def _hide_hint(self) -> None:
-        """Drop the instruction once it has been read, leaving just the state name."""
+        """Shrink 'Listening - "mouse grid" or ...' to just 'Listening' once it has been read."""
         self._hint_job = None
-        self.hint.config(text="")
+        self.label.config(text=self.COLORS[self._state][1])
         self._place()
 
     def set_heard(self, text: str, seq: int = 0) -> None:
