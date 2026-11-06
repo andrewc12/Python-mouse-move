@@ -452,12 +452,12 @@ def test_sherpa_wrappers_with_fake_recognisers():
 
     st = SherpaStreaming("n", 2)
     st.model = FakeOnline("HELLO WORLD")                                              # older builds return a str
-    assert st(pcm) == "hello world" and st.model.decoded == 3 and st.model.s.done
-    assert st.model.s.fed[0] == (SAMPLE_RATE, 1600) and st.model.s.fed[1][1] == int(0.4 * SAMPLE_RATE)
+    assert st(pcm, 1) == "hello world" and st.model.decoded == 3
+    assert st.model.s.fed == [(SAMPLE_RATE, 1600)] and not st.model.s.done            # stream stays open
     st.model = FakeOnline(types.SimpleNamespace(text="Hi There"))                      # newer builds return an object
-    assert st(pcm) == "hi there"
+    assert st(pcm, 2) == "hi there"
     st.model = FakeOnline("[BLANK_AUDIO]")
-    assert st(pcm) == ""                                                               # noise tags still filtered
+    assert st(pcm, 3) == ""                                                            # noise tags still filtered
 
     class FakeOffline:
         def create_stream(self): return FakeStream()
@@ -465,6 +465,41 @@ def test_sherpa_wrappers_with_fake_recognisers():
     nm = SherpaNemo("n", 2)
     nm.model = FakeOffline()
     assert nm(pcm) == "Hello, world."                                                  # case and punctuation kept
+
+
+def test_streaming_draft_feeds_only_new_audio():
+    """The draft's work per update must not grow with the phrase: each call feeds just the new audio."""
+    import numpy as np, types
+
+    class S:
+        def __init__(self): self.samples = 0
+        def accept_waveform(self, rate, x): self.samples += len(x)
+
+    class Rec:
+        def __init__(self): self.streams, self.decodes = [], 0
+        def create_stream(self): self.streams.append(S()); return self.streams[-1]
+        def is_ready(self, s): return False
+        def decode_stream(self, s): self.decodes += 1
+        def get_result(self, s): return types.SimpleNamespace(text="x")
+
+    st = SherpaStreaming("n", 2)
+    st.model = rec = Rec()
+    fed_per_call = []
+    for secs in np.arange(0.5, 14.0, 0.3):                                        # one long phrase, growing
+        pcm = bytes(int(secs * 32000) // 2 * 2)
+        before = sum(x.samples for x in rec.streams)
+        st(pcm, 7)
+        fed_per_call.append(sum(x.samples for x in rec.streams) - before)
+    assert len(rec.streams) == 1                                                  # one stream for the phrase
+    assert max(fed_per_call[1:]) <= 0.3 * SAMPLE_RATE + 2                         # ~0.3 s of audio per update
+    assert abs(sum(fed_per_call) - 13.7 * SAMPLE_RATE) < SAMPLE_RATE * 0.35       # total = the audio, not its square
+    st(bytes(32000), 8)                                                           # next phrase: fresh stream
+    assert len(rec.streams) == 2 and rec.streams[1].samples == 16000
+    st(bytes(16000), 8)                                                           # shorter than fed: start over
+    assert len(rec.streams) == 3
+    st(bytes(32000))                                                              # no id: never reuse a stream
+    st(bytes(32000))
+    assert len(rec.streams) == 5
 
 
 def test_hotkey():

@@ -912,7 +912,7 @@ class WhisperTranscriber:
                                   cpu_threads=self.threads, download_root=self.model_dir)
         return self
 
-    def __call__(self, pcm: bytes) -> str:
+    def __call__(self, pcm: bytes, uid=None) -> str:
         import numpy as np
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
         segments, _ = self.model.transcribe(
@@ -990,14 +990,19 @@ def _result_text(result) -> str:
 
 
 class SherpaStreaming:
-    """Streaming recogniser as the DRAFT stage. Each call re-reads the whole phrase so far from a
-    fresh stream: that is only affordable because the model is so much faster than real time, and it
-    keeps this a drop-in replacement for the Whisper draft. Output is lower-cased: the final pass
-    supplies the capitals and punctuation."""
+    """Streaming recogniser as the DRAFT stage.
+
+    One recogniser stream is kept per phrase and each call feeds it only the audio that arrived since
+    the last call, so the work per update stays the same however long the phrase gets (the model's
+    state carries the earlier words along). A new phrase, or a snapshot that is shorter than what was
+    already fed, starts a fresh stream. The text lags the audio by a fraction of a second (the model
+    needs a little right-hand context), which is fine for a draft: the final pass has the last word.
+    Output is lower-cased; the final pass supplies the capitals and punctuation."""
 
     def __init__(self, name: str, threads: int, device: str = "cpu", model_dir: str | None = None):
         self.name, self.threads, self.device, self.model_dir = name, threads, device, model_dir
         self.model = None
+        self._uid, self._stream, self._fed = None, None, 0       # bytes of the phrase already fed
 
     def load(self) -> "SherpaStreaming":
         import sherpa_onnx
@@ -1008,16 +1013,17 @@ class SherpaStreaming:
             decoding_method="greedy_search", provider="cuda" if self.device == "cuda" else "cpu")
         return self
 
-    def __call__(self, pcm: bytes) -> str:
-        import numpy as np
+    def __call__(self, pcm: bytes, uid=None) -> str:
         rec = self.model
-        stream = rec.create_stream()
-        stream.accept_waveform(SAMPLE_RATE, _pcm_to_float(pcm))
-        stream.accept_waveform(SAMPLE_RATE, np.zeros(int(0.4 * SAMPLE_RATE), dtype=np.float32))  # flush the tail
-        stream.input_finished()
-        while rec.is_ready(stream):
-            rec.decode_stream(stream)
-        return clean_transcript(_result_text(rec.get_result(stream)).lower())
+        if self._stream is None or uid is None or uid != self._uid or len(pcm) < self._fed:
+            self._stream, self._uid, self._fed = rec.create_stream(), uid, 0
+        new = pcm[self._fed:len(pcm) // 2 * 2]
+        if new:
+            self._stream.accept_waveform(SAMPLE_RATE, _pcm_to_float(new))
+            self._fed += len(new)
+        while rec.is_ready(self._stream):
+            rec.decode_stream(self._stream)
+        return clean_transcript(_result_text(rec.get_result(self._stream)).lower())
 
 
 class SherpaNemo:
@@ -1039,7 +1045,7 @@ class SherpaNemo:
             self.model = sherpa_onnx.OfflineRecognizer.from_transducer(**kw)
         return self
 
-    def __call__(self, pcm: bytes) -> str:
+    def __call__(self, pcm: bytes, uid=None) -> str:
         stream = self.model.create_stream()
         stream.accept_waveform(SAMPLE_RATE, _pcm_to_float(pcm))
         self.model.decode_stream(stream)
@@ -1337,7 +1343,7 @@ def main() -> None:
     def run_draft(job):
         uid, pcm = job
         t = time.time()
-        text = draft_tr(pcm)
+        text = draft_tr(pcm, uid)
         if args.verbose:
             print(f"draft {uid}: {time.time() - t:.2f}s for {len(pcm) / 32000:.1f}s -> {text!r}")
         out.put(("draft", uid, text))
