@@ -428,7 +428,7 @@ print("next_state matches controller ok")
 
 # ---- per-state grammars: what an utterance may START with, and which pairs are taught ----
 assert AWAKE_GRAMMAR_G.first == {"click", "left", "right", "double", "mouse", "page", "press",
-                                 "scroll", "stop"}, AWAKE_GRAMMAR_G.first
+                                 "scroll", "stop", "media"}, AWAKE_GRAMMAR_G.first
 assert {"five", "mark", "cancel", "back", "move"} <= GRID_GRAMMAR_G.first
 assert not ({"five", "mark", "cancel", "back", "move"} & AWAKE_GRAMMAR_G.first)
 assert "start" not in GRID_GRAMMAR_G.first | AWAKE_GRAMMAR_G.first
@@ -564,3 +564,45 @@ print("early digits ok")
 assert is_noise("") and is_noise("  ") and is_noise("[unk]") and is_noise("[unk] [unk]")
 assert not is_noise("left") and not is_noise("[unk] left")
 print("noise filter ok")
+
+
+# ================= media buttons =================
+V = lambda text, st, **kw: validate(text, st, **kw)
+for spoken, action in [("play", "play_pause"), ("pause", "play_pause"), ("stop", "stop"), ("next", "next"),
+                       ("previous", "previous"), ("skip back", "previous"), ("skip forward", "next"),
+                       ("fast forward", "fast_forward"), ("rewind", "rewind")]:
+    assert V("media " + spoken, AWAKE) == [Media(action)], spoken
+    assert V("media " + spoken, GRID) is None and V("media " + spoken, SLEEPING) is None
+assert V("media play media next", AWAKE) == [Media("play_pause"), Media("next")]
+assert V("media fast forward left click", AWAKE) == [Media("fast_forward"), "left"]
+assert V("mouse grid five left click media pause", AWAKE) is not None      # grid closes first
+assert V("mouse grid media play", AWAKE) is None                            # not inside the grid
+for bad in ("media", "media skip", "media fast", "media delta", "media stop listening", "media press tab",
+            "play", "next", "pause", "rewind", "previous", "skip back", "fast forward"):
+    assert V(bad, AWAKE) is None, bad           # always needs the prefix, always a whole phrase
+assert V("stop listening", AWAKE) == ["stop"] and V("back", GRID) == ["back"]   # old meanings intact
+assert V("media play", AWAKE, media=False) is None and V("media next", AWAKE, media=False) is None
+assert V("press tab", AWAKE, media=False) is not None
+assert "media" in AWAKE_GRAMMAR_G.first and "media" not in GRID_GRAMMAR_G.first
+no_media = build_command_grammar("awake", media=False)
+assert "media" not in no_media.first and ("media", "play") not in no_media.pairs
+assert ("media", "play") in AWAKE_GRAMMAR_G.pairs and ("fast", "forward") in AWAKE_GRAMMAR_G.pairs
+assert any(s.startswith("media ") for s in AWAKE_SENTENCES) and not any("media" in s for s in GRID_SENTENCES)
+
+class FakeMedia:
+    def __init__(self): self.log = []
+    def send(self, action): self.log.append(action)
+fm, kb = FakeMedia(), FakeKb(); m, o = FakeMouse(), FakeOverlay()
+c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb, media=fm)
+say(c, "media play"); assert fm.log == []                                   # asleep: ignored
+say(c, "start listening media play media next media fast forward")
+assert fm.log == ["play_pause", "next", "fast_forward"], fm.log
+say(c, "mouse grid"); say(c, "media stop"); assert fm.log == ["play_pause", "next", "fast_forward"]   # grid: ignored
+say(c, "cancel"); say(c, "media stop"); assert fm.log[-1] == "stop"
+c2 = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=FakeKb())   # no media object
+say(c2, "start listening media play")                                       # must not crash
+st2 = SpeechThread("m", None, 0.6, lambda: AWAKE, None, media=False)
+assert st2._commands("media play", [], AWAKE) is None and st2._commands("press tab", [], AWAKE) is not None
+st3 = SpeechThread("m", None, 0.6, lambda: AWAKE, None)
+assert st3._commands("media play", [], AWAKE) == [Media("play_pause")]
+print("media buttons ok")

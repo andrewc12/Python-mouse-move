@@ -46,6 +46,14 @@ Scrolling (awake, or inside the grid; scrolls whatever window is under the curso
   "scroll down ten scroll up two"      chainable
 Everything can be chained in one breath: "mouse grid five one left click press hello" style.
 
+Media buttons (awake only; say "media" first so "stop", "next", "back" etc. keep their other meanings)
+  "media play" / "media pause"         play/pause toggle (Windows has a single play/pause key)
+  "media stop"                         stop
+  "media next" / "media previous"      next / previous track     ("media skip forward" / "media skip back" are the same)
+  "media fast forward" / "media rewind"  sent to the focused window as a media command; only some
+                                         players act on it
+  Turn all of this off with --no-media.
+
 Hotkey (no voice needed): tap Ctrl + Left-Windows together, then let go. It toggles between
 sleeping and listening (and leaves the grid). A high beep = now listening, low beep = sleeping.
 Ctrl+Win combined with any other key (e.g. virtual-desktop switching) is left alone.
@@ -106,6 +114,19 @@ PHRASES = {
     ("back",): "back",
     ("cancel",): "cancel",
 }
+
+# Media buttons: spoken words after "media" -> action. Windows has real keys for play/pause (one
+# toggle), stop, next and previous; fast forward / rewind exist only as WM_APPCOMMAND messages.
+MEDIA_ACTIONS: dict[tuple[str, ...], str] = {
+    ("play",): "play_pause", ("pause",): "play_pause", ("stop",): "stop",
+    ("next",): "next", ("previous",): "previous",
+    ("skip", "forward"): "next", ("skip", "back"): "previous",
+    ("fast", "forward"): "fast_forward", ("rewind",): "rewind",
+}
+MEDIA_VK = {"play_pause": 0xB3, "stop": 0xB2, "next": 0xB0, "previous": 0xB1}   # VK_MEDIA_*
+MEDIA_APPCOMMAND = {"fast_forward": 49, "rewind": 50}                            # APPCOMMAND_MEDIA_*
+MEDIA_EXAMPLES = ["media play", "media pause", "media stop", "media next", "media previous",
+                  "media fast forward", "media rewind", "media skip back", "media skip forward"]
 
 MAX_REPEAT = 500          # safety cap for "press down <N>" / "scroll down <N>"
 SCROLL_DEFAULT = 5        # notches for a bare "scroll down"
@@ -185,7 +206,8 @@ SYMBOL_KEYS: dict[tuple[str, ...], tuple[tuple[str, ...], str]] = {
 }
 
 _KEY_WORDS = (set(SPOKEN_KEYS) | set(LETTER_WORDS) | set(MODIFIERS) | set(UNITS) | set(TENS)
-              | {"press", "times", "function", "page", "hundred", "click", "scroll"}
+              | {"press", "times", "function", "page", "hundred", "click", "scroll", "media"}
+              | {w for phrase in MEDIA_ACTIONS for w in phrase}
               | {w for phrase in SYMBOL_KEYS for w in phrase})
 
 WAKE_GRAMMAR = ["start listening", "[unk]"]
@@ -264,7 +286,7 @@ def _phrase(text):
     return _seq(*[_W(w) for w in text.split()])
 
 
-def build_command_grammar(mode: str = "any") -> _G:
+def build_command_grammar(mode: str = "any", media: bool = True) -> _G:
     """The grammar as word-order rules, one per state.
 
     mode "any"  : every command anywhere (state-blind).
@@ -272,6 +294,8 @@ def build_command_grammar(mode: str = "any") -> _G:
     mode "awake": what can be said when awake and NOT in the grid. Clicks, page, scroll, press and
                   "mouse grid" start an utterance; the grid-only words (1-9, back, mark, cancel,
                   move mouse) are legal only after "mouse grid" in the same breath.
+    media=False leaves out the "media <button>" commands (--no-media). They are legal when awake
+    (and in "any"), never in the grid.
     It mirrors ALLOWED / next_state() below, and a test keeps the two in step.
     """
     units19 = [w for w, v in UNITS.items() if 1 <= v <= 9]
@@ -294,13 +318,14 @@ def build_command_grammar(mode: str = "any") -> _G:
     grid_only = _alt(_phrase("move mouse"), _words(["move", "mark", "back", "cancel"] + list(NUMBER_WORDS)))
     stop, mouse_grid = _phrase("stop listening"), _phrase("mouse grid")
     common = [page, scroll, press, clicks, mouse_grid, stop]
+    media_cmd = [_seq(_W("media"), _alt(*[_phrase(" ".join(k)) for k in MEDIA_ACTIONS]))] if media else []
     if mode == "any":
-        return _plus(_alt(_phrase("start listening"), *common, grid_only))
+        return _plus(_alt(_phrase("start listening"), *common, *media_cmd, grid_only))
     if mode == "grid":
         return _plus(_alt(*common, grid_only))
     if mode == "awake":
         in_grid = _alt(*common, grid_only)              # after "mouse grid" anything may follow
-        return _plus(_alt(page, scroll, press, clicks, stop,
+        return _plus(_alt(page, scroll, press, clicks, stop, *media_cmd,
                           _seq(mouse_grid, _opt(_plus(in_grid)))))
     raise ValueError(mode)
 
@@ -312,7 +337,7 @@ _COMMON_EXAMPLES = ["mouse grid", "page down", "page up", "scroll down", "scroll
                     "press left arrow", "stop listening"] + _CLICKS
 BASE_EXAMPLES = _COMMON_EXAMPLES + ["move mouse", "mark", "back", "cancel", "start listening"] + list(NUMBER_WORDS)
 GRID_BASE_EXAMPLES = [e for e in BASE_EXAMPLES if e != "start listening"]
-AWAKE_BASE_EXAMPLES = list(_COMMON_EXAMPLES)
+AWAKE_BASE_EXAMPLES = list(_COMMON_EXAMPLES) + MEDIA_EXAMPLES
 
 
 def grammar_sentences(g: _G, repeat: int = GRAMMAR_REPEAT, max_len: int = GRAMMAR_MAX_LEN,
@@ -434,6 +459,11 @@ class KeyPress:
 
 
 @dataclass(frozen=True)
+class Media:
+    action: str         # play_pause / stop / next / previous / fast_forward / rewind
+
+
+@dataclass(frozen=True)
 class Scroll:
     direction: str      # up / down / left / right
     amount: int
@@ -531,7 +561,7 @@ def _parse_press(words: list[str], i: int, strict: bool = False):
     return chords, i
 
 
-def parse_commands(text, min_word_conf: float = 0.0, strict: bool = False):
+def parse_commands(text, min_word_conf: float = 0.0, strict: bool = False, media: bool = True):
     """Turn recognised words into commands: 'start', 'grid', '1'..'9', ... or KeyPress objects.
 
     `text` may be the raw recognised string or Vosk's per-word result list
@@ -545,6 +575,7 @@ def parse_commands(text, min_word_conf: float = 0.0, strict: bool = False):
     after a key, no leftover words, no word under the floor) or the result is None. A mis-heard
     word then rejects the utterance instead of being silently dropped, because dropping can change
     the meaning ("scroll down <twenty>" would become the default 5).
+    media=False treats "media ..." as stray words (the --no-media option).
     """
     bad = False
     if isinstance(text, str):
@@ -580,6 +611,17 @@ def parse_commands(text, min_word_conf: float = 0.0, strict: bool = False):
                 if i < len(words) and words[i] == "times":
                     i += 1
             out.append(KeyPress((Chord((), key, count),)))
+            continue
+        if words[i] == "media" and media:
+            for n in (2, 1):                                # "fast forward" before a one-word name
+                action = MEDIA_ACTIONS.get(tuple(words[i + 1:i + 1 + n]))
+                if action and len(words[i + 1:i + 1 + n]) == n:
+                    out.append(Media(action))
+                    i += 1 + n
+                    break
+            else:
+                bad = True
+                i += 1
             continue
         if words[i] == "press":
             chords, i = _parse_press(words, i + 1, strict)
@@ -694,7 +736,7 @@ SLEEPING, AWAKE, GRID = "sleeping", "awake", "grid"
 # read in execution order, after the state has actually advanced.
 ALLOWED: dict[str, set] = {
     SLEEPING: {"start"},
-    AWAKE: {"stop", "grid", "left", "right", "double", "press", "scroll"},
+    AWAKE: {"stop", "grid", "left", "right", "double", "press", "scroll", "media"},
     GRID: {"stop", "grid", "back", "mark", "cancel", "move", "left", "right", "double",
            "scroll", *[str(n) for n in range(1, 10)]},      # no "press": no key presses in the grid
 }
@@ -706,6 +748,8 @@ def command_token(cmd) -> str:
         return "press"
     if isinstance(cmd, Scroll):
         return "scroll"
+    if isinstance(cmd, Media):
+        return "media"
     return cmd
 
 
@@ -732,20 +776,22 @@ def sequence_valid(cmds: list, state: str) -> bool:
     return True
 
 
-def validate(text, state: str, min_word_conf: float = 0.0):
+def validate(text, state: str, min_word_conf: float = 0.0, media: bool = True):
     """Commands for `text` (a string or Vosk's word list) if it is a complete, well-ordered
     utterance in `state`; None if anything is stray, incomplete or out of place."""
-    cmds = parse_commands(text, min_word_conf=min_word_conf, strict=True)
+    cmds = parse_commands(text, min_word_conf=min_word_conf, strict=True, media=media)
     return cmds if cmds and sequence_valid(cmds, state) else None
 
 
 class Controller:
     """State machine: SLEEPING <-> AWAKE <-> GRID. Talks to `mouse` and `overlay`."""
 
-    def __init__(self, bounds: Region, mouse, overlay, on_state=lambda s: None, keyboard=None):
+    def __init__(self, bounds: Region, mouse, overlay, on_state=lambda s: None, keyboard=None,
+                 media=None):
         self.nav = GridNavigator(bounds)
         self.mouse, self.overlay, self.on_state = mouse, overlay, on_state
         self.keyboard = keyboard
+        self.media = media                    # object with .send(action), or None (--no-media)
         self.state = SLEEPING
         self.mark: tuple[int, int] | None = None
 
@@ -781,9 +827,14 @@ class Controller:
         # five" opens the grid (allowed while AWAKE) and only then uses the digit (allowed in GRID).
         token = command_token(cmd)
         if token not in ALLOWED[self.state]:
-            if token == "press" and self.state == GRID:
-                print("ignored: key presses are off while the mouse grid is open "
+            if token in ("press", "media") and self.state == GRID:
+                print("ignored: key presses and media buttons are off while the mouse grid is open "
                       "(click, move mouse or cancel first)")
+            return
+
+        if isinstance(cmd, Media):
+            if self.media:
+                self.media.send(cmd.action)
             return
 
         if isinstance(cmd, Scroll):
@@ -944,6 +995,30 @@ class WinKeyboard:
             time.sleep(0.02 if count > 1 else 0.01)   # let the target app keep up on repeats
         if mods:
             print(f"pressed {'+'.join(mods)}+{key}" + (f" x{count}" if count > 1 else ""))
+
+
+class WinMedia:
+    """Media buttons. Play/pause, stop, next and previous are the real Windows media keys (they
+    reach whatever player owns media control). Fast forward and rewind have no key, so they are
+    posted to the focused window as WM_APPCOMMAND, which only some players handle."""
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self.u = ctypes.windll.user32
+        self.u.GetForegroundWindow.restype = wintypes.HWND
+        self.u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+
+    def send(self, action: str) -> None:
+        if action in MEDIA_VK:
+            vk = MEDIA_VK[action]
+            scan = self.u.MapVirtualKeyW(vk, 0)
+            self.u.keybd_event(vk, scan, 0x0001, 0)                 # extended key down
+            self.u.keybd_event(vk, scan, 0x0001 | 0x0002, 0)        # ... and up
+        else:
+            hwnd = self.u.GetForegroundWindow()
+            self.u.PostMessageW(hwnd, 0x0319, hwnd or 0, MEDIA_APPCOMMAND[action] << 16)   # WM_APPCOMMAND
+        print(f"media {action}")
 
 
 class HotkeyWatcher:
@@ -1270,7 +1345,7 @@ class SpeechThread(threading.Thread):
 
     def __init__(self, model_path, device, min_conf, get_state, out_queue, open_vocab=False,
                  word_conf=0.0, nbest=0, log_path=None, lenient=False, flat_grammar=False,
-                 early_digits=True):
+                 early_digits=True, media=True):
         super().__init__(daemon=True)
         self.model_path, self.device, self.min_conf = model_path, device, min_conf
         self.open_vocab = open_vocab
@@ -1279,6 +1354,7 @@ class SpeechThread(threading.Thread):
         self.log_path = log_path      # if set, append each recognition (JSONL) here for analysis
         self.lenient = lenient        # True = old behaviour: skip stray words instead of rejecting
         self.flat_grammar = flat_grammar   # True = old flat word list instead of the BNF sentences
+        self.media = media                 # False (--no-media): "media ..." is neither heard nor run
         self.early_digits = early_digits   # in the grid, zoom on each number as soon as it is stable
         self.level = 0.0         # latest mic loudness, 0..1, read by the UI for the meter
         self.last_heard = ""     # last recognised phrase, read by the UI
@@ -1309,15 +1385,15 @@ class SpeechThread(threading.Thread):
         src = words or text
         if self.lenient:        # old rule: anything that parses to some command valid in this state
             return any(command_token(c) in ALLOWED[state]
-                       for c in parse_commands(src, min_word_conf=self.word_conf))
-        return validate(src, state, self.word_conf) is not None
+                       for c in parse_commands(src, min_word_conf=self.word_conf, media=self.media))
+        return validate(src, state, self.word_conf, self.media) is not None
 
     def _commands(self, text: str, words: list, state: str):
         """The commands to run for one hypothesis, or None to ignore it."""
         src = words or text
         if self.lenient:
-            return parse_commands(src, min_word_conf=self.word_conf) or None
-        return validate(src, state, self.word_conf)
+            return parse_commands(src, min_word_conf=self.word_conf, media=self.media) or None
+        return validate(src, state, self.word_conf, self.media)
 
     def _choose(self, hyps: list, state: str) -> int:
         """Index of the best hypothesis that is a valid utterance in `state`.
@@ -1410,6 +1486,9 @@ class SpeechThread(threading.Thread):
             awake_g = grid_g = COMMAND_GRAMMAR
         else:
             awake_g, grid_g = AWAKE_SENTENCES, GRID_SENTENCES
+            if not self.media:               # same grammar without the "media ..." commands
+                awake_g = grammar_sentences(build_command_grammar("awake", media=False),
+                                            base=list(_COMMON_EXAMPLES))
         recs = {SLEEPING: make(WAKE_GRAMMAR), AWAKE: make(awake_g), GRID: make(grid_g)}
         kind = "open vocabulary" if self.open_vocab else ("flat word list" if self.flat_grammar
                                                           else f"{len(awake_g)}/{len(grid_g)} sentences")
@@ -1511,6 +1590,8 @@ def main() -> None:
                          "(default: zoom on each number as soon as it is recognised)")
     ap.add_argument("--no-minor-grid", action="store_true",
                     help="don't draw the thin dashed 9x9 lines that preview the next zoom level")
+    ap.add_argument("--no-media", action="store_true",
+                    help="turn off the media-button commands (\"media play\", \"media next\", ...)")
     ap.add_argument("--start-awake", action="store_true")
     ap.add_argument("--corner", choices=StatusPill.CORNERS, default="bottom-right",
                     help="screen corner the status box starts in (the arrow button cycles through all four)")
@@ -1544,14 +1625,15 @@ def main() -> None:
     screen = primary_screen()
     pill = StatusPill(root, screen, corner=args.corner)
     overlay = Overlay(root, screen, minor_grid=not args.no_minor_grid)
-    ctl = Controller(screen, WinMouse(), overlay, on_state=pill.set, keyboard=WinKeyboard())
+    ctl = Controller(screen, WinMouse(), overlay, on_state=pill.set, keyboard=WinKeyboard(),
+                     media=None if args.no_media else WinMedia())
     if args.start_awake:
         ctl.handle("start")
 
     cmds: queue.Queue[str] = queue.Queue()
     speech = SpeechThread(model_path, args.device, args.min_conf, lambda: ctl.state, cmds,
                           args.open_vocab, args.word_conf, args.nbest, log_path, args.lenient, args.flat_grammar,
-                          early_digits=not args.no_early_digits)
+                          early_digits=not args.no_early_digits, media=not args.no_media)
     speech.start()
 
     def meter_poll():
