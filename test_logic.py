@@ -746,3 +746,15 @@ assert V("stop listening", AWAKE) == ["stop"]
 kb = FakeKb(); c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=kb)
 say(c, "start listening start menu"); assert kb.log == [((), "win", 1)], kb.log
 print("start menu ok")
+
+
+# ================= relaunch helpers =================
+_argv = sys.argv
+sys.argv = ["voice_mouse.py", "--corner", "top-left"]
+assert self_command()[1:] == [os.path.abspath("voice_mouse.py"), "--corner", "top-left"]
+assert relaunch_command()[-1] == "--start-awake" and relaunch_command().count("--start-awake") == 1
+sys.argv = ["voice_mouse.py", "--start-awake", "--admin"]
+assert relaunch_command().count("--start-awake") == 1 and "--admin" in relaunch_command()
+sys.argv = _argv
+assert is_admin() in (True, False)                      # no crash off Windows
+print("relaunch helpers ok")

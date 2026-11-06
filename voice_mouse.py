@@ -92,6 +92,10 @@ complete, well-ordered command for the current state ("page" only before up/down
 after a key, grid words only in the grid ...); (3) with --nbest the best-ranked alternative that
 passes the check wins. --lenient restores the old skip-stray-words behaviour.
 
+Elevated windows: Windows (UIPI) stops a normal program from clicking or typing into windows that
+run as administrator, such as Task Manager or an installer. Start with --admin (or right-click ->
+Run as administrator) to reach them. It has no effect on windows that were not elevated.
+
 No console window: run it with  pythonw voice_mouse.py  (or double-click a .pyw copy) and there is
 never a console. --hide-console hides the console after start-up instead; it does not work inside
 Windows Terminal (the Windows 11 default), where only the tab can be closed. A compiled build can use
@@ -1047,15 +1051,39 @@ def make_dpi_aware() -> None:
             pass
 
 
-def relaunch_command() -> list[str]:
-    """Command line that starts this program again with the same options, listening from the start."""
+def self_command() -> list[str]:
+    """Command line that starts this program again exactly as it was started."""
     frozen = "__compiled__" in globals() or getattr(sys, "frozen", False)
-    args = [a for a in sys.argv[1:]]
-    if "--start-awake" not in args:
-        args.append("--start-awake")
+    args = list(sys.argv[1:])
     if frozen:
         return [os.path.abspath(sys.argv[0]), *args]
     return [sys.executable, os.path.abspath(sys.argv[0]), *args]
+
+
+def relaunch_command() -> list[str]:
+    """Command line that starts this program again with the same options, listening from the start."""
+    cmd = self_command()
+    if "--start-awake" not in cmd:
+        cmd.append("--start-awake")
+    return cmd
+
+
+def is_admin() -> bool:
+    import ctypes
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_as_admin() -> bool:
+    """Ask Windows to start a copy of this program elevated (shows the UAC prompt). True if the
+    elevated copy was started - the caller should then exit; False if it was refused or failed."""
+    import ctypes
+    import subprocess
+    exe, *args = self_command()
+    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, subprocess.list2cmdline(args), None, 1)
+    return rc > 32
 
 
 def hide_console() -> None:
@@ -1794,6 +1822,9 @@ def main() -> None:
                          "(default: zoom on each number as soon as it is recognised)")
     ap.add_argument("--no-minor-grid", action="store_true",
                     help="don't draw the thin dashed 9x9 lines that preview the next zoom level")
+    ap.add_argument("--admin", action="store_true",
+                    help="restart elevated (UAC prompt) so clicks and keys also reach administrator "
+                         "windows, which Windows otherwise blocks")
     ap.add_argument("--hide-console", action="store_true",
                     help="hide the console window once started (see the note in the docstring: "
                          "pythonw is the reliable way to run with no console at all)")
@@ -1822,6 +1853,11 @@ def main() -> None:
         sys.exit(f"Missing package ({e.name}). Install the requirements with:\n"
                  f"    {os.path.basename(sys.executable)} -m pip install vosk sounddevice")
 
+    if args.admin and not is_admin():
+        print("Restarting as administrator (accept the Windows prompt) ...")
+        if relaunch_as_admin():
+            return
+        print("Could not get administrator rights (prompt declined?); carrying on without them.")
     if args.hide_console:
         hide_console()                   # after the start-up checks above, so their errors are still seen
 

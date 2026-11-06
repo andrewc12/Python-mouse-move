@@ -19,3 +19,4 @@ echo Built: build\voice_mouse.dist\voice_mouse.exe
 echo Copy your "models" folder (vosk-model-small-en-us-0.15) next to the exe to skip the download.
 rem Add --windows-console-mode=disable to hide the console window (then you lose the printed log).
 rem Add --onefile for a single exe (slower start-up: it unpacks to a temp folder each run).
+rem Add --windows-uac-admin to make the exe always ask for administrator rights (so it can click admin windows).

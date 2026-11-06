@@ -23,3 +23,4 @@ echo.
 echo Built: build\voice_mouse.exe  (single file, roughly 100+ MB because it contains the model)
 rem The {CACHE_DIR} tempdir spec makes it unpack once and reuse that copy, so later starts are fast.
 rem Use --windows-console-mode=disable to hide the console window.
+rem Add --windows-uac-admin to make the exe always ask for administrator rights (so it can click admin windows).
