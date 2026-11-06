@@ -821,3 +821,9 @@ st3._close_mic(sd, live)
 assert live.closed and not live.active and st3.level == 0.0 and not st3.mic_ok and sd.refreshes == r0 + 1
 assert "microphone lost" in st3.last_heard
 print("microphone recovery ok")
+
+
+# ================= process priority =================
+assert PRIORITY_CLASSES == {"normal": 0x20, "above": 0x8000, "high": 0x80}
+assert "realtime" not in PRIORITY_CLASSES                      # never offered: can starve input and audio
+print("priority ok")

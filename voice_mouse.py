@@ -92,6 +92,9 @@ complete, well-ordered command for the current state ("page" only before up/down
 after a key, grid words only in the grid ...); (3) with --nbest the best-ranked alternative that
 passes the check wins. --lenient restores the old skip-stray-words behaviour.
 
+Priority: the program runs at high process priority so recognition and clicks stay responsive while
+other things hog the CPU (--priority normal / above / high; real-time is deliberately not offered).
+
 Elevated windows: Windows (UIPI) stops a normal program from clicking or typing into windows that
 run as administrator, such as Task Manager or an installer. Start with --admin (or right-click ->
 Run as administrator) to reach them. It has no effect on windows that were not elevated.
@@ -1068,6 +1071,21 @@ def relaunch_command() -> list[str]:
     return cmd
 
 
+# Windows process priority classes. "realtime" is deliberately not offered: it can starve the system's
+# own input handling (mouse and keyboard) and the audio drivers this program depends on.
+PRIORITY_CLASSES = {"normal": 0x00000020, "above": 0x00008000, "high": 0x00000080}
+
+
+def set_priority(level: str) -> bool:
+    """Give this process the named Windows priority class. True on success."""
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.windll.kernel32
+    k.GetCurrentProcess.restype = wintypes.HANDLE
+    k.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    return bool(k.SetPriorityClass(k.GetCurrentProcess(), PRIORITY_CLASSES[level]))
+
+
 def is_admin() -> bool:
     import ctypes
     try:
@@ -1945,6 +1963,9 @@ def main() -> None:
                          "(default: zoom on each number as soon as it is recognised)")
     ap.add_argument("--no-minor-grid", action="store_true",
                     help="don't draw the thin dashed 9x9 lines that preview the next zoom level")
+    ap.add_argument("--priority", choices=sorted(PRIORITY_CLASSES), default="high",
+                    help="Windows process priority (default high). Keeps clicks and speech responsive "
+                         "when the PC is busy; 'normal' turns it off")
     ap.add_argument("--admin", action="store_true",
                     help="restart elevated (UAC prompt) so clicks and keys also reach administrator "
                          "windows, which Windows otherwise blocks")
@@ -1976,6 +1997,9 @@ def main() -> None:
         sys.exit(f"Missing package ({e.name}). Install the requirements with:\n"
                  f"    {os.path.basename(sys.executable)} -m pip install vosk sounddevice")
 
+    if args.priority != "normal":
+        print(f"Process priority: {args.priority}" if set_priority(args.priority)
+              else f"Could not set {args.priority} priority; carrying on at normal.")
     if args.admin and not is_admin():
         print("Restarting as administrator (accept the Windows prompt) ...")
         if relaunch_as_admin():
