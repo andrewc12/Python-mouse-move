@@ -1224,6 +1224,8 @@ def main() -> None:
     ap.add_argument("--hotkey", default="ctrl+alt+d", help="toggle chord (default ctrl+alt+d)")
     ap.add_argument("--no-hotkey", action="store_true")
     ap.add_argument("--start-active", action="store_true", help="start dictating as soon as the models are loaded")
+    ap.add_argument("--always-on", action="store_true",
+                    help="test mode: start dictating as soon as the models load and ignore the hotkey")
     ap.add_argument("--corner", choices=StatusPill.CORNERS, default="bottom-right")
     ap.add_argument("--no-keep-on-top", action="store_true")
     ap.add_argument("--priority", choices=sorted(PRIORITY_CLASSES), default="above",
@@ -1235,6 +1237,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.language == "auto":
         args.language = None
+    if args.always_on:
+        args.start_active = args.no_hotkey = True
 
     if args.list_devices:
         import sounddevice as sd
@@ -1307,6 +1311,8 @@ def main() -> None:
             notice.say(f"model load failed: {e}")
             traceback.print_exc()
 
+    print(f"Loading models: draft={args.draft_model if draft_tr else 'off'}, final={args.final_model}. "
+          "The first run downloads them (about 750 MB), which can take several minutes.")
     threading.Thread(target=load_models, daemon=True, name="loader").start()
 
     # ---- the speech pipeline
@@ -1351,6 +1357,8 @@ def main() -> None:
 
     def set_listening(on: bool, source: str = "") -> None:
         if state["loading"]:
+            if source:
+                notice.say("still loading the speech models - wait for the box to say Paused/Dictating")
             return
         pipeline.set_active(on)
         pill.set(LISTENING if on else PAUSED)
@@ -1376,8 +1384,11 @@ def main() -> None:
         if state["loading"] and ready.is_set():
             state["loading"] = False
             set_listening(args.start_active)
-            if not args.start_active:
+            if args.start_active:
+                print("Dictating: click in a text box and talk." + ("" if args.no_hotkey else f" {args.hotkey} pauses."))
+            else:
                 pill.set(PAUSED)
+                print(f"Ready. Press {args.hotkey} or click the box to start dictating.")
         root.after(15, poll)
 
     def meter_poll():
