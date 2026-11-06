@@ -30,9 +30,10 @@ Dictation (awake only)
   go back to listening; the hotkey / box click goes to sleep instead.
   Inside dictation, as whole phrases: "new line", "new paragraph", "scratch that" (deletes the last
   phrase; also "delete that").
-  The first "dictate" loads the models in the background (the first run downloads about 750 MB into
-  ./models, --dictate-model-dir); dictation then starts by itself. --preload-dictation loads them at
-  start-up; --no-dictation turns the command off. Needs: pip install sherpa-onnx webrtcvad-wheels numpy
+  The models load (the first run downloads about 750 MB into ./models, --dictate-model-dir) in a
+  background thread at start-up, while the mouse and keyboard commands are already usable; the status
+  box says when dictation is ready. If you say "dictate" before then, it starts by itself once loaded.
+  --lazy-dictation waits until the first "dictate" instead; --no-dictation turns the command off. Needs: pip install sherpa-onnx webrtcvad-wheels numpy
   (requirements.txt). The console prints what dictation hears ("dictation: heard '...'") and, when it
   ends, how many audio frames had speech in them: zero means the microphone / --dictate-vad-level.
   Other knobs: --draft-model / --final-model (a sherpa-onnx or Whisper model name, e.g. small.en),
@@ -3205,9 +3206,10 @@ def main() -> None:
                          "try 0 or 1 if it does not pick up quiet speech)")
     ap.add_argument("--dictate-verbose", action="store_true",
                     help="print every dictation decode with its timing")
-    ap.add_argument("--preload-dictation", action="store_true",
-                    help="load the dictation models at start-up instead of the first time you say "
-                         "\"dictate\" (uses memory and CPU for a while at start)")
+    ap.add_argument("--lazy-dictation", action="store_true",
+                    help="don't load the dictation models at start-up; wait until the first time you "
+                         "say \"dictate\" (saves memory and start-up CPU, but that first use is slow, "
+                         "and the very first run downloads about 750 MB)")
     ap.add_argument("--draft-model", help=f"dictation: fast live model (default {DEFAULT_DRAFT})")
     ap.add_argument("--final-model", help=f"dictation: accurate model run at each pause (default {DEFAULT_FINAL})")
     ap.add_argument("--no-draft", action="store_true",
@@ -3306,8 +3308,8 @@ def main() -> None:
                 d_opts, say, on_idle=lambda: ctl.handle("listen"), on_stop=lambda: ctl.handle("listen"),
                 on_ready=lambda: ctl.handle("dictate"))
             speech.dictation_feed = dictation.feed
-            if args.preload_dictation:
-                dictation.request(want=False)
+            if not args.lazy_dictation:           # load (first run: download) in the background now,
+                dictation.request(want=False)     # so "dictate" works at once; Vosk starts meanwhile
     ctl.dictation = dictation
     speech.start()
 
