@@ -55,7 +55,10 @@ sherpa-onnx "asr-models" release), anything else is a faster-whisper model name.
   --final-model             e.g. sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8, or small.en / distil-small.en
                             / medium.en / large-v3-turbo (Whisper)
   --no-draft                only type when you pause (least CPU)
-  --pause-ms 600            how long a pause ends a phrase (lower = snappier, more splits)
+  --pause-ms 900            how long a pause ends a phrase (lower = snappier final text, more splits)
+  --long-after 12 --long-pause-ms 600 --max-phrase 20
+                            very long phrases may end at a shorter pause / are cut at a hard limit,
+                            so the final model never has to re-read too much at once
   --device cuda             use the NVIDIA GPU instead of the CPU. A GT 1030 has 2 GB and no fast
                             half-precision, so use small models only; it also needs the CUDA 12
                             runtime libraries and a CUDA build of the engine (see requirements.txt).
@@ -1238,7 +1241,14 @@ def main() -> None:
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--vad-level", type=int, choices=(0, 1, 2, 3), default=2,
                     help="voice-activity strictness: 3 ignores more noise, 0 hears more (default 2)")
-    ap.add_argument("--pause-ms", type=int, default=600, help="silence that ends a phrase (default 600)")
+    ap.add_argument("--pause-ms", type=int, default=900,
+                    help="silence that ends a phrase (default 900; lower = snappier final text, more splits)")
+    ap.add_argument("--long-after", type=float, default=12.0,
+                    help="after this many seconds of speech a shorter pause may end the phrase (default 12)")
+    ap.add_argument("--long-pause-ms", type=int, default=600,
+                    help="the shorter pause used once a phrase is that long (default 600)")
+    ap.add_argument("--max-phrase", type=float, default=20.0,
+                    help="a phrase is cut after this many seconds whatever happens (default 20)")
     ap.add_argument("--draft-interval", type=float, default=0.3, help="seconds between draft updates (default 0.3)")
     ap.add_argument("--idle-timeout", type=float, default=60.0,
                     help="seconds of silence after which dictation pauses by itself (default 60; 0 = never)")
@@ -1369,7 +1379,9 @@ def main() -> None:
         make_vad(args.vad_level),
         (lambda uid, pcm: draft_worker.submit((uid, pcm))) if draft_worker else None,
         lambda uid, pcm: final_worker.submit((uid, pcm)), out,
-        Segmenter(end_silence_ms=args.pause_ms), draft_every_s=args.draft_interval,
+        Segmenter(end_silence_ms=args.pause_ms, soft_after_s=args.long_after,
+                  soft_silence_ms=min(args.long_pause_ms, args.pause_ms), max_s=args.max_phrase),
+        draft_every_s=args.draft_interval,
         discard_draft=(draft_worker.discard if draft_worker else (lambda uid: None)),
         idle_s=args.idle_timeout)
     listener = Listener(args.mic, pipeline, notice)
