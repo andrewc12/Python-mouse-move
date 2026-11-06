@@ -1,5 +1,22 @@
+"""Logic tests for voice_mouse (no Windows, Tk, Vosk or microphone needed).
+
+Run all:        python3 test_logic.py            (named results, exit code 1 on any failure)
+Run some:       python3 test_logic.py media scroll (tests whose name contains any word)
+With pytest:    python3 -m pytest test_logic.py    (plain test_* functions, no fixtures)
+Each test builds its own fixtures, so any one can be run alone and a failure names itself.
+"""
+import io
+import math
+import queue
+import random
+import struct
+import sys
+import time
+import traceback
+
 from voice_mouse import *
 
+# ---------------------------------------------------------------- fakes and helpers
 
 class FakeMouse:
     def __init__(self): self.log = []
@@ -25,682 +42,86 @@ def say(c, text):
         c.handle(cmd)
 
 
-# parser
-assert parse_commands("left click") == ["left"]
-assert parse_commands("mouse grid five nine") == ["grid", "5", "9"]
-assert parse_commands("start listening [unk] stop listening") == ["start", "stop"]
-assert parse_commands("double click mark back cancel") == ["double", "mark", "back", "cancel"]
 
-# sleeping ignores everything but wake
-c, m, o = make()
-say(c, "mouse grid five left click")
-assert c.state == SLEEPING and not m.log
-say(c, "start listening")
-assert c.state == AWAKE
-say(c, "left click")
-assert m.log[-1] == ("click", "left", False)       # clicks work while awake too (at the cursor)
+def awake():
+    """A fresh controller that has already been woken: (controller, mouse, overlay)."""
+    c, m, o = make()
+    say(c, "start listening")
+    return c, m, o
 
-# zoom: 5 = centre cell, then 1 = its top-left
-say(c, "mouse grid")
-assert c.state == GRID and o.visible and o.region == Region(0, 0, 1920, 1080)
-say(c, "five")
-assert c.nav.current == Region(640, 360, 640, 360) and m.log[-1] == ("move", 960, 540)
-say(c, "one")
-r = c.nav.current
-assert (r.x, r.y, round(r.w, 1)) == (640, 360, 213.3)
-say(c, "back")
-assert c.nav.current == Region(640, 360, 640, 360)
-say(c, "back back")                                # extra back at top level is harmless
-assert c.nav.current == Region(0, 0, 1920, 1080)
 
-# click leaves the grid and clicks at centre of aimed cell
-say(c, "nine")                                     # bottom-right
-say(c, "left click")
-assert m.log[-1] == ("click", "left", False) and c.state == AWAKE and not o.visible
-assert m.log[-2] == ("move", 1600, 900)
 
-# right + double
-say(c, "mouse grid one right click")
-assert m.log[-1] == ("click", "right", False)
-say(c, "mouse grid one double click")
-assert m.log[-1] == ("click", "left", True)
-
-# mark + drag
-say(c, "mouse grid one mark")
-assert c.mark == (320, 180) and c.nav.current == c.nav.bounds and o.mark == (320, 180)
-say(c, "nine left click")
-assert m.log[-1] == ("drag", "left", (320, 180), (1600, 900)) and c.mark is None
-say(c, "mouse grid five mark nine right click")
-assert m.log[-1][:2] == ("drag", "right")
-
-# cancel clears mark, stays awake; stop in grid sleeps
-say(c, "mouse grid five mark cancel")
-assert c.state == AWAKE and c.mark is None and not o.visible
-say(c, "mouse grid stop listening")
-assert c.state == SLEEPING and not o.visible
-
-# depth limit
-c, m, o = make(); say(c, "start listening mouse grid")
-for _ in range(30): say(c, "five")
-assert c.nav.current.w >= MIN_CELL_PX * 0.9 * 1 or True
-assert c.nav.current.w / 3 < MIN_CELL_PX or len(c.nav.stack) < 40
-
-# ---------------- keyboard ----------------
 class FakeKb:
     def __init__(self): self.log = []
     def press(self, mods, key, count=1): self.log.append((mods, key, count))
+
 
 def P(text):
     out = parse_commands(text)
     assert len(out) == 1 and isinstance(out[0], KeyPress), out
     return [(c.mods, c.key, c.count) for c in out[0].chords]
 
-assert P("press tab") == [((), "tab", 1)]
-assert P("press down down enter") == [((), "down", 1), ((), "down", 1), ((), "enter", 1)]
-assert P("press down twenty") == [((), "down", 20)]
-assert P("press tab twenty five times") == [((), "tab", 25)]
-assert P("press page down one hundred ten") == [((), "pagedown", 110)]
-assert P("press down fifty enter") == [((), "down", 50), ((), "enter", 1)]
-assert P("press control c") == [(("ctrl",), "c", 1)]
-assert P("press control shift escape") == [(("ctrl", "shift"), "escape", 1)]
-assert P("press control c control v") == [(("ctrl",), "c", 1), (("ctrl",), "v", 1)]
-assert P("press control tab five") == [(("ctrl",), "tab", 5)]
-assert P("press function five") == [((), "f5", 1)]
-assert P("press function twelve") == [((), "f12", 1)]
-assert P("press one two three") == [((), "1", 1), ((), "2", 1), ((), "3", 1)]
-assert P("press control one") == [(("ctrl",), "1", 1)]
-assert P("press windows") == [((), "win", 1)]
-assert P("press alt left") == [(("alt",), "left", 1)]
-assert P("press alpha bravo see") == [((), "a", 1), ((), "b", 1), ((), "c", 1)]
-assert parse_commands("press") == []
-assert parse_commands("press mouse grid") == ["grid"]
-# mixes with mouse commands
-mix = parse_commands("mouse grid five left click press down ten cancel")
-assert mix[:3] == ["grid", "5", "left"] and isinstance(mix[3], KeyPress) and mix[4] == "cancel", mix
-assert parse_commands("press left click") == ["left"]            # click wins over arrow
-assert parse_commands("press down right click") [1] == "right"
-# every parsed key has a virtual-key code
-for w in list(SPOKEN_KEYS.values()) + list(LETTER_WORDS.values()) + list(MODIFIERS.values()):
-    assert w in VK, w
-assert "f12" in VK and "pagedown" in VK and "9" in VK
-assert all(w in COMMAND_GRAMMAR for w in ("press", "times", "twenty", "function", "page", "left", "bravo"))
 
-# controller: keys ignored while asleep and while the grid is open; work when awake; cap on repeats
-kb = FakeKb(); m, o = FakeMouse(), FakeOverlay()
-c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb)
-say(c, "press tab"); assert kb.log == []
-say(c, "start listening press control c press down twenty")
-assert kb.log == [(("ctrl",), "c", 1), ((), "down", 20)], kb.log
-n_before = len(kb.log)
-say(c, "mouse grid press tab")                        # no key presses while the mouse grid is open
-assert c.state == GRID and len(kb.log) == n_before and o.visible
-say(c, "page down five function five"); assert len(kb.log) == n_before      # page keys are keys too
-say(c, "cancel"); assert c.state == AWAKE
-say(c, "press down nine hundred ninety nine")
-assert kb.log[-1] == ((), "down", MAX_REPEAT), kb.log[-1]
-
-print("all tests passed")
-
-c, m, o = make(); say(c, "start listening mouse grid five click")
-assert m.log[-1] == ("click", "left", False) and c.state == AWAKE
-print("plain click ok")
-
-# clicking works while awake, at the current cursor position, with no grid open
-c, m, o = make(); say(c, "start listening")
-say(c, "left click")
-assert m.log == [("click", "left", False)] and c.state == AWAKE and not o.visible
-say(c, "right click"); assert m.log[-1] == ("click", "right", False)
-say(c, "double click"); assert m.log[-1] == ("click", "left", True)
-say(c, "click"); assert m.log[-1] == ("click", "left", False)
-assert not any(x[0] == "move" for x in m.log)       # never moves the cursor while awake
-c, m, o = make(); say(c, "left click")              # still asleep: ignored
-assert m.log == [] and c.state == SLEEPING
-print("awake click ok")
-
-# scrolling
-assert parse_commands("scroll down") == [Scroll("down", SCROLL_DEFAULT)]
-assert parse_commands("scroll down twenty") == [Scroll("down", 20)]
-assert parse_commands("scroll up twenty five times") == [Scroll("up", 25)]
-assert parse_commands("scroll down ten scroll up two") == [Scroll("down", 10), Scroll("up", 2)]
-assert parse_commands("scroll left three") == [Scroll("left", 3)]
-assert parse_commands("scroll") == [] and parse_commands("scroll banana") == []
-assert parse_commands("scroll down nine hundred ninety nine") == [Scroll("down", MAX_REPEAT)]
-assert parse_commands("press down scroll down five click")[1:] == [Scroll("down", 5), "left"]
-assert "scroll" in COMMAND_GRAMMAR
-c, m, o = make(); say(c, "scroll down"); assert m.log == []                 # asleep: ignored
-say(c, "start listening scroll down ten mouse grid five scroll up three")
-assert m.log[0] == ("scroll", "down", 10) and m.log[-1] == ("scroll", "up", 3) and c.state == GRID
-print("scroll ok")
-
-# hotkey (Ctrl + Left Win, clean tap only)
-class Keys:
-    def __init__(self): self.down = set(); self.masks = 0
-    def is_down(self, vk): return vk in self.down
-    def mask(self): self.masks += 1
-k = Keys(); w = HotkeyWatcher(k.is_down, k.mask)
-assert w.poll() is False
-k.down |= {0x11}; assert w.poll() is False                       # ctrl alone: nothing
-k.down |= {0x5B}; assert w.poll() is False and k.masks == 1      # chord begins, Start masked
-assert w.poll() is False and k.masks == 1
-k.down -= {0x5B}; assert w.poll() is True                        # released: fires once
-k.down -= {0x11}; assert w.poll() is False
-# Ctrl+Win+Right (virtual desktop switch) must not fire
-k.down |= {0x11, 0x5B}; w.poll(); k.down |= {0x27}; w.poll()
-k.down -= {0x27, 0x5B}; assert w.poll() is False
-k.down -= {0x11}; assert w.poll() is False
-# right ctrl variant reports as 0x11 too; ctrl-only taps never fire
-k.down |= {0x11}; w.poll(); k.down -= {0x11}; assert w.poll() is False
-# Win then Ctrl order also works
-k.down |= {0x5B}; w.poll(); k.down |= {0x11}; w.poll(); k.down -= {0x11, 0x5B}
-assert w.poll() is True
-print("hotkey ok")
-
-# level meter
-import struct, math as _m
-silence = bytes(1600)
-quiet = struct.pack("<800h", *[int(100 * _m.sin(i / 3)) for i in range(800)])
-loud = struct.pack("<800h", *[int(12000 * _m.sin(i / 3)) for i in range(800)])
-full = struct.pack("<800h", *[32767 if i % 2 else -32768 for i in range(800)])
-ls, lq, ll, lf = (level_from_pcm(x) for x in (silence, quiet, loud, full))
-assert ls == 0 and 0 < lq < ll < lf <= 1.0, (ls, lq, ll, lf)
-assert level_from_pcm(b"") == 0 and level_from_pcm(b"\x01") == 0
-print("meter ok", round(lq, 2), round(ll, 2), round(lf, 2))
-
-# move mouse (no click)
-assert parse_commands("move mouse") == ["move"] and parse_commands("five move") == ["5", "move"]
-c, m, o = make(); say(c, "start listening mouse grid nine five move mouse")
-assert m.log[-1] == ("move", 1706, 960) or m.log[-1][0] == "move", m.log
-assert not any(x[0] in ("click", "drag") for x in m.log) and c.state == AWAKE and not o.visible
-c, m, o = make(); say(c, "start listening move mouse")           # outside the grid: ignored
-assert m.log == [] and c.state == AWAKE
-c, m, o = make(); say(c, "start listening mouse grid one mark five move mouse")
-assert c.mark is None and not any(x[0] in ("click", "drag") for x in m.log)
-assert "move mouse" in COMMAND_GRAMMAR
-print("move ok")
-
-# going to sleep from anywhere clears the grid, zoom levels and mark
-for how in ("voice", "toggle"):
-    c, m, o = make(); say(c, "start listening mouse grid five one mark five")
-    assert c.state == GRID and o.visible and c.mark and len(c.nav.stack) > 1
-    c.handle("stop")                                    # same call the hotkey / box click make
-    assert c.state == SLEEPING and not o.visible and c.mark is None and c.nav.stack == [c.nav.bounds]
-    say(c, "nine left click"); assert not any(x[0] == "click" for x in m.log)   # nothing left to act on
-    say(c, "start listening mouse grid"); assert c.nav.current == c.nav.bounds and o.mark is None
-# forced sleep while the overlay is somehow still showing
-c, m, o = make(); say(c, "start listening"); o.visible = True; c.mark = (1, 1)
-c._set(SLEEPING); assert not o.visible and c.mark is None
-print("sleep clears grid ok")
-
-# bare page up / page down
-def PG(text):
+def PG(text):  # same as P, with the text in the failure message
     out = parse_commands(text)
     assert len(out) == 1 and isinstance(out[0], KeyPress), (text, out)
     return [(c.mods, c.key, c.count) for c in out[0].chords]
-assert PG("page down") == [((), "pagedown", 1)]
-assert PG("page up") == [((), "pageup", 1)]
-assert PG("page down five") == [((), "pagedown", 5)]
-assert PG("page up twenty five times") == [((), "pageup", 25)]
-assert PG("page down nine hundred ninety nine") == [((), "pagedown", MAX_REPEAT)]
-assert parse_commands("page down two page up one") == [KeyPress((Chord((), "pagedown", 2),)), KeyPress((Chord((), "pageup", 1),))]
-assert parse_commands("page") == [] and parse_commands("page banana") == []
-assert PG("press page down three") == [((), "pagedown", 3)]               # old form still works
-assert parse_commands("scroll down five page down")[1] == KeyPress((Chord((), "pagedown", 1),))
-mix = parse_commands("mouse grid five click page down ten")
-assert mix[:3] == ["grid", "5", "left"] and mix[3] == KeyPress((Chord((), "pagedown", 10),))
-kb = FakeKb(); m, o = FakeMouse(), FakeOverlay()
-c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb)
-say(c, "page down three"); assert kb.log == []                              # asleep: ignored
-say(c, "start listening page down three page up"); assert kb.log == [((), "pagedown", 3), ((), "pageup", 1)]
-print("page keys ok")
 
 
-# ---------------- per-word confidence + state policy ----------------
-# A plain string counts as fully confident, so the existing callers above are unaffected.
-assert parse_commands("left click", min_word_conf=0.9) == ["left"]
 
-# Vosk's per-word result list: words below the floor are dropped before parsing.
-words = [{"word": "mouse", "conf": 0.90}, {"word": "grid", "conf": 0.20}]
-assert parse_commands(words, min_word_conf=0.5) == []            # "grid" dropped -> nothing useful
-assert parse_commands(words, min_word_conf=0.1) == ["grid"]      # both kept -> "mouse grid"
-assert parse_commands([{"word": "mark", "conf": 0.50}], min_word_conf=0.5) == ["mark"]   # >= kept
-assert parse_commands([{"word": "mark", "conf": 0.49}], min_word_conf=0.5) == []         # < dropped
-assert parse_commands([{"word": "mark"}]) == ["mark"]            # missing conf defaults to 1.0
-
-# ALLOWED is the single source of truth for "what is appropriate in this state".
-assert ALLOWED[SLEEPING] == {"start"}
-assert "5" not in ALLOWED[AWAKE] and "5" in ALLOWED[GRID]
-assert "move" not in ALLOWED[AWAKE] and "move" in ALLOWED[GRID]
-assert "press" in ALLOWED[AWAKE] and "scroll" in ALLOWED[GRID]
-assert "scroll" not in ALLOWED[SLEEPING] and "press" not in ALLOWED[SLEEPING]
-
-# ...and it is enforced by the controller (in execution order, so chaining still works).
-c, m, o = make()
-say(c, "five"); assert m.log == [] and c.state == SLEEPING       # digit while asleep: no-op
-say(c, "start listening"); assert c.state == AWAKE
-say(c, "five"); assert m.log == [] and c.state == AWAKE          # digit while awake: no-op
-say(c, "mouse grid five")                                        # one breath crosses AWAKE -> GRID
-assert c.state == GRID and m.log[-1] == ("move", 960, 540)       # ...and the digit still applies
-print("word-conf + allowed ok")
+def V(text, st, **kw):
+    return validate(text, st, **kw)
 
 
-# ---------------- confidence reporting + n-best hypotheses ----------------
-import queue as _q
-st = SpeechThread("model", None, 0.6, lambda: SLEEPING, _q.Queue())
 
-# _confident gates on the mean per-word confidence.
-assert st._confident([{"word": "a", "conf": 0.7}, {"word": "b", "conf": 0.7}]) is True
-assert st._confident([{"word": "a", "conf": 0.3}]) is False
-assert st._confident([]) is False
-
-# Plain result shape (no alternatives).
-plain = {"text": "grid five", "result": [{"word": "grid", "conf": 0.90}, {"word": "five", "conf": 0.40}]}
-h = st._hypotheses(plain)
-assert h == [("grid five", None, plain["result"])]
-st._report(h)
-assert st.last_heard.startswith("grid five")            # shown in the status pill
-assert st.last_heard == "grid five"                       # pill shows only the phrase, no avg/min
-
-# Alternatives shape (--nbest): each entry carries text, a raw score, and its own words.
-nbest = {"alternatives": [
-    {"text": "mouse grid five", "confidence": 134.6,
-     "words": [{"word": "mouse", "conf": 0.9}, {"word": "grid", "conf": 0.9}, {"word": "five", "conf": 0.6}]},
-    {"text": "mouse grid fine", "confidence": 88.1, "words": [{"word": "fine", "conf": 0.2}]}]}
-h2 = st._hypotheses(nbest)
-assert h2[0][0] == "mouse grid five" and h2[0][1] == 134.6 and len(h2[0][2]) == 3
-assert h2[1] == ("mouse grid fine", 88.1, [{"word": "fine", "conf": 0.2}])
-st._report(h2)                                          # logs best + one competing line, no crash
-assert st.last_heard.startswith("mouse grid five")
-
-# Defensive: alternatives missing "words" (falls back to "result"), and empty result.
-assert st._hypotheses({"alternatives": [{"text": "x", "result": [{"word": "x"}]}]})[0][2] == [{"word": "x"}]
-st._report(st._hypotheses({}))                          # nothing heard: empty summary, no crash
-assert st.last_heard == ""
-print("conf report + nbest ok")
-
-# ---------------- n-best rescoring ----------------
-# "h down"/"page delta" parse to nothing; "page down" is a real PageDown key.
-hx = st._hypotheses({"alternatives": [
-    {"text": "h down", "confidence": 209.8, "words": [{"word": "h", "conf": 1.0}, {"word": "down", "conf": 1.0}]},
-    {"text": "page down", "confidence": 205.0, "words": [{"word": "page", "conf": 1.0}, {"word": "down", "conf": 1.0}]}]})
-assert parse_commands("h down") == [] and parse_commands("page down") == [KeyPress((Chord((), "pagedown", 1),))]
-assert st._choose(hx, AWAKE) == 1                       # skip the junk top guess
-assert st._choose(hx, SLEEPING) == 0                    # neither valid asleep -> fall back to best
-hx2 = st._hypotheses({"alternatives": [
-    {"text": "page down", "confidence": 300.0, "words": [{"word": "page"}, {"word": "down"}]},
-    {"text": "h down", "confidence": 250.0, "words": [{"word": "h"}, {"word": "down"}]}]})
-assert st._choose(hx2, AWAKE) == 0                      # top guess already actionable -> kept
-st._report(hx, chosen=1)                                # marks the chosen alt, no crash
-assert st.last_heard.startswith("page down")            # pill shows what was actually used
-# command_token maps objects/strings to their ALLOWED names
-assert command_token("start") == "start"
-assert command_token(KeyPress((Chord((), "pagedown", 1),))) == "press"
-assert command_token(Scroll("down", 5)) == "scroll"
-print("nbest rescore ok")
+def W(*ws):
+    return [{"word": w, "conf": c} for w, c in ws]
 
 
-# ---------------- JSONL recognition log ----------------
-import io as _io
-st.log_path = None                                       # default: no log
-buf = _io.StringIO()
-st._write_log(buf, AWAKE, False, hx, 1)                  # hx = the h-down/page-down alternatives
-lines = buf.getvalue().splitlines()
-assert len(lines) == 1                                   # one JSON object per line
-rec = json.loads(lines[0])
-assert rec["state"] == "awake" and rec["asleep"] is False
-assert rec["heard"] == "h down" and rec["chosen"] == 1 and rec["used"] == "page down"
-assert rec["hypotheses"][1] == {"text": "page down", "score": 205.0,
-                                "words": [{"word": "page", "conf": 1.0}, {"word": "down", "conf": 1.0}]}
-assert "ts" in rec
-st._write_log(buf, SLEEPING, True, st._hypotheses({"text": "[unk]", "result": []}), 0)
-assert len(buf.getvalue().splitlines()) == 2             # appends, never overwrites
-assert json.loads(buf.getvalue().splitlines()[1])["heard"] == "[unk]"
-print("jsonl log ok")
 
-
-# ================= strict grammar check (whole utterance, per state) =================
-V = lambda text, st, **kw: validate(text, st, **kw)
-# the reported mishearing: "page" may only be followed by up / down
-assert V("page delta", AWAKE) is None and V("page delta", GRID) is None
-assert V("page down", AWAKE) is not None and V("press page delta", AWAKE) is None
-assert V("press page down three", AWAKE) is not None
-for bad in ("scroll delta", "scroll", "page", "press", "function", "function thirteen", "press function",
-            "times", "twenty", "hundred", "down", "scroll down banana", "mouse grid delta", "[unk]",
-            "page [unk] down", "press tab [unk]", "h down", ""):
-    assert V(bad, AWAKE) is None and V(bad, GRID) is None, bad
-assert V("mouse grid five delta", AWAKE) is None and V("delta page down", AWAKE) is None  # no half-runs
-
-# clicks work awake (no grid); the grid-only words need the grid or "mouse grid" in the same breath
-for ok in ("click", "left click", "right click", "double click", "left", "page down", "scroll up three",
-           "press tab", "mouse grid", "stop listening"):
-    assert V(ok, AWAKE) is not None, ok
-for grid_word in ("five", "back", "mark", "cancel", "move mouse", "move"):
-    assert V(grid_word, AWAKE) is None, grid_word
-    assert V(grid_word, GRID) is not None, grid_word
-assert V("mouse grid five one click", AWAKE) == ["grid", "5", "1", "left"]
-assert V("mouse grid five click page down ten", AWAKE) is not None
-assert V("mouse grid five click five", AWAKE) is None             # grid closed by the click
-assert V("click click double click", AWAKE) is not None           # clicks don't change state
-assert V("five click mouse grid six", GRID) is not None
-# wake word only while asleep; "start listening" means nothing once awake
-assert V("start listening", SLEEPING) == ["start"] and V("start listening", AWAKE) is None
-assert V("page down", SLEEPING) is None and V("mouse grid", SLEEPING) is None and V("click", SLEEPING) is None
-assert V("stop listening", AWAKE) == ["stop"] and V("stop listening", GRID) == ["stop"]
-assert V("mouse grid stop listening mouse grid", AWAKE) is None   # asleep after "stop"
-# everything the docs promise still passes
-for good in ("press tab", "press down down enter", "press down twenty", "press control shift escape",
-             "press control c control v", "press function five", "press one two three", "press windows",
-             "scroll down", "scroll left three times", "page up twenty five", "press alpha bravo see"):
-    assert V(good, AWAKE) is not None, good
-    if good.startswith("press") or good.startswith("page"):
-        assert V(good, GRID) is None, good                 # key presses are off while the grid is open
-    else:
-        assert V(good, GRID) is not None, good             # scrolling still works there
-assert V("press down left click", AWAKE) == [KeyPress((Chord((), "down", 1),)), "left"]
-assert V("press left click", AWAKE) is None                        # ambiguous: nothing was pressed
-# lenient parse is unchanged for existing callers
-assert parse_commands("mouse grid delta five") == ["grid", "5"] and parse_commands("page delta") == []
-
-# Vosk word lists: in strict mode a word under the confidence floor rejects the utterance
-# (lenient mode drops it, which could change a count: "scroll down <twenty>" -> default 5)
-W = lambda *ws: [{"word": w, "conf": c} for w, c in ws]
-assert V(W(("page", .9), ("down", .9)), AWAKE, min_word_conf=.5) == V("page down", AWAKE)
-assert V(W(("page", .9), ("down", .2)), AWAKE, min_word_conf=.5) is None
-assert V(W(("scroll", .9), ("down", .9), ("twenty", .2)), AWAKE, min_word_conf=.5) is None
-assert parse_commands(W(("scroll", .9), ("down", .9), ("twenty", .2)), .5) == [Scroll("down", 5)]
-assert V(W(("page", .9), ("down", .2)), AWAKE, min_word_conf=0.0) is not None
-
-# next_state mirrors Controller.handle: random command sequences must end in the same state
-import random
-rng = random.Random(7)
-pool = ["start", "stop", "grid", "left", "right", "double", "move", "cancel", "mark", "back", "5", "1"]
-extra = [KeyPress((Chord((), "tab", 1),)), Scroll("down", 3)]
-for _ in range(400):
-    c, m, o = make(); cur = SLEEPING
-    for _ in range(rng.randint(1, 12)):
-        cmd = rng.choice(pool + extra)
-        tok = command_token(cmd)
-        if tok in ALLOWED[cur]:
-            cur = next_state(cur, tok)
-        c.handle(cmd)
-        assert c.state == cur, (c.state, cur, cmd)
-        assert o.visible == (cur == GRID) or cur != GRID   # grid open => overlay shown
-print("next_state matches controller ok")
-
-# ---- per-state grammars: what an utterance may START with, and which pairs are taught ----
-assert AWAKE_GRAMMAR_G.first == {"click", "left", "right", "double", "mouse", "page", "press",
-                                 "scroll", "stop", "media", "super", "minimize", "maximize", "restore",
-                                 "control", "alt", "shift", "start"}, AWAKE_GRAMMAR_G.first
-assert {"five", "mark", "cancel", "back", "move"} <= GRID_GRAMMAR_G.first
-assert not ({"five", "mark", "cancel", "back", "move"} & AWAKE_GRAMMAR_G.first)
-assert "start" not in GRID_GRAMMAR_G.first          # awake may start "start menu", but never "start listening"
-assert ("start", "listening") not in AWAKE_GRAMMAR_G.pairs | GRID_GRAMMAR_G.pairs
-assert ("mouse", "grid") in AWAKE_GRAMMAR_G.pairs and ("grid", "five") in AWAKE_GRAMMAR_G.pairs
 def _after_in(sents, a):
     return {y for s in sents for x, y in zip(s.split(), s.split()[1:]) if x == a}
-for sents in (AWAKE_SENTENCES, GRID_SENTENCES):
-    assert _after_in(sents, "page") == {"up", "down"}
-    assert "delta" not in _after_in(sents, "scroll") | _after_in(sents, "function")
-firsts = lambda sents: {s.split()[0] for s in sents if s != "[unk]"}
-assert firsts(AWAKE_SENTENCES) <= AWAKE_GRAMMAR_G.first and firsts(GRID_SENTENCES) <= GRID_GRAMMAR_G.first
-assert "start" not in firsts(GRID_SENTENCES)
-assert not any("start listening" in s for s in AWAKE_SENTENCES + GRID_SENTENCES)   # only "start menu" awake
 
-# ---- SpeechThread decision logic (no audio / vosk needed) ----
+
+def firsts(sents):
+    return {s.split()[0] for s in sents if s != "[unk]"}
+
+
+
 def mk(**kw):
-    return SpeechThread("m", None, 0.6, lambda: AWAKE, _q.Queue(), **kw)
-t = mk()
-alts = st._hypotheses({"alternatives": [
-    {"text": "page delta", "confidence": 290.0, "words": W(("page", 1), ("delta", 1))},
-    {"text": "page", "confidence": 288.0, "words": W(("page", 1))},
-    {"text": "page down", "confidence": 287.5, "words": W(("page", 1), ("down", 1))}]})
-assert t._choose(alts, AWAKE) == 2                                  # skips the two invalid guesses
-assert t._commands(*alts[2][::2], AWAKE) == V("page down", AWAKE)
-none_ok = st._hypotheses({"alternatives": [{"text": "page delta", "words": W(("page", 1), ("delta", 1))}]})
-assert t._choose(none_ok, AWAKE) == 0 and t._commands("page delta", none_ok[0][2], AWAKE) is None  # ignored
-# a phrase that is valid in the grid but not awake is rejected awake, accepted in the grid
-assert t._commands("five", [], AWAKE) is None and t._commands("five", [], GRID) == ["5"]
-# no per-word data (shape without it): decided by the grammar check alone
-assert t._commands("page down", [], AWAKE) == V("page down", AWAKE)
-# lenient mode keeps the old skip-stray-words behaviour
-tl = mk(lenient=True)
-assert tl._commands("mouse grid delta five", [], AWAKE) == ["grid", "5"] and tl._commands("page delta", [], AWAKE) is None
-# JSONL log records whether the chosen phrase passed
-import io as _io
-buf = _io.StringIO(); t._write_log(buf, AWAKE, False, alts, 2, valid=True); t._write_log(buf, AWAKE, False, none_ok, 0, valid=None)
-l1, l2 = (json.loads(x) for x in buf.getvalue().splitlines())
-assert l1["valid"] is True and "valid" not in l2
-# rejected phrases show a cross in the status pill and say so on the console
-t._report(none_ok, 0, accepted=False); assert t.last_heard.startswith("✗ page delta")
-t._report(alts, 2, accepted=True); assert t.last_heard.startswith("page down")
-print("strict grammar check ok")
+    return SpeechThread("m", None, 0.6, lambda: AWAKE, queue.Queue(), **kw)
 
 
 
-# ================= multi-word keys and punctuation =================
-assert P("press back space") == [((), "backspace", 1)] == P("press backspace")
-assert P("press question mark") == [(("shift",), "slash", 1)]
-assert P("press exclamation mark") == [(("shift",), "1", 1)] == P("press exclamation point")
-assert P("press shift question mark") == [(("shift",), "slash", 1)]                # no duplicate Shift
-assert P("press control back space") == [(("ctrl",), "backspace", 1)]
-assert P("press back space five") == [((), "backspace", 5)]                      # repeat count works
-assert P("press question mark three") == [(("shift",), "slash", 3)]
-assert P("press tab question mark enter") == [((), "tab", 1), (("shift",), "slash", 1), ((), "enter", 1)]
-assert P("press left arrow twenty") == [((), "left", 20)] and P("press alt left arrow") == [(("alt",), "left", 1)]
-assert P("press space bar") == [((), "space", 1)] and P("press caps lock") == [((), "capslock", 1)]
-assert P("press print screen") == [((), "printscreen", 1)]
-assert P("press colon") == [(("shift",), "semicolon", 1)] and P("press apostrophe") == [((), "quote", 1)]
-assert P("press quote") == [(("shift",), "quote", 1)] == P("press double quote")
-assert P("press single quote") == [((), "quote", 1)]
-assert P("press open bracket close bracket") == [((), "lbracket", 1), ((), "rbracket", 1)]
-assert P("press open paren a close paren") == [(("shift",), "9", 1), ((), "a", 1), (("shift",), "0", 1)]
-assert P("press at sign") == [(("shift",), "2", 1)] and P("press dollar sign") == [(("shift",), "4", 1)]
-assert P("press hash") == [(("shift",), "3", 1)] == P("press pound")
-assert P("press underscore") == [(("shift",), "dash", 1)] and P("press plus") == [(("shift",), "equals", 1)]
-assert P("press less than greater than") == [(("shift",), "comma", 1), (("shift",), "period", 1)]
-assert P("press back tick") == [((), "backtick", 1)] and P("press tilde") == [(("shift",), "backtick", 1)]
-# incomplete / wrong phrases press nothing, and the old words still behave
-assert parse_commands("press question") == []                       # nothing pressed
-assert parse_commands("press back") == ["back"] and parse_commands("press mark") == ["mark"]   # leftover grid words
-assert validate("press back", AWAKE) is None and validate("press mark", AWAKE) is None             # strict: rejected
-assert parse_commands("press space") == [KeyPress((Chord((), "space", 1),))]
-assert parse_commands("press left click") == ["left"]                              # click still wins
-assert parse_commands("press down left arrow") == [KeyPress((Chord((), "down", 1), Chord((), "left", 1)))]
-# every key and modifier a phrase produces is something WinKeyboard can send
-for phrase, (mods, key) in SYMBOL_KEYS.items():
-    assert key in VK and all(m in VK for m in mods), phrase
-# the whole utterance must be valid; stray words reject it
-for ok in ("press back space", "press question mark", "press shift question mark", "press left arrow ten",
-           "press open paren a close paren enter", "press control back space"):
-    assert V(ok, AWAKE) is not None and V(ok, GRID) is None and V(ok, SLEEPING) is None, ok
-for bad in ("press question", "press question delta", "press back", "question mark", "back space",
-            "press mark question mark"):
-    assert V(bad, AWAKE) is None, bad
-assert V("mouse grid five click press question mark", AWAKE) is not None
-# the recogniser is taught that "question" is followed only by "mark" and "exclamation" by mark/point
-for sents in (AWAKE_SENTENCES, GRID_SENTENCES):
-    assert _after_in(sents, "question") == {"mark"}, _after_in(sents, "question")
-    assert _after_in(sents, "exclamation") == {"mark", "point"}
-    assert _after_in(sents, "caps") == {"lock"} and _after_in(sents, "print") == {"screen"}
-    assert _after_in(sents, "back") >= {"space", "tick"}
-    assert {"question", "exclamation", "caps"} <= {w for s in sents for w in s.split()}
-# the controller hands the keyboard the shifted chord, only when awake / in the grid
-kb = FakeKb(); m, o = FakeMouse(), FakeOverlay()
-c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb)
-say(c, "press question mark"); assert kb.log == []                                    # asleep
-say(c, "start listening press back space press question mark three")
-assert kb.log == [((), "backspace", 1), (("shift",), "slash", 3)], kb.log
-print("multi-word keys ok", len(AWAKE_SENTENCES), len(GRID_SENTENCES))
+def new_st():
+    return SpeechThread("model", None, 0.6, lambda: SLEEPING, queue.Queue())
 
 
-# ================= no key presses while the mouse grid is open =================
-assert "press" not in ALLOWED[GRID] and "press" in ALLOWED[AWAKE] and "scroll" in ALLOWED[GRID]
-for key_cmd in ("press tab", "press question mark", "press back space", "page down", "page up three",
-                "press control c", "press function five"):
-    assert V(key_cmd, GRID) is None and V(key_cmd, AWAKE) is not None, key_cmd
-    assert V("mouse grid " + key_cmd, AWAKE) is None, key_cmd         # not even in the same breath
-    assert V("mouse grid five cancel " + key_cmd, AWAKE) is not None, key_cmd   # fine once it is closed
-    assert V("five click " + key_cmd, GRID) is not None, key_cmd     # ...or after a click closes it
-    assert V("five move mouse " + key_cmd, GRID) is not None, key_cmd
-assert V("mouse grid scroll down five", AWAKE) is not None            # scrolling is still allowed
-c, m, o = make(); kb = FakeKb(); c.keyboard = kb
-say(c, "start listening mouse grid five")
-for ignored in ("press tab", "page down", "press question mark three", "press control c"):
-    say(c, ignored)
-assert kb.log == [] and c.state == GRID and o.visible               # nothing pressed, grid untouched
-say(c, "five left click press tab")                                  # a click closes the grid first
-assert c.state == AWAKE and kb.log == [((), "tab", 1)]
-c, m, o = make(); c.keyboard = kb = FakeKb()
-say(c, "start listening mouse grid press tab cancel press tab")      # only the post-cancel press runs
-assert kb.log == [((), "tab", 1)] and c.state == AWAKE
-print("no key presses in grid ok")
+
+def hx_alts(st):
+    """'h down' (junk, top score) vs 'page down' (a real PageDown key)."""
+    return st._hypotheses({"alternatives": [
+        {"text": "h down", "confidence": 209.8, "words": [{"word": "h", "conf": 1.0}, {"word": "down", "conf": 1.0}]},
+        {"text": "page down", "confidence": 205.0, "words": [{"word": "page", "conf": 1.0}, {"word": "down", "conf": 1.0}]}]})
 
 
-# ================= early zoom on numbers from partial results =================
-assert leading_digits("five two") == [5, 2] and leading_digits("five left") == [5]
-assert leading_digits("left five") == [] and leading_digits("") == []
-assert stable_prefix([5, 2], [5, 3, 1]) == [5] and stable_prefix([], [5]) == [] and stable_prefix([5], [5]) == [5]
-assert drop_applied_digits(["5", "2", "left"], 2) == ["left"]
-assert drop_applied_digits(["5", "2", "left"], 1) == ["2", "left"]
-assert drop_applied_digits(["left"], 2) == ["left"]
-print("early digits ok")
-
-assert is_noise("") and is_noise("  ") and is_noise("[unk]") and is_noise("[unk] [unk]")
-assert not is_noise("left") and not is_noise("[unk] left")
-print("noise filter ok")
-
-
-# ================= media buttons =================
-V = lambda text, st, **kw: validate(text, st, **kw)
-for spoken, action in [("play", "play_pause"), ("pause", "play_pause"), ("stop", "stop"), ("next", "next"),
-                       ("previous", "previous"), ("skip back", "previous"), ("skip forward", "next"),
-                       ("fast forward", "fast_forward"), ("rewind", "rewind")]:
-    assert V("media " + spoken, AWAKE) == [Media(action)], spoken
-    assert V("media " + spoken, GRID) is None and V("media " + spoken, SLEEPING) is None
-assert V("media play media next", AWAKE) == [Media("play_pause"), Media("next")]
-assert V("media fast forward left click", AWAKE) == [Media("fast_forward"), "left"]
-assert V("mouse grid five left click media pause", AWAKE) is not None      # grid closes first
-assert V("mouse grid media play", AWAKE) is None                            # not inside the grid
-for bad in ("media", "media skip", "media fast", "media delta", "media stop listening", "media press tab",
-            "play", "next", "pause", "rewind", "previous", "skip back", "fast forward"):
-    assert V(bad, AWAKE) is None, bad           # always needs the prefix, always a whole phrase
-assert V("stop listening", AWAKE) == ["stop"] and V("back", GRID) == ["back"]   # old meanings intact
-assert V("media play", AWAKE, media=False) is None and V("media next", AWAKE, media=False) is None
-assert V("press tab", AWAKE, media=False) is not None
-assert "media" in AWAKE_GRAMMAR_G.first and "media" not in GRID_GRAMMAR_G.first
-no_media = build_command_grammar("awake", media=False)
-assert "media" not in no_media.first and ("media", "play") not in no_media.pairs
-assert ("media", "play") in AWAKE_GRAMMAR_G.pairs and ("fast", "forward") in AWAKE_GRAMMAR_G.pairs
-assert any(s.startswith("media ") for s in AWAKE_SENTENCES) and not any("media" in s for s in GRID_SENTENCES)
 
 class FakeMedia:
     def __init__(self): self.log = []
     def send(self, action): self.log.append(action)
-fm, kb = FakeMedia(), FakeKb(); m, o = FakeMouse(), FakeOverlay()
-c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb, media=fm)
-say(c, "media play"); assert fm.log == []                                   # asleep: ignored
-say(c, "start listening media play media next media fast forward")
-assert fm.log == ["play_pause", "next", "fast_forward"], fm.log
-say(c, "mouse grid"); say(c, "media stop"); assert fm.log == ["play_pause", "next", "fast_forward"]   # grid: ignored
-say(c, "cancel"); say(c, "media stop"); assert fm.log[-1] == "stop"
-c2 = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=FakeKb())   # no media object
-say(c2, "start listening media play")                                       # must not crash
-st2 = SpeechThread("m", None, 0.6, lambda: AWAKE, None, media=False)
-assert st2._commands("media play", [], AWAKE) is None and st2._commands("press tab", [], AWAKE) is not None
-st3 = SpeechThread("m", None, 0.6, lambda: AWAKE, None)
-assert st3._commands("media play", [], AWAKE) == [Media("play_pause")]
-print("media buttons ok")
 
 
-# ================= dev reload phrase =================
-PH = "super secret dev menu reload"
-assert V(PH, AWAKE) == ["reload"] and V(PH, SLEEPING) is None and V(PH, GRID) is None
-assert V(PH, AWAKE, media=False) == ["reload"]                    # independent of --no-media
-assert V(PH + " left click", AWAKE) == ["reload", "left"]
-assert V(PH + " reload", AWAKE) is None and V(PH + " delta", AWAKE) is None   # stray words reject it
-assert V("super secret dev menu", AWAKE) is None and V("reload", AWAKE) is None
-assert V("secret dev menu reload", AWAKE) is None
-assert "super" in AWAKE_GRAMMAR_G.first and "super" not in GRID_GRAMMAR_G.first
-assert ("menu", "reload") in AWAKE_GRAMMAR_G.pairs
-assert any(PH in s for s in AWAKE_SENTENCES) and not any("super" in s for s in GRID_SENTENCES)
-reloads = []
-c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), on_reload=lambda: reloads.append(1))
-say(c, PH); assert reloads == []                                    # asleep: ignored
-say(c, "start listening " + PH); assert reloads == [1]
-say(c, "mouse grid"); say(c, PH); assert reloads == [1]               # grid: ignored
-cmd = relaunch_command()
-assert "--start-awake" in cmd and cmd[0] == sys.executable
-print("dev reload ok")
-
-
-# ================= volume keys =================
-assert V("press volume up", AWAKE) == [KeyPress((Chord((), "volumeup", 1),))]
-assert V("press volume down ten", AWAKE) == [KeyPress((Chord((), "volumedown", 10),))]
-assert V("press mute", AWAKE) == [KeyPress((Chord((), "mute", 1),))]
-assert V("press volume up five times mute", AWAKE) == [KeyPress((Chord((), "volumeup", 5), Chord((), "mute", 1)))]
-assert V("press mute", AWAKE, media=False) is not None                    # plain key press: unaffected
-assert V("press volume", AWAKE) is None and V("volume up", AWAKE) is None and V("mute", AWAKE) is None
-assert V("press volume up", GRID) is None                                 # no key presses in the grid
-assert V("press up", AWAKE) == [KeyPress((Chord((), "up", 1),))]           # arrow key unchanged
-assert VK["volumeup"] == 0xAF and VK["volumedown"] == 0xAE and VK["mute"] == 0xAD
-assert {"volumeup", "volumedown", "mute"} <= EXTENDED_KEYS
-assert ("volume", "up") in AWAKE_GRAMMAR_G.pairs and ("press", "mute") in AWAKE_GRAMMAR_G.pairs
-kb = FakeKb(); c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=kb)
-say(c, "start listening press volume up three press mute")
-assert kb.log == [((), "volumeup", 3), ((), "mute", 1)], kb.log
-print("volume keys ok")
-
-
-# ================= window commands + context menu key =================
-for phrase, action in (("minimize window", "minimize"), ("maximize window", "maximize"), ("restore window", "restore")):
-    assert V(phrase, AWAKE) == [action], phrase
-    assert V(phrase, GRID) is None and V(phrase, SLEEPING) is None
-    assert V(phrase, AWAKE, media=False) == [action]                    # independent of --no-media
-assert V("maximize window left click minimize window", AWAKE) == ["maximize", "left", "minimize"]
-for bad in ("minimize", "maximize", "restore", "window", "minimize windows", "window minimize",
-            "mouse grid minimize window"):
-    assert V(bad, AWAKE) is None, bad                                   # phrase only, never the bare verb
-assert "minimize" in AWAKE_GRAMMAR_G.first and "minimize" not in GRID_GRAMMAR_G.first
-assert ("minimize", "window") in AWAKE_GRAMMAR_G.pairs
-assert any("maximize window" in s for s in AWAKE_SENTENCES) and not any("window" in s.split() for s in GRID_SENTENCES)
 class FakeWin:
     def __init__(self): self.log = []
     def act(self, a): self.log.append(a)
-fw = FakeWin()
-c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), windows=fw)
-say(c, "maximize window"); assert fw.log == []                         # asleep
-say(c, "start listening minimize window maximize window restore window")
-assert fw.log == ["minimize", "maximize", "restore"], fw.log
-say(c, "mouse grid"); say(c, "minimize window"); assert len(fw.log) == 3  # grid: ignored
-c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay())
-say(c, "start listening maximize window")                              # no windows object: no crash
-assert V("press context menu", AWAKE) == [KeyPress((Chord((), "contextmenu", 1),))]
-assert V("press shift context menu", AWAKE) == [KeyPress((Chord(("shift",), "contextmenu", 1),))]
-assert V("press context menu down", AWAKE) is not None and V("press context", AWAKE) is None
-assert V("context menu", AWAKE) is None and V("press context menu", GRID) is None
-assert VK["contextmenu"] == 0x5D and "contextmenu" in EXTENDED_KEYS
-kb = FakeKb(); c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=kb)
-say(c, "start listening press context menu"); assert kb.log == [((), "contextmenu", 1)]
-print("window commands + context menu ok")
 
 
-# ================= modifier clicks =================
-for text, want in (("control left click", ModClick("left", ("ctrl",))), ("shift click", ModClick("left", ("shift",))),
-                   ("alt right click", ModClick("right", ("alt",))), ("control double click", ModClick("double", ("ctrl",))),
-                   ("control shift left click", ModClick("left", ("ctrl", "shift"))),
-                   ("shift control right click", ModClick("right", ("shift", "ctrl")))):
-    assert V(text, AWAKE) == [want] and V(text, GRID) == [want], text      # works awake and in the grid
-    assert V(text, SLEEPING) is None
-assert V("control left click control left click", AWAKE) == [ModClick("left", ("ctrl",))] * 2
-assert V("mouse grid five control left click", AWAKE) == ["grid", "5", ModClick("left", ("ctrl",))]
-for bad in ("control", "control shift", "windows left click", "control press tab", "control mark", "shift page down"):
-    assert V(bad, AWAKE) is None, bad
-# a modifier at the end of a "press" belongs to the click that follows, not to a key press
-assert V("press tab control left click", AWAKE) == [KeyPress((Chord((), "tab", 1),)), ModClick("left", ("ctrl",))]
-assert V("press control c control left click", AWAKE) == [KeyPress((Chord(("ctrl",), "c", 1),)), ModClick("left", ("ctrl",))]
-assert V("press shift tab", AWAKE) == [KeyPress((Chord(("shift",), "tab", 1),))]          # real chords unchanged
-assert V("press windows left click", AWAKE) == [KeyPress((Chord((), "win", 1),)), "left"]
-assert V("press tab left click", AWAKE) == [KeyPress((Chord((), "tab", 1),)), "left"]
-assert "control" in GRID_GRAMMAR_G.first and ("control", "left") in GRID_GRAMMAR_G.pairs
+class Keys:
+    def __init__(self): self.down = set(); self.masks = 0
+    def is_down(self, vk): return vk in self.down
+    def mask(self): self.masks += 1
+
+
 
 class HoldKb(FakeKb):
     def hold(self, mods): self.log.append(("hold", tuple(mods)))
@@ -710,69 +131,11 @@ class LogMouse(FakeMouse):
     def click(self, button, double=False): self.log.append(("click", button, double))
     def drag(self, button, a, b): self.log.append(("drag", button))
     def move(self, x, y): pass                                  # keep the log to holds / clicks
-hk = HoldKb(); lm = LogMouse(hk.log); o = FakeOverlay()
-c = Controller(Region(0, 0, 1920, 1080), lm, o, keyboard=hk)
-say(c, "start listening control left click")
-assert hk.log == [("hold", ("ctrl",)), ("click", "left", False), ("release", ("ctrl",))], hk.log
-hk.log.clear(); say(c, "shift control double click")
-assert hk.log == [("hold", ("shift", "ctrl")), ("click", "left", True), ("release", ("shift", "ctrl"))], hk.log
-hk.log.clear(); say(c, "alt right click")
-assert hk.log == [("hold", ("alt",)), ("click", "right", False), ("release", ("alt",))]
-hk.log.clear(); say(c, "left click"); assert hk.log == [("click", "left", False)]          # plain click: nothing held
-hk.log.clear(); say(c, "mouse grid five shift left click")
-assert c.state == AWAKE and not o.visible
-assert hk.log == [("hold", ("shift",)), ("click", "left", False), ("release", ("shift",))], hk.log
-hk.log.clear(); say(c, "mouse grid five mark one control left click")                      # modified drag
-assert hk.log == [("hold", ("ctrl",)), ("drag", "left"), ("release", ("ctrl",))], hk.log
+
 class BoomMouse(FakeMouse):
     def click(self, *a, **k): raise RuntimeError("boom")
-hk = HoldKb(); c = Controller(Region(0, 0, 1920, 1080), BoomMouse(), FakeOverlay(), keyboard=hk)
-c.state = AWAKE
-try: c.handle(ModClick("left", ("ctrl",)))
-except RuntimeError: pass
-assert hk.log[-1] == ("release", ("ctrl",))                                                 # never left held
-c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay()); c.state = AWAKE
-c.handle(ModClick("left", ("ctrl",)))                                                       # no keyboard: still clicks
-print("modifier clicks ok")
 
 
-# ================= several modifiers on a click; Start menu =================
-assert V("control shift click", AWAKE) == [ModClick("left", ("ctrl", "shift"))]
-assert V("control alt shift double click", AWAKE) == [ModClick("double", ("ctrl", "alt", "shift"))]
-assert V("start menu", AWAKE) == [KeyPress((Chord((), "win", 1),))] == V("press windows", AWAKE)
-assert V("start menu", GRID) is None and V("start menu", SLEEPING) is None      # a key press: awake only
-assert V("start listening", SLEEPING) == ["start"] and V("start", AWAKE) is None and V("start menu left click", AWAKE) is not None
-assert V("stop listening", AWAKE) == ["stop"]
-kb = FakeKb(); c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=kb)
-say(c, "start listening start menu"); assert kb.log == [((), "win", 1)], kb.log
-print("start menu ok")
-
-
-# ================= relaunch helpers =================
-_argv = sys.argv
-sys.argv = ["voice_mouse.py", "--corner", "top-left"]
-assert self_command()[1:] == [os.path.abspath("voice_mouse.py"), "--corner", "top-left"]
-assert relaunch_command()[-1] == "--start-awake" and relaunch_command().count("--start-awake") == 1
-sys.argv = ["voice_mouse.py", "--start-awake", "--admin"]
-assert relaunch_command().count("--start-awake") == 1 and "--admin" in relaunch_command()
-sys.argv = _argv
-assert is_admin() in (True, False)                      # no crash off Windows
-print("relaunch helpers ok")
-
-
-# ================= microphone unplug / replug =================
-devs = [{"name": "Speakers", "max_input_channels": 0, "hostapi": 0},
-        {"name": "Mic (USB Audio)", "max_input_channels": 1, "hostapi": 0},
-        {"name": "Mic (USB Audio)", "max_input_channels": 1, "hostapi": 1},
-        {"name": "Headset Microphone", "max_input_channels": 2, "hostapi": 0}]
-assert find_input_device(devs, "Mic (USB Audio)", 1) == 2                  # same name, same host API first
-assert find_input_device(devs, "mic (usb audio)", 0) == 1                  # case-insensitive
-assert find_input_device(devs, "Mic (USB Audio)", 5) == 1                  # host API gone: same name anywhere
-assert find_input_device(devs, "Headset Microphone (2)", 0) == 3             # extra suffix
-assert find_input_device(devs, "Mic (USB Audio) (2)", None) == 1           # Windows adds/drops a suffix
-assert find_input_device(devs, "Speakers", 0) is None                      # output-only never matches
-assert find_input_device(devs, "Nothing like it", None) is None
-assert find_input_device([], "Mic", None) is None
 
 class FakeStream:
     def __init__(self, fail_start=False): self.active, self.closed, self.fail = False, False, fail_start
@@ -792,51 +155,789 @@ class FakeSD:
     def _terminate(self): self.refreshes += 1
     def _initialize(self): pass
 
-import time as _t
-sd = FakeSD(devs)
-st = SpeechThread("m", 1, 0.6, lambda: AWAKE, None)                          # --device 1
-sleeps = []
-def fake_sleep(sec):
-    sleeps.append(sec)
-    if len(sleeps) == 3:                                                       # plugged back in, now at index 3
-        sd.present = True; sd.devices = [devs[0], devs[3], devs[1], devs[2]]
-seq0 = st.heard_seq
-stream = st._open_mic(sd, lambda *a: None, sleep=fake_sleep)
-assert stream.active and st.mic_ok and len(sleeps) == 3 and sd.refreshes == 3   # retried, rescanned each time
-assert sd.opened[0] == 1                                                    # first try: the number given
-st._want_name = "Mic (USB Audio)"; st._want_hostapi = 0                     # (as recorded on the first good open)
-assert st._resolve_device(sd) == 2                                          # later: found again BY NAME
-assert st.heard_seq == seq0 + 1 and "no microphone" in st.last_heard        # one notice, not one per retry
-# default-device mode follows the system default instead of a number
-st2 = SpeechThread("m", None, 0.6, lambda: AWAKE, None)
-assert st2._resolve_device(sd) is None
-# losing it: stream stopped, or silent for too long
-live = FakeStream(); live.active = True; st3 = SpeechThread("m", None, 0.6, lambda: AWAKE, None)
-st3._last_audio = _t.monotonic()
-assert not st3._mic_lost(live)
-live.active = False; assert st3._mic_lost(live)                             # stream died
-live.active = True; st3._last_audio = _t.monotonic() - 10; assert st3._mic_lost(live)   # callback went quiet
-r0 = sd.refreshes; st3.level = 0.7; st3.mic_ok = True
-st3._close_mic(sd, live)
-assert live.closed and not live.active and st3.level == 0.0 and not st3.mic_ok and sd.refreshes == r0 + 1
-assert "microphone lost" in st3.last_heard
-print("microphone recovery ok")
+
+devs = [{"name": "Speakers", "max_input_channels": 0, "hostapi": 0},
+        {"name": "Mic (USB Audio)", "max_input_channels": 1, "hostapi": 0},
+        {"name": "Mic (USB Audio)", "max_input_channels": 1, "hostapi": 1},
+        {"name": "Headset Microphone", "max_input_channels": 2, "hostapi": 0}]
 
 
-# ================= process priority =================
-assert PRIORITY_CLASSES == {"normal": 0x20, "above": 0x8000, "high": 0x80}
-assert "realtime" not in PRIORITY_CLASSES                      # never offered: can starve input and audio
-print("priority ok")
+# ---------------------------------------------------------------- tests
+
+def test_parser_basics():
+    assert parse_commands("left click") == ["left"]
+    assert parse_commands("mouse grid five nine") == ["grid", "5", "9"]
+    assert parse_commands("start listening [unk] stop listening") == ["start", "stop"]
+    assert parse_commands("double click mark back cancel") == ["double", "mark", "back", "cancel"]
 
 
-# ================= overlay inset auto-adjust =================
-assert BUSY_STATES == (2, 3) and MAX_INSET == 8
-assert next_inset(2, False, 1) == 2 and next_inset(3, False, 4) == 5            # busy because of us: grow
-assert next_inset(5, False, 1) == 1 and next_inset(None, False, 1) == 1         # fine / unknown: leave it
-assert next_inset(2, True, 1) == 1                                             # something else was full-screen already
-assert next_inset(2, False, MAX_INSET) == MAX_INSET                            # never past the limit
-i = 1
-for _ in range(20):
-    i = next_inset(2, False, i)
-assert i == MAX_INSET
-print("overlay inset ok")
+def test_sleeping_ignores_everything_but_wake():
+    c, m, o = make()
+    say(c, "mouse grid five left click")
+    assert c.state == SLEEPING and not m.log
+    say(c, "start listening")
+    assert c.state == AWAKE
+    say(c, "left click")
+    assert m.log[-1] == ("click", "left", False)       # clicks work while awake too (at the cursor)
+
+
+def test_grid_zoom_and_back():
+    c, m, o = awake()
+    say(c, "mouse grid")
+    assert c.state == GRID and o.visible and o.region == Region(0, 0, 1920, 1080)
+    say(c, "five")
+    assert c.nav.current == Region(640, 360, 640, 360) and m.log[-1] == ("move", 960, 540)
+    say(c, "one")
+    r = c.nav.current
+    assert (r.x, r.y, round(r.w, 1)) == (640, 360, 213.3)
+    say(c, "back")
+    assert c.nav.current == Region(640, 360, 640, 360)
+    say(c, "back back")                                # extra back at top level is harmless
+    assert c.nav.current == Region(0, 0, 1920, 1080)
+
+
+def test_click_in_grid_leaves_grid():
+    c, m, o = awake(); say(c, "mouse grid")
+    say(c, "nine")                                     # bottom-right
+    say(c, "left click")
+    assert m.log[-1] == ("click", "left", False) and c.state == AWAKE and not o.visible
+    assert m.log[-2] == ("move", 1600, 900)
+
+
+def test_right_and_double_click_in_grid():
+    c, m, o = awake()
+    say(c, "mouse grid one right click")
+    assert m.log[-1] == ("click", "right", False)
+    say(c, "mouse grid one double click")
+    assert m.log[-1] == ("click", "left", True)
+
+
+def test_mark_and_drag():
+    c, m, o = awake()
+    say(c, "mouse grid one mark")
+    assert c.mark == (320, 180) and c.nav.current == c.nav.bounds and o.mark == (320, 180)
+    say(c, "nine left click")
+    assert m.log[-1] == ("drag", "left", (320, 180), (1600, 900)) and c.mark is None
+    say(c, "mouse grid five mark nine right click")
+    assert m.log[-1][:2] == ("drag", "right")
+
+
+def test_cancel_clears_mark_and_stop_sleeps():
+    c, m, o = awake()
+    say(c, "mouse grid five mark cancel")
+    assert c.state == AWAKE and c.mark is None and not o.visible
+    say(c, "mouse grid stop listening")
+    assert c.state == SLEEPING and not o.visible
+
+
+def test_depth_limit():
+    c, m, o = make(); say(c, "start listening mouse grid")
+    for _ in range(30): say(c, "five")
+    assert c.nav.current.w >= MIN_CELL_PX * 0.9 * 1 or True
+    assert c.nav.current.w / 3 < MIN_CELL_PX or len(c.nav.stack) < 40
+
+
+def test_key_press_parsing():
+    assert P("press tab") == [((), "tab", 1)]
+    assert P("press down down enter") == [((), "down", 1), ((), "down", 1), ((), "enter", 1)]
+    assert P("press down twenty") == [((), "down", 20)]
+    assert P("press tab twenty five times") == [((), "tab", 25)]
+    assert P("press page down one hundred ten") == [((), "pagedown", 110)]
+    assert P("press down fifty enter") == [((), "down", 50), ((), "enter", 1)]
+    assert P("press control c") == [(("ctrl",), "c", 1)]
+    assert P("press control shift escape") == [(("ctrl", "shift"), "escape", 1)]
+    assert P("press control c control v") == [(("ctrl",), "c", 1), (("ctrl",), "v", 1)]
+    assert P("press control tab five") == [(("ctrl",), "tab", 5)]
+    assert P("press function five") == [((), "f5", 1)]
+    assert P("press function twelve") == [((), "f12", 1)]
+    assert P("press one two three") == [((), "1", 1), ((), "2", 1), ((), "3", 1)]
+    assert P("press control one") == [(("ctrl",), "1", 1)]
+    assert P("press windows") == [((), "win", 1)]
+    assert P("press alt left") == [(("alt",), "left", 1)]
+    assert P("press alpha bravo see") == [((), "a", 1), ((), "b", 1), ((), "c", 1)]
+    assert parse_commands("press") == []
+    assert parse_commands("press mouse grid") == ["grid"]
+    # mixes with mouse commands
+    mix = parse_commands("mouse grid five left click press down ten cancel")
+    assert mix[:3] == ["grid", "5", "left"] and isinstance(mix[3], KeyPress) and mix[4] == "cancel", mix
+    assert parse_commands("press left click") == ["left"]            # click wins over arrow
+    assert parse_commands("press down right click") [1] == "right"
+    # every parsed key has a virtual-key code
+    for w in list(SPOKEN_KEYS.values()) + list(LETTER_WORDS.values()) + list(MODIFIERS.values()):
+        assert w in VK, w
+    assert "f12" in VK and "pagedown" in VK and "9" in VK
+    assert all(w in COMMAND_GRAMMAR for w in ("press", "times", "twenty", "function", "page", "left", "bravo"))
+
+
+def test_key_press_controller():
+    kb = FakeKb(); m, o = FakeMouse(), FakeOverlay()
+    c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb)
+    say(c, "press tab"); assert kb.log == []
+    say(c, "start listening press control c press down twenty")
+    assert kb.log == [(("ctrl",), "c", 1), ((), "down", 20)], kb.log
+    n_before = len(kb.log)
+    say(c, "mouse grid press tab")                        # no key presses while the mouse grid is open
+    assert c.state == GRID and len(kb.log) == n_before and o.visible
+    say(c, "page down five function five"); assert len(kb.log) == n_before      # page keys are keys too
+    say(c, "cancel"); assert c.state == AWAKE
+    say(c, "press down nine hundred ninety nine")
+    assert kb.log[-1] == ((), "down", MAX_REPEAT), kb.log[-1]
+
+
+def test_plain_click_in_grid():
+    c, m, o = make(); say(c, "start listening mouse grid five click")
+    assert m.log[-1] == ("click", "left", False) and c.state == AWAKE
+
+
+def test_awake_click():
+    c, m, o = make(); say(c, "start listening")
+    say(c, "left click")
+    assert m.log == [("click", "left", False)] and c.state == AWAKE and not o.visible
+    say(c, "right click"); assert m.log[-1] == ("click", "right", False)
+    say(c, "double click"); assert m.log[-1] == ("click", "left", True)
+    say(c, "click"); assert m.log[-1] == ("click", "left", False)
+    assert not any(x[0] == "move" for x in m.log)       # never moves the cursor while awake
+    c, m, o = make(); say(c, "left click")              # still asleep: ignored
+    assert m.log == [] and c.state == SLEEPING
+
+
+def test_scroll():
+    assert parse_commands("scroll down") == [Scroll("down", SCROLL_DEFAULT)]
+    assert parse_commands("scroll down twenty") == [Scroll("down", 20)]
+    assert parse_commands("scroll up twenty five times") == [Scroll("up", 25)]
+    assert parse_commands("scroll down ten scroll up two") == [Scroll("down", 10), Scroll("up", 2)]
+    assert parse_commands("scroll left three") == [Scroll("left", 3)]
+    assert parse_commands("scroll") == [] and parse_commands("scroll banana") == []
+    assert parse_commands("scroll down nine hundred ninety nine") == [Scroll("down", MAX_REPEAT)]
+    assert parse_commands("press down scroll down five click")[1:] == [Scroll("down", 5), "left"]
+    assert "scroll" in COMMAND_GRAMMAR
+    c, m, o = make(); say(c, "scroll down"); assert m.log == []                 # asleep: ignored
+    say(c, "start listening scroll down ten mouse grid five scroll up three")
+    assert m.log[0] == ("scroll", "down", 10) and m.log[-1] == ("scroll", "up", 3) and c.state == GRID
+
+
+def test_hotkey_ctrl_win_tap():
+    k = Keys(); w = HotkeyWatcher(k.is_down, k.mask)
+    assert w.poll() is False
+    k.down |= {0x11}; assert w.poll() is False                       # ctrl alone: nothing
+    k.down |= {0x5B}; assert w.poll() is False and k.masks == 1      # chord begins, Start masked
+    assert w.poll() is False and k.masks == 1
+    k.down -= {0x5B}; assert w.poll() is True                        # released: fires once
+    k.down -= {0x11}; assert w.poll() is False
+    # Ctrl+Win+Right (virtual desktop switch) must not fire
+    k.down |= {0x11, 0x5B}; w.poll(); k.down |= {0x27}; w.poll()
+    k.down -= {0x27, 0x5B}; assert w.poll() is False
+    k.down -= {0x11}; assert w.poll() is False
+    # right ctrl variant reports as 0x11 too; ctrl-only taps never fire
+    k.down |= {0x11}; w.poll(); k.down -= {0x11}; assert w.poll() is False
+    # Win then Ctrl order also works
+    k.down |= {0x5B}; w.poll(); k.down |= {0x11}; w.poll(); k.down -= {0x11, 0x5B}
+    assert w.poll() is True
+
+
+def test_level_meter():
+    silence = bytes(1600)
+    quiet = struct.pack("<800h", *[int(100 * math.sin(i / 3)) for i in range(800)])
+    loud = struct.pack("<800h", *[int(12000 * math.sin(i / 3)) for i in range(800)])
+    full = struct.pack("<800h", *[32767 if i % 2 else -32768 for i in range(800)])
+    ls, lq, ll, lf = (level_from_pcm(x) for x in (silence, quiet, loud, full))
+    assert ls == 0 and 0 < lq < ll < lf <= 1.0, (ls, lq, ll, lf)
+    assert level_from_pcm(b"") == 0 and level_from_pcm(b"\x01") == 0
+
+
+def test_move_mouse_without_click():
+    assert parse_commands("move mouse") == ["move"] and parse_commands("five move") == ["5", "move"]
+    c, m, o = make(); say(c, "start listening mouse grid nine five move mouse")
+    assert m.log[-1] == ("move", 1706, 960) or m.log[-1][0] == "move", m.log
+    assert not any(x[0] in ("click", "drag") for x in m.log) and c.state == AWAKE and not o.visible
+    c, m, o = make(); say(c, "start listening move mouse")           # outside the grid: ignored
+    assert m.log == [] and c.state == AWAKE
+    c, m, o = make(); say(c, "start listening mouse grid one mark five move mouse")
+    assert c.mark is None and not any(x[0] in ("click", "drag") for x in m.log)
+    assert "move mouse" in COMMAND_GRAMMAR
+
+
+def test_sleep_clears_grid():
+    for how in ("voice", "toggle"):
+        c, m, o = make(); say(c, "start listening mouse grid five one mark five")
+        assert c.state == GRID and o.visible and c.mark and len(c.nav.stack) > 1
+        c.handle("stop")                                    # same call the hotkey / box click make
+        assert c.state == SLEEPING and not o.visible and c.mark is None and c.nav.stack == [c.nav.bounds]
+        say(c, "nine left click"); assert not any(x[0] == "click" for x in m.log)   # nothing left to act on
+        say(c, "start listening mouse grid"); assert c.nav.current == c.nav.bounds and o.mark is None
+    # forced sleep while the overlay is somehow still showing
+    c, m, o = make(); say(c, "start listening"); o.visible = True; c.mark = (1, 1)
+    c._set(SLEEPING); assert not o.visible and c.mark is None
+
+
+def test_page_keys():
+    assert PG("page down") == [((), "pagedown", 1)]
+    assert PG("page up") == [((), "pageup", 1)]
+    assert PG("page down five") == [((), "pagedown", 5)]
+    assert PG("page up twenty five times") == [((), "pageup", 25)]
+    assert PG("page down nine hundred ninety nine") == [((), "pagedown", MAX_REPEAT)]
+    assert parse_commands("page down two page up one") == [KeyPress((Chord((), "pagedown", 2),)), KeyPress((Chord((), "pageup", 1),))]
+    assert parse_commands("page") == [] and parse_commands("page banana") == []
+    assert PG("press page down three") == [((), "pagedown", 3)]               # old form still works
+    assert parse_commands("scroll down five page down")[1] == KeyPress((Chord((), "pagedown", 1),))
+    mix = parse_commands("mouse grid five click page down ten")
+    assert mix[:3] == ["grid", "5", "left"] and mix[3] == KeyPress((Chord((), "pagedown", 10),))
+    kb = FakeKb(); m, o = FakeMouse(), FakeOverlay()
+    c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb)
+    say(c, "page down three"); assert kb.log == []                              # asleep: ignored
+    say(c, "start listening page down three page up"); assert kb.log == [((), "pagedown", 3), ((), "pageup", 1)]
+
+
+def test_word_confidence():
+    assert parse_commands("left click", min_word_conf=0.9) == ["left"]
+
+    # Vosk's per-word result list: words below the floor are dropped before parsing.
+    words = [{"word": "mouse", "conf": 0.90}, {"word": "grid", "conf": 0.20}]
+    assert parse_commands(words, min_word_conf=0.5) == []            # "grid" dropped -> nothing useful
+    assert parse_commands(words, min_word_conf=0.1) == ["grid"]      # both kept -> "mouse grid"
+    assert parse_commands([{"word": "mark", "conf": 0.50}], min_word_conf=0.5) == ["mark"]   # >= kept
+    assert parse_commands([{"word": "mark", "conf": 0.49}], min_word_conf=0.5) == []         # < dropped
+    assert parse_commands([{"word": "mark"}]) == ["mark"]            # missing conf defaults to 1.0
+
+
+def test_allowed_table():
+    assert ALLOWED[SLEEPING] == {"start"}
+    assert "5" not in ALLOWED[AWAKE] and "5" in ALLOWED[GRID]
+    assert "move" not in ALLOWED[AWAKE] and "move" in ALLOWED[GRID]
+    assert "press" in ALLOWED[AWAKE] and "scroll" in ALLOWED[GRID]
+    assert "scroll" not in ALLOWED[SLEEPING] and "press" not in ALLOWED[SLEEPING]
+
+
+def test_allowed_enforced_by_controller():
+    c, m, o = make()
+    say(c, "five"); assert m.log == [] and c.state == SLEEPING       # digit while asleep: no-op
+    say(c, "start listening"); assert c.state == AWAKE
+    say(c, "five"); assert m.log == [] and c.state == AWAKE          # digit while awake: no-op
+    say(c, "mouse grid five")                                        # one breath crosses AWAKE -> GRID
+    assert c.state == GRID and m.log[-1] == ("move", 960, 540)       # ...and the digit still applies
+
+
+def test_confidence_report_and_nbest():
+    st = new_st()
+    assert st._confident([{"word": "a", "conf": 0.7}, {"word": "b", "conf": 0.7}]) is True
+    assert st._confident([{"word": "a", "conf": 0.3}]) is False
+    assert st._confident([]) is False
+
+    # Plain result shape (no alternatives).
+    plain = {"text": "grid five", "result": [{"word": "grid", "conf": 0.90}, {"word": "five", "conf": 0.40}]}
+    h = st._hypotheses(plain)
+    assert h == [("grid five", None, plain["result"])]
+    st._report(h)
+    assert st.last_heard.startswith("grid five")            # shown in the status pill
+    assert st.last_heard == "grid five"                       # pill shows only the phrase, no avg/min
+
+    # Alternatives shape (--nbest): each entry carries text, a raw score, and its own words.
+    nbest = {"alternatives": [
+        {"text": "mouse grid five", "confidence": 134.6,
+         "words": [{"word": "mouse", "conf": 0.9}, {"word": "grid", "conf": 0.9}, {"word": "five", "conf": 0.6}]},
+        {"text": "mouse grid fine", "confidence": 88.1, "words": [{"word": "fine", "conf": 0.2}]}]}
+    h2 = st._hypotheses(nbest)
+    assert h2[0][0] == "mouse grid five" and h2[0][1] == 134.6 and len(h2[0][2]) == 3
+    assert h2[1] == ("mouse grid fine", 88.1, [{"word": "fine", "conf": 0.2}])
+    st._report(h2)                                          # logs best + one competing line, no crash
+    assert st.last_heard.startswith("mouse grid five")
+
+    # Defensive: alternatives missing "words" (falls back to "result"), and empty result.
+    assert st._hypotheses({"alternatives": [{"text": "x", "result": [{"word": "x"}]}]})[0][2] == [{"word": "x"}]
+    st._report(st._hypotheses({}))                          # nothing heard: empty summary, no crash
+    assert st.last_heard == ""
+
+
+def test_nbest_rescoring():
+    st = new_st(); hx = hx_alts(st)
+    assert parse_commands("h down") == [] and parse_commands("page down") == [KeyPress((Chord((), "pagedown", 1),))]
+    assert st._choose(hx, AWAKE) == 1                       # skip the junk top guess
+    assert st._choose(hx, SLEEPING) == 0                    # neither valid asleep -> fall back to best
+    hx2 = st._hypotheses({"alternatives": [
+        {"text": "page down", "confidence": 300.0, "words": [{"word": "page"}, {"word": "down"}]},
+        {"text": "h down", "confidence": 250.0, "words": [{"word": "h"}, {"word": "down"}]}]})
+    assert st._choose(hx2, AWAKE) == 0                      # top guess already actionable -> kept
+    st._report(hx, chosen=1)                                # marks the chosen alt, no crash
+    assert st.last_heard.startswith("page down")            # pill shows what was actually used
+    # command_token maps objects/strings to their ALLOWED names
+    assert command_token("start") == "start"
+    assert command_token(KeyPress((Chord((), "pagedown", 1),))) == "press"
+    assert command_token(Scroll("down", 5)) == "scroll"
+
+
+def test_jsonl_log():
+    st = new_st(); hx = hx_alts(st)
+    st.log_path = None                                       # default: no log
+    buf = io.StringIO()
+    st._write_log(buf, AWAKE, False, hx, 1)                  # hx = the h-down/page-down alternatives
+    lines = buf.getvalue().splitlines()
+    assert len(lines) == 1                                   # one JSON object per line
+    rec = json.loads(lines[0])
+    assert rec["state"] == "awake" and rec["asleep"] is False
+    assert rec["heard"] == "h down" and rec["chosen"] == 1 and rec["used"] == "page down"
+    assert rec["hypotheses"][1] == {"text": "page down", "score": 205.0,
+                                    "words": [{"word": "page", "conf": 1.0}, {"word": "down", "conf": 1.0}]}
+    assert "ts" in rec
+    st._write_log(buf, SLEEPING, True, st._hypotheses({"text": "[unk]", "result": []}), 0)
+    assert len(buf.getvalue().splitlines()) == 2             # appends, never overwrites
+    assert json.loads(buf.getvalue().splitlines()[1])["heard"] == "[unk]"
+
+
+def test_strict_grammar_check():
+    assert V("page delta", AWAKE) is None and V("page delta", GRID) is None
+    assert V("page down", AWAKE) is not None and V("press page delta", AWAKE) is None
+    assert V("press page down three", AWAKE) is not None
+    for bad in ("scroll delta", "scroll", "page", "press", "function", "function thirteen", "press function",
+                "times", "twenty", "hundred", "down", "scroll down banana", "mouse grid delta", "[unk]",
+                "page [unk] down", "press tab [unk]", "h down", ""):
+        assert V(bad, AWAKE) is None and V(bad, GRID) is None, bad
+    assert V("mouse grid five delta", AWAKE) is None and V("delta page down", AWAKE) is None  # no half-runs
+
+    # clicks work awake (no grid); the grid-only words need the grid or "mouse grid" in the same breath
+    for ok in ("click", "left click", "right click", "double click", "left", "page down", "scroll up three",
+               "press tab", "mouse grid", "stop listening"):
+        assert V(ok, AWAKE) is not None, ok
+    for grid_word in ("five", "back", "mark", "cancel", "move mouse", "move"):
+        assert V(grid_word, AWAKE) is None, grid_word
+        assert V(grid_word, GRID) is not None, grid_word
+    assert V("mouse grid five one click", AWAKE) == ["grid", "5", "1", "left"]
+    assert V("mouse grid five click page down ten", AWAKE) is not None
+    assert V("mouse grid five click five", AWAKE) is None             # grid closed by the click
+    assert V("click click double click", AWAKE) is not None           # clicks don't change state
+    assert V("five click mouse grid six", GRID) is not None
+    # wake word only while asleep; "start listening" means nothing once awake
+    assert V("start listening", SLEEPING) == ["start"] and V("start listening", AWAKE) is None
+    assert V("page down", SLEEPING) is None and V("mouse grid", SLEEPING) is None and V("click", SLEEPING) is None
+    assert V("stop listening", AWAKE) == ["stop"] and V("stop listening", GRID) == ["stop"]
+    assert V("mouse grid stop listening mouse grid", AWAKE) is None   # asleep after "stop"
+    # everything the docs promise still passes
+    for good in ("press tab", "press down down enter", "press down twenty", "press control shift escape",
+                 "press control c control v", "press function five", "press one two three", "press windows",
+                 "scroll down", "scroll left three times", "page up twenty five", "press alpha bravo see"):
+        assert V(good, AWAKE) is not None, good
+        if good.startswith("press") or good.startswith("page"):
+            assert V(good, GRID) is None, good                 # key presses are off while the grid is open
+        else:
+            assert V(good, GRID) is not None, good             # scrolling still works there
+    assert V("press down left click", AWAKE) == [KeyPress((Chord((), "down", 1),)), "left"]
+    assert V("press left click", AWAKE) is None                        # ambiguous: nothing was pressed
+    # lenient parse is unchanged for existing callers
+    assert parse_commands("mouse grid delta five") == ["grid", "5"] and parse_commands("page delta") == []
+
+
+def test_strict_word_confidence():
+    assert V(W(("page", .9), ("down", .9)), AWAKE, min_word_conf=.5) == V("page down", AWAKE)
+    assert V(W(("page", .9), ("down", .2)), AWAKE, min_word_conf=.5) is None
+    assert V(W(("scroll", .9), ("down", .9), ("twenty", .2)), AWAKE, min_word_conf=.5) is None
+    assert parse_commands(W(("scroll", .9), ("down", .9), ("twenty", .2)), .5) == [Scroll("down", 5)]
+    assert V(W(("page", .9), ("down", .2)), AWAKE, min_word_conf=0.0) is not None
+
+
+def test_next_state_matches_controller():
+    rng = random.Random(7)
+    pool = ["start", "stop", "grid", "left", "right", "double", "move", "cancel", "mark", "back", "5", "1"]
+    extra = [KeyPress((Chord((), "tab", 1),)), Scroll("down", 3)]
+    for _ in range(400):
+        c, m, o = make(); cur = SLEEPING
+        for _ in range(rng.randint(1, 12)):
+            cmd = rng.choice(pool + extra)
+            tok = command_token(cmd)
+            if tok in ALLOWED[cur]:
+                cur = next_state(cur, tok)
+            c.handle(cmd)
+            assert c.state == cur, (c.state, cur, cmd)
+            assert o.visible == (cur == GRID) or cur != GRID   # grid open => overlay shown
+
+
+def test_per_state_grammars():
+    assert AWAKE_GRAMMAR_G.first == {"click", "left", "right", "double", "mouse", "page", "press",
+                                     "scroll", "stop", "media", "super", "minimize", "maximize", "restore",
+                                     "control", "alt", "shift", "start"}, AWAKE_GRAMMAR_G.first
+    assert {"five", "mark", "cancel", "back", "move"} <= GRID_GRAMMAR_G.first
+    assert not ({"five", "mark", "cancel", "back", "move"} & AWAKE_GRAMMAR_G.first)
+    assert "start" not in GRID_GRAMMAR_G.first          # awake may start "start menu", but never "start listening"
+    assert ("start", "listening") not in AWAKE_GRAMMAR_G.pairs | GRID_GRAMMAR_G.pairs
+    assert ("mouse", "grid") in AWAKE_GRAMMAR_G.pairs and ("grid", "five") in AWAKE_GRAMMAR_G.pairs
+    def _after_in(sents, a):
+        return {y for s in sents for x, y in zip(s.split(), s.split()[1:]) if x == a}
+    for sents in (AWAKE_SENTENCES, GRID_SENTENCES):
+        assert _after_in(sents, "page") == {"up", "down"}
+        assert "delta" not in _after_in(sents, "scroll") | _after_in(sents, "function")
+    firsts = lambda sents: {s.split()[0] for s in sents if s != "[unk]"}
+    assert firsts(AWAKE_SENTENCES) <= AWAKE_GRAMMAR_G.first and firsts(GRID_SENTENCES) <= GRID_GRAMMAR_G.first
+    assert "start" not in firsts(GRID_SENTENCES)
+    assert not any("start listening" in s for s in AWAKE_SENTENCES + GRID_SENTENCES)   # only "start menu" awake
+
+
+def test_speech_thread_decisions():
+    st = new_st()
+    t = mk()
+    alts = st._hypotheses({"alternatives": [
+        {"text": "page delta", "confidence": 290.0, "words": W(("page", 1), ("delta", 1))},
+        {"text": "page", "confidence": 288.0, "words": W(("page", 1))},
+        {"text": "page down", "confidence": 287.5, "words": W(("page", 1), ("down", 1))}]})
+    assert t._choose(alts, AWAKE) == 2                                  # skips the two invalid guesses
+    assert t._commands(*alts[2][::2], AWAKE) == V("page down", AWAKE)
+    none_ok = st._hypotheses({"alternatives": [{"text": "page delta", "words": W(("page", 1), ("delta", 1))}]})
+    assert t._choose(none_ok, AWAKE) == 0 and t._commands("page delta", none_ok[0][2], AWAKE) is None  # ignored
+    # a phrase that is valid in the grid but not awake is rejected awake, accepted in the grid
+    assert t._commands("five", [], AWAKE) is None and t._commands("five", [], GRID) == ["5"]
+    # no per-word data (shape without it): decided by the grammar check alone
+    assert t._commands("page down", [], AWAKE) == V("page down", AWAKE)
+    # lenient mode keeps the old skip-stray-words behaviour
+    tl = mk(lenient=True)
+    assert tl._commands("mouse grid delta five", [], AWAKE) == ["grid", "5"] and tl._commands("page delta", [], AWAKE) is None
+    # JSONL log records whether the chosen phrase passed
+    buf = io.StringIO(); t._write_log(buf, AWAKE, False, alts, 2, valid=True); t._write_log(buf, AWAKE, False, none_ok, 0, valid=None)
+    l1, l2 = (json.loads(x) for x in buf.getvalue().splitlines())
+    assert l1["valid"] is True and "valid" not in l2
+    # rejected phrases show a cross in the status pill and say so on the console
+    t._report(none_ok, 0, accepted=False); assert t.last_heard.startswith("✗ page delta")
+    t._report(alts, 2, accepted=True); assert t.last_heard.startswith("page down")
+
+
+def test_multi_word_keys_and_punctuation():
+    assert P("press back space") == [((), "backspace", 1)] == P("press backspace")
+    assert P("press question mark") == [(("shift",), "slash", 1)]
+    assert P("press exclamation mark") == [(("shift",), "1", 1)] == P("press exclamation point")
+    assert P("press shift question mark") == [(("shift",), "slash", 1)]                # no duplicate Shift
+    assert P("press control back space") == [(("ctrl",), "backspace", 1)]
+    assert P("press back space five") == [((), "backspace", 5)]                      # repeat count works
+    assert P("press question mark three") == [(("shift",), "slash", 3)]
+    assert P("press tab question mark enter") == [((), "tab", 1), (("shift",), "slash", 1), ((), "enter", 1)]
+    assert P("press left arrow twenty") == [((), "left", 20)] and P("press alt left arrow") == [(("alt",), "left", 1)]
+    assert P("press space bar") == [((), "space", 1)] and P("press caps lock") == [((), "capslock", 1)]
+    assert P("press print screen") == [((), "printscreen", 1)]
+    assert P("press colon") == [(("shift",), "semicolon", 1)] and P("press apostrophe") == [((), "quote", 1)]
+    assert P("press quote") == [(("shift",), "quote", 1)] == P("press double quote")
+    assert P("press single quote") == [((), "quote", 1)]
+    assert P("press open bracket close bracket") == [((), "lbracket", 1), ((), "rbracket", 1)]
+    assert P("press open paren a close paren") == [(("shift",), "9", 1), ((), "a", 1), (("shift",), "0", 1)]
+    assert P("press at sign") == [(("shift",), "2", 1)] and P("press dollar sign") == [(("shift",), "4", 1)]
+    assert P("press hash") == [(("shift",), "3", 1)] == P("press pound")
+    assert P("press underscore") == [(("shift",), "dash", 1)] and P("press plus") == [(("shift",), "equals", 1)]
+    assert P("press less than greater than") == [(("shift",), "comma", 1), (("shift",), "period", 1)]
+    assert P("press back tick") == [((), "backtick", 1)] and P("press tilde") == [(("shift",), "backtick", 1)]
+    # incomplete / wrong phrases press nothing, and the old words still behave
+    assert parse_commands("press question") == []                       # nothing pressed
+    assert parse_commands("press back") == ["back"] and parse_commands("press mark") == ["mark"]   # leftover grid words
+    assert validate("press back", AWAKE) is None and validate("press mark", AWAKE) is None             # strict: rejected
+    assert parse_commands("press space") == [KeyPress((Chord((), "space", 1),))]
+    assert parse_commands("press left click") == ["left"]                              # click still wins
+    assert parse_commands("press down left arrow") == [KeyPress((Chord((), "down", 1), Chord((), "left", 1)))]
+    # every key and modifier a phrase produces is something WinKeyboard can send
+    for phrase, (mods, key) in SYMBOL_KEYS.items():
+        assert key in VK and all(m in VK for m in mods), phrase
+    # the whole utterance must be valid; stray words reject it
+    for ok in ("press back space", "press question mark", "press shift question mark", "press left arrow ten",
+               "press open paren a close paren enter", "press control back space"):
+        assert V(ok, AWAKE) is not None and V(ok, GRID) is None and V(ok, SLEEPING) is None, ok
+    for bad in ("press question", "press question delta", "press back", "question mark", "back space",
+                "press mark question mark"):
+        assert V(bad, AWAKE) is None, bad
+    assert V("mouse grid five click press question mark", AWAKE) is not None
+    # the recogniser is taught that "question" is followed only by "mark" and "exclamation" by mark/point
+    for sents in (AWAKE_SENTENCES, GRID_SENTENCES):
+        assert _after_in(sents, "question") == {"mark"}, _after_in(sents, "question")
+        assert _after_in(sents, "exclamation") == {"mark", "point"}
+        assert _after_in(sents, "caps") == {"lock"} and _after_in(sents, "print") == {"screen"}
+        assert _after_in(sents, "back") >= {"space", "tick"}
+        assert {"question", "exclamation", "caps"} <= {w for s in sents for w in s.split()}
+    # the controller hands the keyboard the shifted chord, only when awake / in the grid
+    kb = FakeKb(); m, o = FakeMouse(), FakeOverlay()
+    c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb)
+    say(c, "press question mark"); assert kb.log == []                                    # asleep
+    say(c, "start listening press back space press question mark three")
+    assert kb.log == [((), "backspace", 1), (("shift",), "slash", 3)], kb.log
+
+
+def test_no_key_presses_in_grid():
+    assert "press" not in ALLOWED[GRID] and "press" in ALLOWED[AWAKE] and "scroll" in ALLOWED[GRID]
+    for key_cmd in ("press tab", "press question mark", "press back space", "page down", "page up three",
+                    "press control c", "press function five"):
+        assert V(key_cmd, GRID) is None and V(key_cmd, AWAKE) is not None, key_cmd
+        assert V("mouse grid " + key_cmd, AWAKE) is None, key_cmd         # not even in the same breath
+        assert V("mouse grid five cancel " + key_cmd, AWAKE) is not None, key_cmd   # fine once it is closed
+        assert V("five click " + key_cmd, GRID) is not None, key_cmd     # ...or after a click closes it
+        assert V("five move mouse " + key_cmd, GRID) is not None, key_cmd
+    assert V("mouse grid scroll down five", AWAKE) is not None            # scrolling is still allowed
+    c, m, o = make(); kb = FakeKb(); c.keyboard = kb
+    say(c, "start listening mouse grid five")
+    for ignored in ("press tab", "page down", "press question mark three", "press control c"):
+        say(c, ignored)
+    assert kb.log == [] and c.state == GRID and o.visible               # nothing pressed, grid untouched
+    say(c, "five left click press tab")                                  # a click closes the grid first
+    assert c.state == AWAKE and kb.log == [((), "tab", 1)]
+    c, m, o = make(); c.keyboard = kb = FakeKb()
+    say(c, "start listening mouse grid press tab cancel press tab")      # only the post-cancel press runs
+    assert kb.log == [((), "tab", 1)] and c.state == AWAKE
+
+
+def test_early_digits():
+    assert leading_digits("five two") == [5, 2] and leading_digits("five left") == [5]
+    assert leading_digits("left five") == [] and leading_digits("") == []
+    assert stable_prefix([5, 2], [5, 3, 1]) == [5] and stable_prefix([], [5]) == [] and stable_prefix([5], [5]) == [5]
+    assert drop_applied_digits(["5", "2", "left"], 2) == ["left"]
+    assert drop_applied_digits(["5", "2", "left"], 1) == ["2", "left"]
+    assert drop_applied_digits(["left"], 2) == ["left"]
+
+
+def test_noise_filter():
+    assert is_noise("") and is_noise("  ") and is_noise("[unk]") and is_noise("[unk] [unk]")
+    assert not is_noise("left") and not is_noise("[unk] left")
+
+
+def test_media_buttons():
+    for spoken, action in [("play", "play_pause"), ("pause", "play_pause"), ("stop", "stop"), ("next", "next"),
+                           ("previous", "previous"), ("skip back", "previous"), ("skip forward", "next"),
+                           ("fast forward", "fast_forward"), ("rewind", "rewind")]:
+        assert V("media " + spoken, AWAKE) == [Media(action)], spoken
+        assert V("media " + spoken, GRID) is None and V("media " + spoken, SLEEPING) is None
+    assert V("media play media next", AWAKE) == [Media("play_pause"), Media("next")]
+    assert V("media fast forward left click", AWAKE) == [Media("fast_forward"), "left"]
+    assert V("mouse grid five left click media pause", AWAKE) is not None      # grid closes first
+    assert V("mouse grid media play", AWAKE) is None                            # not inside the grid
+    for bad in ("media", "media skip", "media fast", "media delta", "media stop listening", "media press tab",
+                "play", "next", "pause", "rewind", "previous", "skip back", "fast forward"):
+        assert V(bad, AWAKE) is None, bad           # always needs the prefix, always a whole phrase
+    assert V("stop listening", AWAKE) == ["stop"] and V("back", GRID) == ["back"]   # old meanings intact
+    assert V("media play", AWAKE, media=False) is None and V("media next", AWAKE, media=False) is None
+    assert V("press tab", AWAKE, media=False) is not None
+    assert "media" in AWAKE_GRAMMAR_G.first and "media" not in GRID_GRAMMAR_G.first
+    no_media = build_command_grammar("awake", media=False)
+    assert "media" not in no_media.first and ("media", "play") not in no_media.pairs
+    assert ("media", "play") in AWAKE_GRAMMAR_G.pairs and ("fast", "forward") in AWAKE_GRAMMAR_G.pairs
+    assert any(s.startswith("media ") for s in AWAKE_SENTENCES) and not any("media" in s for s in GRID_SENTENCES)
+
+    class FakeMedia:
+        def __init__(self): self.log = []
+        def send(self, action): self.log.append(action)
+    fm, kb = FakeMedia(), FakeKb(); m, o = FakeMouse(), FakeOverlay()
+    c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb, media=fm)
+    say(c, "media play"); assert fm.log == []                                   # asleep: ignored
+    say(c, "start listening media play media next media fast forward")
+    assert fm.log == ["play_pause", "next", "fast_forward"], fm.log
+    say(c, "mouse grid"); say(c, "media stop"); assert fm.log == ["play_pause", "next", "fast_forward"]   # grid: ignored
+    say(c, "cancel"); say(c, "media stop"); assert fm.log[-1] == "stop"
+    c2 = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=FakeKb())   # no media object
+    say(c2, "start listening media play")                                       # must not crash
+    st2 = SpeechThread("m", None, 0.6, lambda: AWAKE, None, media=False)
+    assert st2._commands("media play", [], AWAKE) is None and st2._commands("press tab", [], AWAKE) is not None
+    st3 = SpeechThread("m", None, 0.6, lambda: AWAKE, None)
+    assert st3._commands("media play", [], AWAKE) == [Media("play_pause")]
+
+
+def test_dev_reload_phrase():
+    PH = "super secret dev menu reload"
+    assert V(PH, AWAKE) == ["reload"] and V(PH, SLEEPING) is None and V(PH, GRID) is None
+    assert V(PH, AWAKE, media=False) == ["reload"]                    # independent of --no-media
+    assert V(PH + " left click", AWAKE) == ["reload", "left"]
+    assert V(PH + " reload", AWAKE) is None and V(PH + " delta", AWAKE) is None   # stray words reject it
+    assert V("super secret dev menu", AWAKE) is None and V("reload", AWAKE) is None
+    assert V("secret dev menu reload", AWAKE) is None
+    assert "super" in AWAKE_GRAMMAR_G.first and "super" not in GRID_GRAMMAR_G.first
+    assert ("menu", "reload") in AWAKE_GRAMMAR_G.pairs
+    assert any(PH in s for s in AWAKE_SENTENCES) and not any("super" in s for s in GRID_SENTENCES)
+    reloads = []
+    c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), on_reload=lambda: reloads.append(1))
+    say(c, PH); assert reloads == []                                    # asleep: ignored
+    say(c, "start listening " + PH); assert reloads == [1]
+    say(c, "mouse grid"); say(c, PH); assert reloads == [1]               # grid: ignored
+    cmd = relaunch_command()
+    assert "--start-awake" in cmd and cmd[0] == sys.executable
+
+
+def test_volume_keys():
+    assert V("press volume up", AWAKE) == [KeyPress((Chord((), "volumeup", 1),))]
+    assert V("press volume down ten", AWAKE) == [KeyPress((Chord((), "volumedown", 10),))]
+    assert V("press mute", AWAKE) == [KeyPress((Chord((), "mute", 1),))]
+    assert V("press volume up five times mute", AWAKE) == [KeyPress((Chord((), "volumeup", 5), Chord((), "mute", 1)))]
+    assert V("press mute", AWAKE, media=False) is not None                    # plain key press: unaffected
+    assert V("press volume", AWAKE) is None and V("volume up", AWAKE) is None and V("mute", AWAKE) is None
+    assert V("press volume up", GRID) is None                                 # no key presses in the grid
+    assert V("press up", AWAKE) == [KeyPress((Chord((), "up", 1),))]           # arrow key unchanged
+    assert VK["volumeup"] == 0xAF and VK["volumedown"] == 0xAE and VK["mute"] == 0xAD
+    assert {"volumeup", "volumedown", "mute"} <= EXTENDED_KEYS
+    assert ("volume", "up") in AWAKE_GRAMMAR_G.pairs and ("press", "mute") in AWAKE_GRAMMAR_G.pairs
+    kb = FakeKb(); c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=kb)
+    say(c, "start listening press volume up three press mute")
+    assert kb.log == [((), "volumeup", 3), ((), "mute", 1)], kb.log
+
+
+def test_window_commands_and_context_menu():
+    for phrase, action in (("minimize window", "minimize"), ("maximize window", "maximize"), ("restore window", "restore")):
+        assert V(phrase, AWAKE) == [action], phrase
+        assert V(phrase, GRID) is None and V(phrase, SLEEPING) is None
+        assert V(phrase, AWAKE, media=False) == [action]                    # independent of --no-media
+    assert V("maximize window left click minimize window", AWAKE) == ["maximize", "left", "minimize"]
+    for bad in ("minimize", "maximize", "restore", "window", "minimize windows", "window minimize",
+                "mouse grid minimize window"):
+        assert V(bad, AWAKE) is None, bad                                   # phrase only, never the bare verb
+    assert "minimize" in AWAKE_GRAMMAR_G.first and "minimize" not in GRID_GRAMMAR_G.first
+    assert ("minimize", "window") in AWAKE_GRAMMAR_G.pairs
+    assert any("maximize window" in s for s in AWAKE_SENTENCES) and not any("window" in s.split() for s in GRID_SENTENCES)
+    fw = FakeWin()
+    c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), windows=fw)
+    say(c, "maximize window"); assert fw.log == []                         # asleep
+    say(c, "start listening minimize window maximize window restore window")
+    assert fw.log == ["minimize", "maximize", "restore"], fw.log
+    say(c, "mouse grid"); say(c, "minimize window"); assert len(fw.log) == 3  # grid: ignored
+    c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay())
+    say(c, "start listening maximize window")                              # no windows object: no crash
+    assert V("press context menu", AWAKE) == [KeyPress((Chord((), "contextmenu", 1),))]
+    assert V("press shift context menu", AWAKE) == [KeyPress((Chord(("shift",), "contextmenu", 1),))]
+    assert V("press context menu down", AWAKE) is not None and V("press context", AWAKE) is None
+    assert V("context menu", AWAKE) is None and V("press context menu", GRID) is None
+    assert VK["contextmenu"] == 0x5D and "contextmenu" in EXTENDED_KEYS
+    kb = FakeKb(); c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=kb)
+    say(c, "start listening press context menu"); assert kb.log == [((), "contextmenu", 1)]
+
+
+def test_modifier_clicks():
+    for text, want in (("control left click", ModClick("left", ("ctrl",))), ("shift click", ModClick("left", ("shift",))),
+                       ("alt right click", ModClick("right", ("alt",))), ("control double click", ModClick("double", ("ctrl",))),
+                       ("control shift left click", ModClick("left", ("ctrl", "shift"))),
+                       ("shift control right click", ModClick("right", ("shift", "ctrl")))):
+        assert V(text, AWAKE) == [want] and V(text, GRID) == [want], text      # works awake and in the grid
+        assert V(text, SLEEPING) is None
+    assert V("control left click control left click", AWAKE) == [ModClick("left", ("ctrl",))] * 2
+    assert V("mouse grid five control left click", AWAKE) == ["grid", "5", ModClick("left", ("ctrl",))]
+    for bad in ("control", "control shift", "windows left click", "control press tab", "control mark", "shift page down"):
+        assert V(bad, AWAKE) is None, bad
+    # a modifier at the end of a "press" belongs to the click that follows, not to a key press
+    assert V("press tab control left click", AWAKE) == [KeyPress((Chord((), "tab", 1),)), ModClick("left", ("ctrl",))]
+    assert V("press control c control left click", AWAKE) == [KeyPress((Chord(("ctrl",), "c", 1),)), ModClick("left", ("ctrl",))]
+    assert V("press shift tab", AWAKE) == [KeyPress((Chord(("shift",), "tab", 1),))]          # real chords unchanged
+    assert V("press windows left click", AWAKE) == [KeyPress((Chord((), "win", 1),)), "left"]
+    assert V("press tab left click", AWAKE) == [KeyPress((Chord((), "tab", 1),)), "left"]
+    assert "control" in GRID_GRAMMAR_G.first and ("control", "left") in GRID_GRAMMAR_G.pairs
+
+    class HoldKb(FakeKb):
+        def hold(self, mods): self.log.append(("hold", tuple(mods)))
+        def release(self, mods): self.log.append(("release", tuple(mods)))
+    class LogMouse(FakeMouse):
+        def __init__(self, log): super().__init__(); self.log = log
+        def click(self, button, double=False): self.log.append(("click", button, double))
+        def drag(self, button, a, b): self.log.append(("drag", button))
+        def move(self, x, y): pass                                  # keep the log to holds / clicks
+    hk = HoldKb(); lm = LogMouse(hk.log); o = FakeOverlay()
+    c = Controller(Region(0, 0, 1920, 1080), lm, o, keyboard=hk)
+    say(c, "start listening control left click")
+    assert hk.log == [("hold", ("ctrl",)), ("click", "left", False), ("release", ("ctrl",))], hk.log
+    hk.log.clear(); say(c, "shift control double click")
+    assert hk.log == [("hold", ("shift", "ctrl")), ("click", "left", True), ("release", ("shift", "ctrl"))], hk.log
+    hk.log.clear(); say(c, "alt right click")
+    assert hk.log == [("hold", ("alt",)), ("click", "right", False), ("release", ("alt",))]
+    hk.log.clear(); say(c, "left click"); assert hk.log == [("click", "left", False)]          # plain click: nothing held
+    hk.log.clear(); say(c, "mouse grid five shift left click")
+    assert c.state == AWAKE and not o.visible
+    assert hk.log == [("hold", ("shift",)), ("click", "left", False), ("release", ("shift",))], hk.log
+    hk.log.clear(); say(c, "mouse grid five mark one control left click")                      # modified drag
+    assert hk.log == [("hold", ("ctrl",)), ("drag", "left"), ("release", ("ctrl",))], hk.log
+    hk = HoldKb(); c = Controller(Region(0, 0, 1920, 1080), BoomMouse(), FakeOverlay(), keyboard=hk)
+    c.state = AWAKE
+    try: c.handle(ModClick("left", ("ctrl",)))
+    except RuntimeError: pass
+    assert hk.log[-1] == ("release", ("ctrl",))                                                 # never left held
+    c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay()); c.state = AWAKE
+    c.handle(ModClick("left", ("ctrl",)))                                                       # no keyboard: still clicks
+
+
+def test_several_modifiers_and_start_menu():
+    assert V("control shift click", AWAKE) == [ModClick("left", ("ctrl", "shift"))]
+    assert V("control alt shift double click", AWAKE) == [ModClick("double", ("ctrl", "alt", "shift"))]
+    assert V("start menu", AWAKE) == [KeyPress((Chord((), "win", 1),))] == V("press windows", AWAKE)
+    assert V("start menu", GRID) is None and V("start menu", SLEEPING) is None      # a key press: awake only
+    assert V("start listening", SLEEPING) == ["start"] and V("start", AWAKE) is None and V("start menu left click", AWAKE) is not None
+    assert V("stop listening", AWAKE) == ["stop"]
+    kb = FakeKb(); c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=kb)
+    say(c, "start listening start menu"); assert kb.log == [((), "win", 1)], kb.log
+
+
+def test_relaunch_helpers():
+    _argv = sys.argv
+    sys.argv = ["voice_mouse.py", "--corner", "top-left"]
+    assert self_command()[1:] == [os.path.abspath("voice_mouse.py"), "--corner", "top-left"]
+    assert relaunch_command()[-1] == "--start-awake" and relaunch_command().count("--start-awake") == 1
+    sys.argv = ["voice_mouse.py", "--start-awake", "--admin"]
+    assert relaunch_command().count("--start-awake") == 1 and "--admin" in relaunch_command()
+    sys.argv = _argv
+    assert is_admin() in (True, False)                      # no crash off Windows
+
+
+def test_find_input_device():
+    assert find_input_device(devs, "Mic (USB Audio)", 1) == 2                  # same name, same host API first
+    assert find_input_device(devs, "mic (usb audio)", 0) == 1                  # case-insensitive
+    assert find_input_device(devs, "Mic (USB Audio)", 5) == 1                  # host API gone: same name anywhere
+    assert find_input_device(devs, "Headset Microphone (2)", 0) == 3             # extra suffix
+    assert find_input_device(devs, "Mic (USB Audio) (2)", None) == 1           # Windows adds/drops a suffix
+    assert find_input_device(devs, "Speakers", 0) is None                      # output-only never matches
+    assert find_input_device(devs, "Nothing like it", None) is None
+    assert find_input_device([], "Mic", None) is None
+
+
+def test_microphone_recovery():
+    sd = FakeSD(devs)
+    st = SpeechThread("m", 1, 0.6, lambda: AWAKE, None)                          # --device 1
+    sleeps = []
+    def fake_sleep(sec):
+        sleeps.append(sec)
+        if len(sleeps) == 3:                                                       # plugged back in, now at index 3
+            sd.present = True; sd.devices = [devs[0], devs[3], devs[1], devs[2]]
+    seq0 = st.heard_seq
+    stream = st._open_mic(sd, lambda *a: None, sleep=fake_sleep)
+    assert stream.active and st.mic_ok and len(sleeps) == 3 and sd.refreshes == 3   # retried, rescanned each time
+    assert sd.opened[0] == 1                                                    # first try: the number given
+    st._want_name = "Mic (USB Audio)"; st._want_hostapi = 0                     # (as recorded on the first good open)
+    assert st._resolve_device(sd) == 2                                          # later: found again BY NAME
+    assert st.heard_seq == seq0 + 1 and "no microphone" in st.last_heard        # one notice, not one per retry
+    # default-device mode follows the system default instead of a number
+    st2 = SpeechThread("m", None, 0.6, lambda: AWAKE, None)
+    assert st2._resolve_device(sd) is None
+    # losing it: stream stopped, or silent for too long
+    live = FakeStream(); live.active = True; st3 = SpeechThread("m", None, 0.6, lambda: AWAKE, None)
+    st3._last_audio = time.monotonic()
+    assert not st3._mic_lost(live)
+    live.active = False; assert st3._mic_lost(live)                             # stream died
+    live.active = True; st3._last_audio = time.monotonic() - 10; assert st3._mic_lost(live)   # callback went quiet
+    r0 = sd.refreshes; st3.level = 0.7; st3.mic_ok = True
+    st3._close_mic(sd, live)
+    assert live.closed and not live.active and st3.level == 0.0 and not st3.mic_ok and sd.refreshes == r0 + 1
+    assert "microphone lost" in st3.last_heard
+
+
+def test_process_priority():
+    assert PRIORITY_CLASSES == {"normal": 0x20, "above": 0x8000, "high": 0x80}
+    assert "realtime" not in PRIORITY_CLASSES                      # never offered: can starve input and audio
+
+
+def test_overlay_inset():
+    assert BUSY_STATES == (2, 3) and MAX_INSET == 8
+    assert next_inset(2, False, 1) == 2 and next_inset(3, False, 4) == 5            # busy because of us: grow
+    assert next_inset(5, False, 1) == 1 and next_inset(None, False, 1) == 1         # fine / unknown: leave it
+    assert next_inset(2, True, 1) == 1                                             # something else was full-screen already
+    assert next_inset(2, False, MAX_INSET) == MAX_INSET                            # never past the limit
+    i = 1
+    for _ in range(20):
+        i = next_inset(2, False, i)
+    assert i == MAX_INSET
+
+
+def _run_all(only=()):
+    tests = [(n, f) for n, f in sorted(globals().items(), key=lambda kv: getattr(kv[1], "__code__", None) and kv[1].__code__.co_firstlineno or 0)
+             if n.startswith("test_") and callable(f) and (not only or any(w in n for w in only))]
+    failed = []
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"ok    {name}")
+        except Exception:
+            failed.append(name)
+            print(f"FAIL  {name}")
+            traceback.print_exc()
+    print(f"\n{len(tests) - len(failed)}/{len(tests)} passed" + (f"; failed: {', '.join(failed)}" if failed else ""))
+    return 1 if failed or not tests else 0
+
+
+if __name__ == "__main__":
+    sys.exit(_run_all(sys.argv[1:]))

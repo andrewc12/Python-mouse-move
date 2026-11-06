@@ -150,29 +150,50 @@ NUMBER_WORDS = {
 # key on its own can open the Start menu.
 CLICK_MODIFIERS = {"control", "alt", "shift"}
 
-# "<verb> window": act on the foreground window. Phrases only, never the bare verb, so a stray word
-# cannot minimise whatever you are working in.
-WINDOW_COMMANDS = {("minimize", "window"): "minimize", ("maximize", "window"): "maximize",
-                   ("restore", "window"): "restore"}
-# Two-word phrases first, then single words.
-PHRASES = {
-    **WINDOW_COMMANDS,
-    ("start", "listening"): "start",
-    ("stop", "listening"): "stop",
-    ("mouse", "grid"): "grid",
-    ("move", "mouse"): "move",
-    ("move",): "move",          # bare word: Vosk sometimes drops "mouse"
-    ("left", "click"): "left",
-    ("right", "click"): "right",
-    ("double", "click"): "double",
-    ("click",): "left",         # plain "click" = left click
-    ("left",): "left",          # bare words: Vosk sometimes drops "click"
-    ("right",): "right",        # (arrow keys always need "press" first)
-    ("double",): "double",
-    ("mark",): "mark",
-    ("back",): "back",
-    ("cancel",): "cancel",
-}
+SLEEPING, AWAKE, GRID = "sleeping", "awake", "grid"
+
+# ---- the command table ------------------------------------------------------
+# One row per command token: what is said, and in which states it may be said. PHRASES (spoken words
+# -> token), ALLOWED (token -> legal states) and the window-command grammar/examples are all derived
+# from it. Tokens with no phrases here (press, scroll, media, digits) are built by their own parsers.
+# "window" commands are phrases only, never the bare verb, so a stray word cannot minimise whatever
+# you are working in. `phrases` that are not in PHRASES (reload) are matched by their own code.
+@dataclass(frozen=True)
+class CommandSpec:
+    token: str
+    states: frozenset
+    phrases: tuple = ()
+    in_phrases: bool = True            # False: matched by dedicated parser code, not the PHRASES lookup
+    window: bool = False               # a "<verb> window" command
+
+
+_AW, _GR, _SL = frozenset({AWAKE}), frozenset({GRID}), frozenset({SLEEPING})
+_AG = _AW | _GR
+COMMAND_TABLE: tuple[CommandSpec, ...] = (
+    CommandSpec("start", _SL, (("start", "listening"),)),
+    CommandSpec("stop", _AG, (("stop", "listening"),)),
+    CommandSpec("grid", _AG, (("mouse", "grid"),)),
+    CommandSpec("move", _GR, (("move", "mouse"), ("move",))),       # bare word: Vosk sometimes drops "mouse"
+    CommandSpec("left", _AG, (("left", "click"), ("click",), ("left",))),   # plain "click" = left click
+    CommandSpec("right", _AG, (("right", "click"), ("right",))),    # bare words: Vosk sometimes drops
+    CommandSpec("double", _AG, (("double", "click"), ("double",))),  # "click" (arrow keys need "press")
+    CommandSpec("mark", _GR, (("mark",),)),
+    CommandSpec("back", _GR, (("back",),)),
+    CommandSpec("cancel", _GR, (("cancel",),)),
+    CommandSpec("minimize", _AW, (("minimize", "window"),), window=True),
+    CommandSpec("maximize", _AW, (("maximize", "window"),), window=True),
+    CommandSpec("restore", _AW, (("restore", "window"),), window=True),
+    CommandSpec("reload", _AW, (("super", "secret", "dev", "menu", "reload"),), in_phrases=False),
+    CommandSpec("press", _AW),                 # no key presses in the grid
+    CommandSpec("scroll", _AG),
+    CommandSpec("media", _AW),                 # never in the grid
+    *[CommandSpec(str(n), _GR) for n in range(1, 10)],
+)
+WINDOW_COMMANDS = {p: c.token for c in COMMAND_TABLE if c.window for p in c.phrases}
+RELOAD_PHRASE = next(c.phrases[0] for c in COMMAND_TABLE if c.token == "reload")   # -> "reload"
+# Two-word phrases first, then single words (the parser relies on that order).
+PHRASES = {p: c.token for n in (5, 3, 2, 1) for c in COMMAND_TABLE if c.in_phrases
+           for p in c.phrases if len(p) == n}
 
 # Media buttons: spoken words after "media" -> action. Windows has real keys for play/pause (one
 # toggle), stop, next and previous; fast forward / rewind exist only as WM_APPCOMMAND messages.
@@ -186,8 +207,6 @@ MEDIA_VK = {"play_pause": 0xB3, "stop": 0xB2, "next": 0xB0, "previous": 0xB1}   
 MEDIA_APPCOMMAND = {"fast_forward": 49, "rewind": 50}                            # APPCOMMAND_MEDIA_*
 MEDIA_EXAMPLES = ["media play", "media pause", "media stop", "media next", "media previous",
                   "media fast forward", "media rewind", "media skip back", "media skip forward"]
-
-RELOAD_PHRASE = ("super", "secret", "dev", "menu", "reload")      # -> the "reload" command
 
 MAX_REPEAT = 500          # safety cap for "press down <N>" / "scroll down <N>"
 SCROLL_DEFAULT = 5        # notches for a bare "scroll down"
@@ -385,17 +404,19 @@ def build_command_grammar(mode: str = "any", media: bool = True) -> _G:
     grid_only = _alt(_phrase("move mouse"), _words(["move", "mark", "back", "cancel"] + list(NUMBER_WORDS)))
     stop, mouse_grid = _phrase("stop listening"), _phrase("mouse grid")
     common = [page, scroll, press, clicks, mouse_grid, stop]
-    media_cmd = [_seq(_W("media"), _alt(*[_phrase(" ".join(k)) for k in MEDIA_ACTIONS]))] if media else []
-    media_cmd.append(_phrase(" ".join(RELOAD_PHRASE)))         # the dev "reload" phrase: awake only
-    media_cmd.append(_phrase("start menu"))                          # = press windows
-    media_cmd += [_phrase(" ".join(k)) for k in WINDOW_COMMANDS]   # "minimize window" ...: awake only
+    # Commands legal when awake (and in "any") but never in the grid: media buttons, the dev reload
+    # phrase, "start menu" (= press windows) and the "<verb> window" commands.
+    awake_only = [_seq(_W("media"), _alt(*[_phrase(" ".join(k)) for k in MEDIA_ACTIONS]))] if media else []
+    awake_only.append(_phrase(" ".join(RELOAD_PHRASE)))
+    awake_only.append(_phrase("start menu"))
+    awake_only += [_phrase(" ".join(k)) for k in WINDOW_COMMANDS]
     if mode == "any":
-        return _plus(_alt(_phrase("start listening"), *common, *media_cmd, grid_only))
+        return _plus(_alt(_phrase("start listening"), *common, *awake_only, grid_only))
     if mode == "grid":
         return _plus(_alt(*common, grid_only))
     if mode == "awake":
         in_grid = _alt(*common, grid_only)              # after "mouse grid" anything may follow
-        return _plus(_alt(page, scroll, press, clicks, stop, *media_cmd,
+        return _plus(_alt(page, scroll, press, clicks, stop, *awake_only,
                           _seq(mouse_grid, _opt(_plus(in_grid)))))
     raise ValueError(mode)
 
@@ -844,7 +865,6 @@ class GridNavigator:
         return False
 
 
-SLEEPING, AWAKE, GRID = "sleeping", "awake", "grid"
 
 # Which canonical commands have any effect in each state (keys are the canonical strings produced
 # by parse_commands; "press"/"scroll" stand for any KeyPress/Scroll object and the digits are the
@@ -852,13 +872,8 @@ SLEEPING, AWAKE, GRID = "sleeping", "awake", "grid"
 # AWAKE and GRID share the same two-tier *grammar* in the speech thread (a single breath can cross
 # the boundary, e.g. "mouse grid five"), but they are listed separately here because these sets are
 # read in execution order, after the state has actually advanced.
-ALLOWED: dict[str, set] = {
-    SLEEPING: {"start"},
-    AWAKE: {"stop", "grid", "left", "right", "double", "press", "scroll", "media", "reload",
-            *WINDOW_COMMANDS.values()},
-    GRID: {"stop", "grid", "back", "mark", "cancel", "move", "left", "right", "double",
-           "scroll", *[str(n) for n in range(1, 10)]},      # no "press": no key presses in the grid
-}
+ALLOWED: dict[str, set] = {st: {c.token for c in COMMAND_TABLE if st in c.states}
+                    for st in (SLEEPING, AWAKE, GRID)}
 
 
 def command_token(cmd) -> str:
@@ -1214,6 +1229,19 @@ class WinKeyboard:
         if mods:
             print(f"pressed {'+'.join(mods)}+{key}" + (f" x{count}" if count > 1 else ""))
 
+    def hold(self, mods) -> None:
+        """Press and keep down the modifier keys (used around a mouse click)."""
+        for m in mods:
+            self._event(m, False)
+        if mods:
+            time.sleep(0.04)
+
+    def release(self, mods) -> None:
+        for m in reversed(mods):
+            self._event(m, True)
+        if mods:
+            time.sleep(0.02)
+
 
 class WinWindow:
     """Minimise / maximise / restore the window you are working in (the foreground window)."""
@@ -1264,24 +1292,6 @@ class WinMedia:
             hwnd = self.u.GetForegroundWindow()
             self.u.PostMessageW(hwnd, 0x0319, hwnd or 0, MEDIA_APPCOMMAND[action] << 16)   # WM_APPCOMMAND
         print(f"media {action}")
-
-
-def _kb_hold(self, mods) -> None:
-    """Press and keep down the modifier keys (used around a mouse click)."""
-    for m in mods:
-        self._event(m, False)
-    if mods:
-        time.sleep(0.04)
-
-
-def _kb_release(self, mods) -> None:
-    for m in reversed(mods):
-        self._event(m, True)
-    if mods:
-        time.sleep(0.02)
-
-
-WinKeyboard.hold, WinKeyboard.release = _kb_hold, _kb_release
 
 
 class HotkeyWatcher:
