@@ -92,6 +92,10 @@ complete, well-ordered command for the current state ("page" only before up/down
 after a key, grid words only in the grid ...); (3) with --nbest the best-ranked alternative that
 passes the check wins. --lenient restores the old skip-stray-words behaviour.
 
+Do Not Disturb: the grid overlay stops 1 pixel short of the screen's bottom edge (--overlay-inset N),
+because a window that covers the monitor exactly makes Windows think a full-screen app is running and
+turn on Do Not Disturb (which also shifts the taskbar's notification icons).
+
 Always on top: the status box and the grid are raised to the top of the always-on-top order a few
 times a second, so they stay above the taskbar, the Start menu and other topmost windows (turn off
 with --no-keep-on-top). Windows' own highest layer (on-screen keyboard, Magnifier, the lock screen)
@@ -1354,13 +1358,16 @@ def raise_topmost(widget) -> None:
 class Overlay:
     KEY = "#010203"      # colour treated as fully transparent
 
-    def __init__(self, root, screen: Region, minor_grid: bool = True):
+    def __init__(self, root, screen: Region, minor_grid: bool = True, inset: int = 1):
         import tkinter as tk
         self.tk, self.screen = tk, screen
         self.minor_grid = minor_grid          # thin 9x9 preview lines inside the 3x3 grid
         self.win = tk.Toplevel(root)
         self.win.overrideredirect(True)
-        self.win.geometry(f"{int(screen.w)}x{int(screen.h)}+{int(screen.x)}+{int(screen.y)}")
+        # A borderless window that covers the monitor exactly is treated by Windows as a full-screen
+        # app, which switches on Do Not Disturb / Focus Assist and shuffles the taskbar's notification
+        # area. Stopping `inset` pixel(s) short of the bottom edge avoids that, and is not noticeable.
+        self.win.geometry(f"{int(screen.w)}x{int(screen.h) - max(0, int(inset))}+{int(screen.x)}+{int(screen.y)}")
         self.win.attributes("-topmost", True)
         self.win.attributes("-transparentcolor", self.KEY)
         self.canvas = tk.Canvas(self.win, bg=self.KEY, highlightthickness=0)
@@ -1994,6 +2001,10 @@ def main() -> None:
                          "(default: zoom on each number as soon as it is recognised)")
     ap.add_argument("--no-minor-grid", action="store_true",
                     help="don't draw the thin dashed 9x9 lines that preview the next zoom level")
+    ap.add_argument("--overlay-inset", type=int, default=1, metavar="PIXELS",
+                    help="make the grid overlay this many pixels shorter than the screen (default 1) so "
+                         "Windows does not treat it as a full-screen app and switch on Do Not Disturb; "
+                         "0 = cover the whole screen")
     ap.add_argument("--no-keep-on-top", action="store_true",
                     help="don't keep re-raising the status box and grid above everything else "
                          "(they are still always-on-top windows)")
@@ -2051,7 +2062,7 @@ def main() -> None:
     root.withdraw()
     screen = primary_screen()
     pill = StatusPill(root, screen, corner=args.corner)
-    overlay = Overlay(root, screen, minor_grid=not args.no_minor_grid)
+    overlay = Overlay(root, screen, minor_grid=not args.no_minor_grid, inset=args.overlay_inset)
     ctl = Controller(screen, WinMouse(), overlay, on_state=pill.set, keyboard=WinKeyboard(),
                      media=None if args.no_media else WinMedia(), on_reload=reload_program,
                      windows=WinWindow())
