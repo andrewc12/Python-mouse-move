@@ -758,3 +758,66 @@ assert relaunch_command().count("--start-awake") == 1 and "--admin" in relaunch_
 sys.argv = _argv
 assert is_admin() in (True, False)                      # no crash off Windows
 print("relaunch helpers ok")
+
+
+# ================= microphone unplug / replug =================
+devs = [{"name": "Speakers", "max_input_channels": 0, "hostapi": 0},
+        {"name": "Mic (USB Audio)", "max_input_channels": 1, "hostapi": 0},
+        {"name": "Mic (USB Audio)", "max_input_channels": 1, "hostapi": 1},
+        {"name": "Headset Microphone", "max_input_channels": 2, "hostapi": 0}]
+assert find_input_device(devs, "Mic (USB Audio)", 1) == 2                  # same name, same host API first
+assert find_input_device(devs, "mic (usb audio)", 0) == 1                  # case-insensitive
+assert find_input_device(devs, "Mic (USB Audio)", 5) == 1                  # host API gone: same name anywhere
+assert find_input_device(devs, "Headset Microphone (2)", 0) == 3             # extra suffix
+assert find_input_device(devs, "Mic (USB Audio) (2)", None) == 1           # Windows adds/drops a suffix
+assert find_input_device(devs, "Speakers", 0) is None                      # output-only never matches
+assert find_input_device(devs, "Nothing like it", None) is None
+assert find_input_device([], "Mic", None) is None
+
+class FakeStream:
+    def __init__(self, fail_start=False): self.active, self.closed, self.fail = False, False, fail_start
+    def start(self):
+        if self.fail: raise OSError("Error opening RawInputStream: Invalid device")
+        self.active = True
+    def abort(self): self.active = False
+    def close(self): self.closed = True
+class FakeSD:
+    """Stands in for sounddevice: the microphone is 'unplugged' until `present` is set."""
+    def __init__(self, devices): self.devices, self.present, self.opened, self.refreshes = devices, False, [], 0
+    def query_devices(self, device=None):
+        return self.devices if device is None else self.devices[device]
+    def RawInputStream(self, **kw):
+        self.opened.append(kw["device"])
+        return FakeStream(fail_start=not self.present)
+    def _terminate(self): self.refreshes += 1
+    def _initialize(self): pass
+
+import time as _t
+sd = FakeSD(devs)
+st = SpeechThread("m", 1, 0.6, lambda: AWAKE, None)                          # --device 1
+sleeps = []
+def fake_sleep(sec):
+    sleeps.append(sec)
+    if len(sleeps) == 3:                                                       # plugged back in, now at index 3
+        sd.present = True; sd.devices = [devs[0], devs[3], devs[1], devs[2]]
+seq0 = st.heard_seq
+stream = st._open_mic(sd, lambda *a: None, sleep=fake_sleep)
+assert stream.active and st.mic_ok and len(sleeps) == 3 and sd.refreshes == 3   # retried, rescanned each time
+assert sd.opened[0] == 1                                                    # first try: the number given
+st._want_name = "Mic (USB Audio)"; st._want_hostapi = 0                     # (as recorded on the first good open)
+assert st._resolve_device(sd) == 2                                          # later: found again BY NAME
+assert st.heard_seq == seq0 + 1 and "no microphone" in st.last_heard        # one notice, not one per retry
+# default-device mode follows the system default instead of a number
+st2 = SpeechThread("m", None, 0.6, lambda: AWAKE, None)
+assert st2._resolve_device(sd) is None
+# losing it: stream stopped, or silent for too long
+live = FakeStream(); live.active = True; st3 = SpeechThread("m", None, 0.6, lambda: AWAKE, None)
+st3._last_audio = _t.monotonic()
+assert not st3._mic_lost(live)
+live.active = False; assert st3._mic_lost(live)                             # stream died
+live.active = True; st3._last_audio = _t.monotonic() - 10; assert st3._mic_lost(live)   # callback went quiet
+r0 = sd.refreshes; st3.level = 0.7; st3.mic_ok = True
+st3._close_mic(sd, live)
+assert live.closed and not live.active and st3.level == 0.0 and not st3.mic_ok and sd.refreshes == r0 + 1
+assert "microphone lost" in st3.last_heard
+print("microphone recovery ok")

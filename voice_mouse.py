@@ -1570,6 +1570,27 @@ def ensure_model(path: str | None) -> str:
     return target
 
 
+def find_input_device(devices, name: str, hostapi=None):
+    """Index of the input device called `name` in sounddevice's device list, or None.
+
+    Device numbers change when a microphone is unplugged and plugged back in, so the program
+    remembers the NAME and looks it up again. Preference: same name on the same host API, then the
+    same name anywhere, then a name that contains / is contained in it (Windows sometimes appends
+    or drops a suffix such as "(2)"). Only devices that can record count."""
+    want = name.strip().lower()
+    cands = [(i, d) for i, d in enumerate(devices) if d.get("max_input_channels", 0) > 0]
+    tiers = (
+        lambda d: d["name"].strip().lower() == want and (hostapi is None or d.get("hostapi") == hostapi),
+        lambda d: d["name"].strip().lower() == want,
+        lambda d: want in d["name"].lower() or d["name"].strip().lower() in want,
+    )
+    for ok in tiers:
+        for i, d in cands:
+            if ok(d):
+                return i
+    return None
+
+
 class SpeechThread(threading.Thread):
     """Mic -> Vosk with one recogniser per state (wake-only / awake / grid), then a hard grammar
     check: an utterance is acted on only if it is complete and well-ordered for the current state
@@ -1593,6 +1614,10 @@ class SpeechThread(threading.Thread):
         self.heard_seq = 0       # bumped on each recognition so the UI can tell repeats apart
         self.get_state, self.out = get_state, out_queue
         self.audio: queue.Queue[bytes] = queue.Queue()
+        self.mic_ok = False             # True while audio is flowing
+        self._last_audio = time.monotonic()
+        self._want_name = None          # name of the chosen microphone, to find it again after a replug
+        self._want_hostapi = None
 
     def _confident(self, words: list) -> bool:
         if not words:
@@ -1697,6 +1722,84 @@ class SpeechThread(threading.Thread):
         except OSError as e:
             print(f"warning: log write failed: {e}")
 
+    # ---- microphone handling: survive unplug / replug ----------------------------------------
+    STALL_SECONDS = 2.0       # no audio for this long means the microphone has gone
+    RETRY_SECONDS = 1.0       # how often to look for it again
+
+    def _say(self, text: str) -> None:
+        """Print and show a short notice in the status box."""
+        print(text)
+        self.heard_seq += 1
+        self.last_heard = text
+
+    @staticmethod
+    def _refresh_audio(sd) -> None:
+        """Make PortAudio re-scan the audio devices (it caches the list; without this a replugged
+        microphone is never seen). Only safe while no stream is open."""
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
+
+    def _resolve_device(self, sd):
+        """Device to open now. With no --device the system default is followed. With --device the
+        microphone is found again by NAME, because its number can change after a replug."""
+        if self.device is None:
+            return None
+        if self._want_name is None:                  # first open: remember what was asked for
+            if isinstance(self.device, str):
+                self._want_name = self.device
+            else:
+                try:
+                    info = sd.query_devices(self.device)
+                    self._want_name, self._want_hostapi = info["name"], info.get("hostapi")
+                except Exception:
+                    return self.device
+            return self.device
+        idx = find_input_device(list(sd.query_devices()), self._want_name, self._want_hostapi)
+        if idx is None:
+            raise RuntimeError(f"microphone '{self._want_name}' not found")
+        return idx
+
+    def _open_mic(self, sd, callback, sleep=time.sleep):
+        """Open the microphone stream, retrying until it works (also covers 'not plugged in yet')."""
+        last_err = None
+        while True:
+            try:
+                stream = sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=800,
+                                           device=self._resolve_device(sd), dtype="int16",
+                                           channels=1, callback=callback)
+                stream.start()
+                self._last_audio = time.monotonic()
+                self.mic_ok = True
+                return stream
+            except Exception as e:
+                if str(e) != last_err:               # say it once per distinct problem, not every retry
+                    last_err = str(e)
+                    self._say(f"\u26a0 no microphone ({last_err}); waiting for it ...")
+                sleep(self.RETRY_SECONDS)
+                self._refresh_audio(sd)
+
+    def _mic_lost(self, stream) -> bool:
+        """The stream has stopped, or has delivered nothing for a while (device unplugged)."""
+        try:
+            stopped = not stream.active
+        except Exception:
+            stopped = True
+        return stopped or time.monotonic() - self._last_audio > self.STALL_SECONDS
+
+    def _close_mic(self, sd, stream) -> None:
+        for how in ("abort", "close"):
+            try:
+                getattr(stream, how)()
+            except Exception:
+                pass
+        self.level = 0.0
+        self.mic_ok = False
+        self._say("\u26a0 microphone lost; reconnecting ...")
+        self._refresh_audio(sd)
+
     def run(self) -> None:
         import sounddevice as sd
         from vosk import KaldiRecognizer, Model, SetLogLevel
@@ -1730,6 +1833,7 @@ class SpeechThread(threading.Thread):
 
         def cb(indata, frames, t, status):
             data = bytes(indata)
+            self._last_audio = time.monotonic()
             self.level = level_from_pcm(data)
             self.audio.put(data)
 
@@ -1740,51 +1844,70 @@ class SpeechThread(threading.Thread):
                 print(f"Logging recognitions to {self.log_path}")
             except OSError as e:
                 print(f"warning: cannot write log file {self.log_path}: {e}")
+        stream, opened_before = None, False
         try:
-            with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=800, device=self.device,
-                                   dtype="int16", channels=1, callback=cb):
-                print("Microphone open. Say \"start listening\".")
-                while True:
-                    data = self.audio.get()
-                    state = self.get_state()
-                    asleep = state == SLEEPING
-                    if state != last_state:               # state flipped: drop stale audio
-                        recs[state].Reset()
-                        last_state = state
-                        early, prev_digits = 0, []
-                    rec = recs[state]
-                    if rec.AcceptWaveform(data):
-                        hyps = self._hypotheses(json.loads(rec.Result()))
-                        text, _, words = hyps[0]
-                        sent, early, prev_digits = early, 0, []
-                        if is_noise(text):            # "", " " or only [unk]: not worth logging or showing
-                            continue
-                        # With --nbest, prefer the highest-ranked alternative that is a valid
-                        # utterance in this state (so "page delta" loses to "page down").
-                        chosen = self._choose(hyps, state) if len(hyps) > 1 else 0
-                        ctext, _, cwords = hyps[chosen]
-                        cmds = self._commands(ctext, cwords, state)
-                        if log is not None:               # record every recognition, even weak ones
-                            self._write_log(log, state, asleep, hyps, chosen, valid=cmds)
-                        # Weak overall confidence is ignored as before; no per-word data (some
-                        # result shapes have none) cannot be judged, so the grammar check decides.
-                        if cwords and not self._confident(cwords):
-                            continue
-                        self._report(hyps, chosen, accepted=bool(cmds))
-                        if sent and cmds:             # those leading numbers have already been acted on
-                            cmds = drop_applied_digits(cmds, sent)
-                        for cmd in cmds or ():
-                            self.out.put(cmd)
-                    elif state == GRID and self.early_digits:
-                        # Mid-utterance: zoom as soon as a spoken number is stable (unchanged between
-                        # two successive partials), instead of waiting for the whole sequence to end.
-                        part = json.loads(rec.PartialResult()).get("partial", "")
-                        digits = leading_digits(part)
-                        for d in stable_prefix(prev_digits, digits)[early:]:
-                            self.out.put(str(d))
-                            early += 1
-                        prev_digits = digits
+            while True:
+                if stream is None:                    # first start, or the microphone came back
+                    stream = self._open_mic(sd, cb)
+                    while not self.audio.empty():     # drop audio from before the gap
+                        self.audio.get_nowait()
+                    for r in recs.values():
+                        r.Reset()
+                    early, prev_digits = 0, []
+                    self._say("microphone back" if opened_before else
+                              "Microphone open. Say \"start listening\".")
+                    opened_before = True
+                try:
+                    data = self.audio.get(timeout=0.5)
+                except queue.Empty:
+                    if self._mic_lost(stream):
+                        self._close_mic(sd, stream)
+                        stream = None
+                    continue
+                state = self.get_state()
+                asleep = state == SLEEPING
+                if state != last_state:               # state flipped: drop stale audio
+                    recs[state].Reset()
+                    last_state = state
+                    early, prev_digits = 0, []
+                rec = recs[state]
+                if rec.AcceptWaveform(data):
+                    hyps = self._hypotheses(json.loads(rec.Result()))
+                    text, _, words = hyps[0]
+                    sent, early, prev_digits = early, 0, []
+                    if is_noise(text):            # "", " " or only [unk]: not worth logging or showing
+                        continue
+                    # With --nbest, prefer the highest-ranked alternative that is a valid
+                    # utterance in this state (so "page delta" loses to "page down").
+                    chosen = self._choose(hyps, state) if len(hyps) > 1 else 0
+                    ctext, _, cwords = hyps[chosen]
+                    cmds = self._commands(ctext, cwords, state)
+                    if log is not None:               # record every recognition, even weak ones
+                        self._write_log(log, state, asleep, hyps, chosen, valid=cmds)
+                    # Weak overall confidence is ignored as before; no per-word data (some
+                    # result shapes have none) cannot be judged, so the grammar check decides.
+                    if cwords and not self._confident(cwords):
+                        continue
+                    self._report(hyps, chosen, accepted=bool(cmds))
+                    if sent and cmds:             # those leading numbers have already been acted on
+                        cmds = drop_applied_digits(cmds, sent)
+                    for cmd in cmds or ():
+                        self.out.put(cmd)
+                elif state == GRID and self.early_digits:
+                    # Mid-utterance: zoom as soon as a spoken number is stable (unchanged between
+                    # two successive partials), instead of waiting for the whole sequence to end.
+                    part = json.loads(rec.PartialResult()).get("partial", "")
+                    digits = leading_digits(part)
+                    for d in stable_prefix(prev_digits, digits)[early:]:
+                        self.out.put(str(d))
+                        early += 1
+                    prev_digits = digits
         finally:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
             if log is not None:
                 log.close()
 
