@@ -428,7 +428,7 @@ print("next_state matches controller ok")
 
 # ---- per-state grammars: what an utterance may START with, and which pairs are taught ----
 assert AWAKE_GRAMMAR_G.first == {"click", "left", "right", "double", "mouse", "page", "press",
-                                 "scroll", "stop", "media", "super"}, AWAKE_GRAMMAR_G.first
+                                 "scroll", "stop", "media", "super", "minimize", "maximize", "restore"}, AWAKE_GRAMMAR_G.first
 assert {"five", "mark", "cancel", "back", "move"} <= GRID_GRAMMAR_G.first
 assert not ({"five", "mark", "cancel", "back", "move"} & AWAKE_GRAMMAR_G.first)
 assert "start" not in GRID_GRAMMAR_G.first | AWAKE_GRAMMAR_G.first
@@ -645,3 +645,36 @@ kb = FakeKb(); c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay
 say(c, "start listening press volume up three press mute")
 assert kb.log == [((), "volumeup", 3), ((), "mute", 1)], kb.log
 print("volume keys ok")
+
+
+# ================= window commands + context menu key =================
+for phrase, action in (("minimize window", "minimize"), ("maximize window", "maximize"), ("restore window", "restore")):
+    assert V(phrase, AWAKE) == [action], phrase
+    assert V(phrase, GRID) is None and V(phrase, SLEEPING) is None
+    assert V(phrase, AWAKE, media=False) == [action]                    # independent of --no-media
+assert V("maximize window left click minimize window", AWAKE) == ["maximize", "left", "minimize"]
+for bad in ("minimize", "maximize", "restore", "window", "minimize windows", "window minimize",
+            "mouse grid minimize window"):
+    assert V(bad, AWAKE) is None, bad                                   # phrase only, never the bare verb
+assert "minimize" in AWAKE_GRAMMAR_G.first and "minimize" not in GRID_GRAMMAR_G.first
+assert ("minimize", "window") in AWAKE_GRAMMAR_G.pairs
+assert any("maximize window" in s for s in AWAKE_SENTENCES) and not any("window" in s.split() for s in GRID_SENTENCES)
+class FakeWin:
+    def __init__(self): self.log = []
+    def act(self, a): self.log.append(a)
+fw = FakeWin()
+c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), windows=fw)
+say(c, "maximize window"); assert fw.log == []                         # asleep
+say(c, "start listening minimize window maximize window restore window")
+assert fw.log == ["minimize", "maximize", "restore"], fw.log
+say(c, "mouse grid"); say(c, "minimize window"); assert len(fw.log) == 3  # grid: ignored
+c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay())
+say(c, "start listening maximize window")                              # no windows object: no crash
+assert V("press context menu", AWAKE) == [KeyPress((Chord((), "contextmenu", 1),))]
+assert V("press shift context menu", AWAKE) == [KeyPress((Chord(("shift",), "contextmenu", 1),))]
+assert V("press context menu down", AWAKE) is not None and V("press context", AWAKE) is None
+assert V("context menu", AWAKE) is None and V("press context menu", GRID) is None
+assert VK["contextmenu"] == 0x5D and "contextmenu" in EXTENDED_KEYS
+kb = FakeKb(); c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=kb)
+say(c, "start listening press context menu"); assert kb.log == [((), "contextmenu", 1)]
+print("window commands + context menu ok")

@@ -49,6 +49,14 @@ Scrolling (awake, or inside the grid; scrolls whatever window is under the curso
   "scroll down ten scroll up two"      chainable
 Everything can be chained in one breath: "mouse grid five one left click press hello" style.
 
+Windows (awake only; acts on the window you are using, never the desktop or taskbar)
+  "minimize window"                    minimise it to the taskbar
+  "maximize window"                    maximise it
+  "restore window"                     bring a maximised window back to its normal size
+  (US spellings: that is what the speech model knows.)
+  "press context menu"                 the keyboard's menu key: opens the right-click menu for whatever
+                                       has keyboard focus (use "right click" to open it at the pointer)
+
 Media buttons (awake only; say "media" first so "stop", "next", "back" etc. keep their other meanings)
   "media play" / "media pause"         play/pause toggle (Windows has a single play/pause key)
   "media stop"                         stop
@@ -103,8 +111,13 @@ NUMBER_WORDS = {
     "six": 6, "seven": 7, "eight": 8, "nine": 9,
 }
 
+# "<verb> window": act on the foreground window. Phrases only, never the bare verb, so a stray word
+# cannot minimise whatever you are working in.
+WINDOW_COMMANDS = {("minimize", "window"): "minimize", ("maximize", "window"): "maximize",
+                   ("restore", "window"): "restore"}
 # Two-word phrases first, then single words.
 PHRASES = {
+    **WINDOW_COMMANDS,
     ("start", "listening"): "start",
     ("stop", "listening"): "stop",
     ("mouse", "grid"): "grid",
@@ -182,12 +195,12 @@ VK.update({
     "equals": 0xBB, "semicolon": 0xBA,
     "lbracket": 0xDB, "rbracket": 0xDD, "quote": 0xDE, "backtick": 0xC0,
     "capslock": 0x14, "printscreen": 0x2C,
-    "volumeup": 0xAF, "volumedown": 0xAE, "mute": 0xAD,
+    "volumeup": 0xAF, "volumedown": 0xAE, "mute": 0xAD, "contextmenu": 0x5D,   # 0x5D = VK_APPS
     "ctrl": 0x11, "alt": 0x12, "shift": 0x10, "win": 0x5B,
 })
 EXTENDED_KEYS = {"delete", "insert", "home", "end", "pageup", "pagedown",
                  "left", "up", "right", "down", "win", "printscreen",
-                 "volumeup", "volumedown", "mute"}
+                 "volumeup", "volumedown", "mute", "contextmenu"}
 
 # Multi-word and punctuation key names: spoken phrase -> (extra modifiers, key). Symbols that need
 # Shift are Shift + the key that carries them on a US layout (the Australian layout is the same).
@@ -196,6 +209,7 @@ SYMBOL_KEYS: dict[tuple[str, ...], tuple[tuple[str, ...], str]] = {
     ("back", "space"): ((), "backspace"), ("space", "bar"): ((), "space"),
     ("caps", "lock"): ((), "capslock"), ("print", "screen"): ((), "printscreen"),
     ("volume", "up"): ((), "volumeup"), ("volume", "down"): ((), "volumedown"), ("mute",): ((), "mute"),
+    ("context", "menu"): ((), "contextmenu"),
     ("left", "arrow"): ((), "left"), ("right", "arrow"): ((), "right"),
     ("up", "arrow"): ((), "up"), ("down", "arrow"): ((), "down"),
     ("question", "mark"): (("shift",), "slash"),
@@ -219,7 +233,7 @@ SYMBOL_KEYS: dict[tuple[str, ...], tuple[tuple[str, ...], str]] = {
 
 _KEY_WORDS = (set(SPOKEN_KEYS) | set(LETTER_WORDS) | set(MODIFIERS) | set(UNITS) | set(TENS)
               | {"press", "times", "function", "page", "hundred", "click", "scroll", "media"}
-              | set(RELOAD_PHRASE)
+              | set(RELOAD_PHRASE) | {w for phrase in WINDOW_COMMANDS for w in phrase}
               | {w for phrase in MEDIA_ACTIONS for w in phrase}
               | {w for phrase in SYMBOL_KEYS for w in phrase})
 
@@ -333,6 +347,7 @@ def build_command_grammar(mode: str = "any", media: bool = True) -> _G:
     common = [page, scroll, press, clicks, mouse_grid, stop]
     media_cmd = [_seq(_W("media"), _alt(*[_phrase(" ".join(k)) for k in MEDIA_ACTIONS]))] if media else []
     media_cmd.append(_phrase(" ".join(RELOAD_PHRASE)))         # the dev "reload" phrase: awake only
+    media_cmd += [_phrase(" ".join(k)) for k in WINDOW_COMMANDS]   # "minimize window" ...: awake only
     if mode == "any":
         return _plus(_alt(_phrase("start listening"), *common, *media_cmd, grid_only))
     if mode == "grid":
@@ -351,7 +366,8 @@ _COMMON_EXAMPLES = ["mouse grid", "page down", "page up", "scroll down", "scroll
                     "press left arrow", "stop listening"] + _CLICKS
 BASE_EXAMPLES = _COMMON_EXAMPLES + ["move mouse", "mark", "back", "cancel", "start listening"] + list(NUMBER_WORDS)
 GRID_BASE_EXAMPLES = [e for e in BASE_EXAMPLES if e != "start listening"]
-AWAKE_BASE_EXAMPLES = list(_COMMON_EXAMPLES) + MEDIA_EXAMPLES + [" ".join(RELOAD_PHRASE)]
+AWAKE_BASE_EXAMPLES = (list(_COMMON_EXAMPLES) + MEDIA_EXAMPLES + [" ".join(RELOAD_PHRASE)]
+                       + [" ".join(k) for k in WINDOW_COMMANDS] + ["press context menu"])
 
 
 def grammar_sentences(g: _G, repeat: int = GRAMMAR_REPEAT, max_len: int = GRAMMAR_MAX_LEN,
@@ -754,7 +770,8 @@ SLEEPING, AWAKE, GRID = "sleeping", "awake", "grid"
 # read in execution order, after the state has actually advanced.
 ALLOWED: dict[str, set] = {
     SLEEPING: {"start"},
-    AWAKE: {"stop", "grid", "left", "right", "double", "press", "scroll", "media", "reload"},
+    AWAKE: {"stop", "grid", "left", "right", "double", "press", "scroll", "media", "reload",
+            *WINDOW_COMMANDS.values()},
     GRID: {"stop", "grid", "back", "mark", "cancel", "move", "left", "right", "double",
            "scroll", *[str(n) for n in range(1, 10)]},      # no "press": no key presses in the grid
 }
@@ -805,12 +822,13 @@ class Controller:
     """State machine: SLEEPING <-> AWAKE <-> GRID. Talks to `mouse` and `overlay`."""
 
     def __init__(self, bounds: Region, mouse, overlay, on_state=lambda s: None, keyboard=None,
-                 media=None, on_reload=None):
+                 media=None, on_reload=None, windows=None):
         self.nav = GridNavigator(bounds)
         self.on_reload = on_reload or (lambda: print("reload requested (nothing wired up)"))
         self.mouse, self.overlay, self.on_state = mouse, overlay, on_state
         self.keyboard = keyboard
         self.media = media                    # object with .send(action), or None (--no-media)
+        self.windows = windows                # object with .act(action): minimize/maximize/restore
         self.state = SLEEPING
         self.mark: tuple[int, int] | None = None
 
@@ -846,9 +864,10 @@ class Controller:
         # five" opens the grid (allowed while AWAKE) and only then uses the digit (allowed in GRID).
         token = command_token(cmd)
         if token not in ALLOWED[self.state]:
-            if token in ("press", "media", "reload") and self.state == GRID:
-                print("ignored: key presses and media buttons are off while the mouse grid is open "
-                      "(click, move mouse or cancel first)")
+            if self.state == GRID and (token in ("press", "media", "reload")
+                                       or token in WINDOW_COMMANDS.values()):
+                print("ignored: key presses, media buttons and window commands are off while the "
+                      "mouse grid is open (click, move mouse or cancel first)")
             return
 
         if isinstance(cmd, Media):
@@ -876,6 +895,9 @@ class Controller:
                 self._set(SLEEPING)
             elif cmd == "reload":
                 self.on_reload()
+            elif cmd in WINDOW_COMMANDS.values():
+                if self.windows:
+                    self.windows.act(cmd)
             elif cmd == "grid":
                 self.nav.reset()
                 self.mark = None
@@ -1036,6 +1058,33 @@ class WinKeyboard:
             time.sleep(0.02 if count > 1 else 0.01)   # let the target app keep up on repeats
         if mods:
             print(f"pressed {'+'.join(mods)}+{key}" + (f" x{count}" if count > 1 else ""))
+
+
+class WinWindow:
+    """Minimise / maximise / restore the window you are working in (the foreground window)."""
+    SW = {"minimize": 6, "maximize": 3, "restore": 9}          # SW_MINIMIZE, SW_MAXIMIZE, SW_RESTORE
+    SHELL = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}   # desktop + taskbar
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self.ctypes = ctypes
+        self.u = ctypes.windll.user32
+        self.u.GetForegroundWindow.restype = wintypes.HWND
+        self.u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        self.u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+
+    def act(self, action: str) -> None:
+        hwnd = self.u.GetForegroundWindow()
+        if not hwnd:
+            return
+        buf = self.ctypes.create_unicode_buffer(256)
+        self.u.GetClassNameW(hwnd, buf, 256)
+        if buf.value in self.SHELL:                  # never minimise the desktop or the taskbar
+            print(f"{action} window: nothing to do (desktop or taskbar is focused)")
+            return
+        self.u.ShowWindow(hwnd, self.SW[action])
+        print(f"{action} window")
 
 
 class WinMedia:
@@ -1667,7 +1716,8 @@ def main() -> None:
     pill = StatusPill(root, screen, corner=args.corner)
     overlay = Overlay(root, screen, minor_grid=not args.no_minor_grid)
     ctl = Controller(screen, WinMouse(), overlay, on_state=pill.set, keyboard=WinKeyboard(),
-                     media=None if args.no_media else WinMedia(), on_reload=reload_program)
+                     media=None if args.no_media else WinMedia(), on_reload=reload_program,
+                     windows=WinWindow())
     if args.start_awake:
         ctl.handle("start")
 
