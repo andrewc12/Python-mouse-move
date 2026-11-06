@@ -1035,7 +1035,7 @@ class Overlay:
         # thin and dashed so it reads as secondary. Skipped when the minor cells would be tiny.
         if self.minor_grid and min(r.w, r.h) / 9 >= 4:
             # Two strokes per line - a dark one under a bright one - so it shows on any background.
-            shadow = dict(fill="black", width=3, dash=(6, 6))
+            shadow = dict(fill="black", width=2, dash=(6, 6))
             minor = dict(fill="#ff7a7a", width=1, dash=(6, 6))
             for k in range(1, 9):
                 if k % 3 == 0:
