@@ -83,6 +83,12 @@ complete, well-ordered command for the current state ("page" only before up/down
 after a key, grid words only in the grid ...); (3) with --nbest the best-ranked alternative that
 passes the check wins. --lenient restores the old skip-stray-words behaviour.
 
+No console window: run it with  pythonw voice_mouse.py  (or double-click a .pyw copy) and there is
+never a console. --hide-console hides the console after start-up instead; it does not work inside
+Windows Terminal (the Windows 11 default), where only the tab can be closed. A compiled build can use
+--windows-console-mode=disable in build_exe.bat / build_onefile.bat. With no console, messages go
+nowhere; heard.jsonl (--log) still records what was recognised.
+
 Run:  python voice_mouse.py            (downloads the ~40 MB model on first run)
       python voice_mouse.py --list-devices
 """
@@ -971,12 +977,21 @@ def relaunch_command() -> list[str]:
     return [sys.executable, os.path.abspath(sys.argv[0]), *args]
 
 
+def hide_console() -> None:
+    """Hide this program's console window (if it has one). Output still goes to it, unseen."""
+    import ctypes
+    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if hwnd:
+        ctypes.windll.user32.ShowWindow(hwnd, 0)             # SW_HIDE
+
+
 def reload_program() -> None:
     """Start a fresh copy, then exit this one (which frees the microphone and the hooks)."""
     import subprocess
     print("reloading ...")
     subprocess.Popen(relaunch_command())
-    sys.stdout.flush()
+    if sys.stdout:                      # None when run with pythonw / no console
+        sys.stdout.flush()
     os._exit(0)
 
 
@@ -1680,6 +1695,9 @@ def main() -> None:
                          "(default: zoom on each number as soon as it is recognised)")
     ap.add_argument("--no-minor-grid", action="store_true",
                     help="don't draw the thin dashed 9x9 lines that preview the next zoom level")
+    ap.add_argument("--hide-console", action="store_true",
+                    help="hide the console window once started (see the note in the docstring: "
+                         "pythonw is the reliable way to run with no console at all)")
     ap.add_argument("--no-media", action="store_true",
                     help="turn off the media-button commands (\"media play\", \"media next\", ...)")
     ap.add_argument("--start-awake", action="store_true")
@@ -1704,6 +1722,9 @@ def main() -> None:
     except ImportError as e:
         sys.exit(f"Missing package ({e.name}). Install the requirements with:\n"
                  f"    {os.path.basename(sys.executable)} -m pip install vosk sounddevice")
+
+    if args.hide_console:
+        hide_console()                   # after the start-up checks above, so their errors are still seen
 
     import tkinter as tk
     make_dpi_aware()
