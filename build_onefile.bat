@@ -13,6 +13,9 @@ py -m nuitka ^
   --include-package=vosk ^
   --include-package-data=vosk ^
   --include-package-data=_sounddevice_data ^
+  --include-module=voice_dictate ^
+  --include-package=sherpa_onnx ^
+  --include-package-data=sherpa_onnx ^
   --include-data-dir=models=models ^
   --assume-yes-for-downloads ^
   --windows-console-mode=force ^
@@ -24,3 +27,7 @@ echo Built: build\voice_mouse.exe  (single file, roughly 100+ MB because it cont
 rem The {CACHE_DIR} tempdir spec makes it unpack once and reuse that copy, so later starts are fast.
 rem Use --windows-console-mode=disable to hide the console window.
 rem Add --windows-uac-admin to make the exe always ask for administrator rights (so it can click admin windows).
+
+rem Dictation (the "dictate" command) is built in: the three voice_dictate / sherpa_onnx lines above add it.
+rem   They need: py -m pip install sherpa-onnx webrtcvad-wheels numpy   (delete the two sherpa_onnx lines to build without dictation).
+rem   Copy the dictation models folder (sherpa-onnx-*) next to the exe too, or the first use downloads about 750 MB.

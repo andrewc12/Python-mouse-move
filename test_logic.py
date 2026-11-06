@@ -561,7 +561,7 @@ def test_next_state_matches_controller():
 def test_per_state_grammars():
     assert AWAKE_GRAMMAR_G.first == {"click", "left", "right", "double", "mouse", "page", "press",
                                      "scroll", "stop", "media", "super", "minimize", "maximize", "restore",
-                                     "control", "alt", "shift", "start"}, AWAKE_GRAMMAR_G.first
+                                     "control", "alt", "shift", "start", "dictate"}, AWAKE_GRAMMAR_G.first
     assert {"five", "mark", "cancel", "back", "move"} <= GRID_GRAMMAR_G.first
     assert not ({"five", "mark", "cancel", "back", "move"} & AWAKE_GRAMMAR_G.first)
     assert "start" not in GRID_GRAMMAR_G.first          # awake may start "start menu", but never "start listening"
@@ -964,7 +964,7 @@ def _final(text):
     return ("final", {"text": text, "result": [{"word": w, "conf": 1.0} for w in text.split()]})
 
 
-def run_speech(script, state, **kw):
+def run_speech(script, state, feed=None, **kw):
     """Run SpeechThread.run() against scripted recogniser steps; return what it sent the controller."""
     import types
     ScriptRec.script, ScriptRec.resets = list(script), 0
@@ -988,8 +988,10 @@ def run_speech(script, state, **kw):
     sys.modules["sounddevice"], sys.modules["vosk"] = sd, vosk
     try:
         out = queue.Queue()
-        st = SpeechThread("m", None, 0.6, lambda: state, out, **kw)
+        get_state = state if callable(state) else (lambda: state)
+        st = SpeechThread("m", None, 0.6, get_state, out, **kw)
         st.log_path = None
+        st.dictation_feed = feed
         try:
             st.run()
         except _Stop:
@@ -1053,6 +1055,222 @@ def test_recognisers_are_built_for_every_state_and_fall_back_to_serial():
     except RuntimeError:
         pass                                                   # a second failure is allowed to surface
     assert len(calls) >= 2                                     # ...but the serial retry was attempted
+
+
+# ---- dictation ("dictate"): the command, the state, and the engine hand-off ---------------------------
+class FakeDictation:
+    """Stands in for DictationSession in Controller tests."""
+    def __init__(self, ready=True):
+        self.ready, self.log = ready, []
+    def request(self, want=True): self.log.append("request")
+    def cancel_pending(self): self.log.append("cancel_pending")
+    def start(self): self.log.append("start")
+    def stop(self): self.log.append("stop")
+
+
+class TypedText:
+    """A typist that applies edits to a string, so tests see what the user would see."""
+    def __init__(self): self.text = ""
+    def edit(self, back, add): self.text = self.text[:len(self.text) - back] + add
+
+
+def dictating(ready=True):
+    d = FakeDictation(ready)
+    c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=FakeKb(), dictation=d)
+    say(c, "start listening")
+    d.log.clear()
+    return c, d
+
+
+def test_dictate_command_grammar_and_states():
+    assert V("dictate", AWAKE) == ["dictate"]
+    assert V("dictate", GRID) is None and V("dictate", SLEEPING) is None
+    assert V("dictate left click", AWAKE) is None                     # nothing else can follow in the same breath
+    assert V("left click dictate", AWAKE) == ["left", "dictate"]
+    assert V("dictate", AWAKE, media=False) == ["dictate"]
+    assert "dictate" in AWAKE_GRAMMAR_G.first and "dictate" not in GRID_GRAMMAR_G.first
+    assert any(sentence == "dictate" for sentence in AWAKE_SENTENCES) and "dictate" not in " ".join(GRID_SENTENCES)
+    assert "dictate" in ALLOWED[AWAKE] and "dictate" not in ALLOWED[GRID]
+    assert ALLOWED[DICTATE] == {"stop", "listen"}                      # no mouse or key commands while typing
+    assert next_state(AWAKE, "dictate") == DICTATE and next_state(DICTATE, "listen") == AWAKE
+    assert next_state(DICTATE, "stop") == SLEEPING
+    assert "listen" not in PHRASES.values()                           # never spoken: only a timeout or "stop dictation"
+
+
+def test_dictate_enters_and_leaves_the_state():
+    c, d = dictating()
+    say(c, "dictate")
+    assert c.state == DICTATE and d.log == ["cancel_pending", "start"], d.log
+    d.log.clear()
+    c.handle("listen")                                                 # timeout, or "stop dictation"
+    assert c.state == AWAKE and d.log == ["cancel_pending", "stop"], d.log
+    say(c, "dictate"); d.log.clear()
+    c.handle("stop")                                                   # the hotkey / box click: sleep
+    assert c.state == SLEEPING and d.log == ["cancel_pending", "stop"], d.log
+
+
+def test_dictate_state_ignores_mouse_and_key_commands():
+    c, d = dictating()
+    m = c.mouse
+    say(c, "dictate")
+    for cmd in ("left", "grid", "dictate", "start", Scroll("down", 3), KeyPress((Chord((), "tab", 1),)), Media("next"), "5"):
+        c.handle(cmd)
+    assert c.state == DICTATE and m.log == [] and c.keyboard.log == [] and d.log.count("start") == 1
+
+
+def test_dictate_waits_for_the_models_then_the_controller_is_told():
+    c, d = dictating(ready=False)
+    say(c, "dictate")
+    assert c.state == AWAKE and d.log == ["request"]                    # loading; stays listening
+    d.ready = True
+    say(c, "dictate")
+    assert c.state == DICTATE
+
+
+def test_dictate_without_an_engine_and_in_the_grid():
+    c, m, o = make()
+    say(c, "start listening dictate")                                  # no dictation object at all: no crash
+    assert c.state == AWAKE
+    c, d = dictating()
+    say(c, "mouse grid"); c.handle("dictate")
+    assert c.state == GRID and "start" not in d.log                    # off while the grid is open
+    c, d = dictating(ready=False)
+    say(c, "mouse grid"); say(c, "cancel")                              # any state change drops a queued request
+    assert "cancel_pending" in d.log
+
+
+def test_pill_has_a_dictating_look():
+    assert StatusPill.COLORS[DICTATE][1] == "Dictating" and "dictate" in StatusPill.COLORS[AWAKE][2]
+    assert set(StatusPill.COLORS) == {SLEEPING, AWAKE, GRID, DICTATE}
+
+
+def test_reframer_recuts_blocks_into_frames():
+    r = Reframer(960)
+    assert r.push(bytes(1600)) == [bytes(960)] and len(r.buf) == 640
+    assert len(r.push(bytes(1600))) == 2 and len(r.buf) == 320          # 640 left over + 1600 = 2240 = 2 frames + 320
+    r.reset()
+    assert r.push(b"x" * 959) == [] and r.push(b"y") == [b"x" * 959 + b"y"]
+
+
+def make_session(clock, **kw):
+    """A DictationSession wired to fakes: no models, no microphone, no Windows."""
+    typed, events = TypedText(), {"idle": 0, "stop": 0, "ready": 0, "said": []}
+    drafts = {"hello world": 0}
+    def draft(pcm, uid=None): return "hello wor" if len(pcm) < 40000 else "hello world"
+    def final(pcm): return "Hello, world."
+    opts = DictationOptions(**kw)
+    sess = DictationSession(
+        opts, events["said"].append, on_idle=lambda: events.__setitem__("idle", events["idle"] + 1),
+        on_stop=lambda: events.__setitem__("stop", events["stop"] + 1),
+        on_ready=lambda: events.__setitem__("ready", events["ready"] + 1),
+        typist=typed, foreground=lambda: 1, vad=lambda f: f[:1] == b"S", load=lambda: (draft, final), clock=clock)
+    return sess, typed, events
+
+
+def pump(sess, until, timeout=3.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        sess.poll()
+        if until():
+            return True
+        time.sleep(0.005)
+    sess.poll()
+    return until()
+
+
+def test_session_types_a_phrase_then_goes_idle_after_three_seconds():
+    now = [0.0]
+    sess, typed, ev = make_session(lambda: now[0])
+    assert sess.opts.idle == 3.0                                       # the default dictation timeout
+    sess.request(want=False); assert pump(sess, lambda: sess.ready) and not ev["ready"]
+    sess.start()
+    def feed(kind, frames):
+        for _ in range(frames):
+            now[0] += 0.03
+            sess.feed((b"S" if kind == "speech" else b"q") * 960)
+    feed("quiet", 3); feed("speech", 60); feed("quiet", 40)           # a phrase, then a pause
+    assert pump(sess, lambda: typed.text == "Hello, world."), typed.text
+    assert ev["idle"] == 0                                             # 1.2 s since speech: not yet
+    feed("quiet", 85)                                                  # the phrase ended ~2.85 s ago
+    sess.poll(); assert ev["idle"] == 0
+    feed("quiet", 10)                                                  # now past 3 s of silence
+    sess.poll()
+    assert ev["idle"] == 1, ev
+    sess.stop()
+    feed("quiet", 300); sess.poll()
+    assert ev["idle"] == 1                                             # inactive pipelines stay silent
+
+
+def test_session_idle_timeout_is_adjustable_and_speech_resets_it():
+    now = [0.0]
+    sess, typed, ev = make_session(lambda: now[0], idle=1.0)
+    sess.request(want=False); pump(sess, lambda: sess.ready)
+    sess.start()
+    for _ in range(10):                                                # speak every ~0.6 s: never idle
+        for kind, n in (("S", 10), ("q", 10)):
+            for _ in range(n):
+                now[0] += 0.03
+                sess.feed(kind.encode() * 960)
+        sess.poll()
+    assert ev["idle"] == 0
+    sess2, _, ev2 = make_session(lambda: now[0], idle=0)               # 0 = never
+    sess2.request(want=False); pump(sess2, lambda: sess2.ready); sess2.start()
+    for _ in range(2000):
+        now[0] += 0.03; sess2.feed(b"q" * 960)
+    sess2.poll(); assert ev2["idle"] == 0
+
+
+def test_session_spoken_stop_and_load_requests():
+    now = [0.0]
+    sess, typed, ev = make_session(lambda: now[0])
+    assert not sess.ready
+    sess.request()                                                     # a spoken "dictate" before the models exist
+    assert pump(sess, lambda: ev["ready"] == 1)                        # loaded -> on_ready fires once
+    sess.poll(); assert ev["ready"] == 1
+    sess.request(); sess.cancel_pending(); sess.poll()
+    assert ev["ready"] == 1                                            # a cancelled request does not fire
+    sess.start()
+    sess.out.put(("start", 1)); sess.out.put(("final", 1, "Stop listening."))
+    sess.poll()
+    assert ev["stop"] == 1 and typed.text == ""
+
+
+def test_session_failed_load_is_reported_and_forgotten():
+    def broken(): raise RuntimeError("no network")
+    sess = DictationSession(DictationOptions(), lambda t: said.append(t), lambda: None, lambda: None, lambda: None,
+                            typist=TypedText(), foreground=lambda: 1, vad=lambda f: False, load=broken)
+    said = []
+    sess.request()
+    assert pump(sess, lambda: any("failed to load" in t for t in said)) and not sess.ready and not sess.wanted
+    sess.request()                                                     # can be tried again
+    assert pump(sess, lambda: len([t for t in said if "failed to load" in t]) == 2)
+
+
+def test_unavailable_stand_in_explains_itself():
+    said = []
+    u = DictationUnavailable(said.append, "dictation is turned off")
+    c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), dictation=u)
+    say(c, "start listening dictate")
+    assert c.state == AWAKE and said == ["dictation is turned off"]
+
+
+def test_speech_loop_hands_audio_to_dictation_instead_of_vosk():
+    chunks = []
+    def feed(data):
+        chunks.append(data)
+        if len(chunks) == 3:
+            raise _Stop()
+    script = [_final("left click")]
+    got = run_speech(script, DICTATE, feed=feed)
+    assert len(chunks) == 3 and got == [] and ScriptRec.script == script, (len(chunks), got)   # Vosk never ran
+
+
+def test_speech_loop_returns_to_vosk_when_dictation_ends():
+    states = iter([DICTATE, DICTATE, AWAKE, AWAKE])
+    chunks = []
+    got = run_speech([_final("left click")], lambda: next(states, AWAKE), feed=chunks.append)
+    assert len(chunks) == 2 and got == ["left"], (len(chunks), got)
+    assert ScriptRec.resets >= 1                                       # recogniser cleared on the way back
 
 
 def _run_all(only=()):

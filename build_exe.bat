@@ -9,6 +9,9 @@ py -m nuitka ^
   --include-package=vosk ^
   --include-package-data=vosk ^
   --include-package-data=_sounddevice_data ^
+  --include-module=voice_dictate ^
+  --include-package=sherpa_onnx ^
+  --include-package-data=sherpa_onnx ^
   --assume-yes-for-downloads ^
   --windows-console-mode=force ^
   --output-dir=build ^
@@ -20,3 +23,7 @@ echo Copy your "models" folder (vosk-model-small-en-us-0.15) next to the exe to 
 rem Add --windows-console-mode=disable to hide the console window (then you lose the printed log).
 rem Add --onefile for a single exe (slower start-up: it unpacks to a temp folder each run).
 rem Add --windows-uac-admin to make the exe always ask for administrator rights (so it can click admin windows).
+
+rem Dictation (the "dictate" command) is built in: the three voice_dictate / sherpa_onnx lines above add it.
+rem   They need: py -m pip install sherpa-onnx webrtcvad-wheels numpy   (delete the two sherpa_onnx lines to build without dictation).
+rem   Copy the dictation models folder (sherpa-onnx-*) next to the exe too, or the first use downloads about 750 MB.

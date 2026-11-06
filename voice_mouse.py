@@ -18,6 +18,18 @@ In grid  : "one" ... "nine"              -> zoom into that cell (cursor moves to
                                             without clicking
            "cancel"                      -> leave the grid (and forget any mark)
 
+Dictation (awake only)
+----------------------
+  "dictate"                          type what you say into the focused window (voice_dictate.py's
+                                     engines: a fast draft while you talk, corrected at each pause).
+                                     The status box turns blue and says Dictating.
+  stops by itself after 3 s of silence (--dictate-idle), or say "stop dictation" / "stop listening"
+  as a phrase of its own: both go back to listening. The hotkey / box click goes to sleep instead.
+  "new line", "new paragraph", "scratch that" work inside dictation (see voice_dictate.py).
+  The first "dictate" loads the models in the background (the first run downloads about 750 MB);
+  dictation then starts by itself. --preload-dictation loads them at start-up; --no-dictation turns
+  the command off. Needs: pip install sherpa-onnx webrtcvad-wheels numpy (see requirements.txt).
+
 Keyboard (awake only; ignored while the mouse grid is open)
 ------------------------------------
   "press tab"                        one key
@@ -133,6 +145,7 @@ import queue
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -151,7 +164,7 @@ NUMBER_WORDS = {
 # key on its own can open the Start menu.
 CLICK_MODIFIERS = {"control", "alt", "shift"}
 
-SLEEPING, AWAKE, GRID = "sleeping", "awake", "grid"
+SLEEPING, AWAKE, GRID, DICTATE = "sleeping", "awake", "grid", "dictating"
 
 # ---- the command table ------------------------------------------------------
 # One row per command token: what is said, and in which states it may be said. PHRASES (spoken words
@@ -166,13 +179,14 @@ class CommandSpec:
     phrases: tuple = ()
     in_phrases: bool = True            # False: matched by dedicated parser code, not the PHRASES lookup
     window: bool = False               # a "<verb> window" command
+    awake_only: bool = False           # its phrases are in the awake/any grammar but never the grid's
 
 
-_AW, _GR, _SL = frozenset({AWAKE}), frozenset({GRID}), frozenset({SLEEPING})
+_AW, _GR, _SL, _DI = (frozenset({AWAKE}), frozenset({GRID}), frozenset({SLEEPING}), frozenset({DICTATE}))
 _AG = _AW | _GR
 COMMAND_TABLE: tuple[CommandSpec, ...] = (
     CommandSpec("start", _SL, (("start", "listening"),)),
-    CommandSpec("stop", _AG, (("stop", "listening"),)),
+    CommandSpec("stop", _AG | _DI, (("stop", "listening"),)),
     CommandSpec("grid", _AG, (("mouse", "grid"),)),
     CommandSpec("move", _GR, (("move", "mouse"), ("move",))),       # bare word: Vosk sometimes drops "mouse"
     CommandSpec("left", _AG, (("left", "click"), ("click",), ("left",))),   # plain "click" = left click
@@ -181,10 +195,12 @@ COMMAND_TABLE: tuple[CommandSpec, ...] = (
     CommandSpec("mark", _GR, (("mark",),)),
     CommandSpec("back", _GR, (("back",),)),
     CommandSpec("cancel", _GR, (("cancel",),)),
-    CommandSpec("minimize", _AW, (("minimize", "window"),), window=True),
-    CommandSpec("maximize", _AW, (("maximize", "window"),), window=True),
-    CommandSpec("restore", _AW, (("restore", "window"),), window=True),
+    CommandSpec("minimize", _AW, (("minimize", "window"),), window=True, awake_only=True),
+    CommandSpec("maximize", _AW, (("maximize", "window"),), window=True, awake_only=True),
+    CommandSpec("restore", _AW, (("restore", "window"),), window=True, awake_only=True),
     CommandSpec("reload", _AW, (("super", "secret", "dev", "menu", "reload"),), in_phrases=False),
+    CommandSpec("dictate", _AW, (("dictate",),), awake_only=True),   # awake -> typing what you say
+    CommandSpec("listen", _DI),                # end dictation, back to listening (not spoken: timeout / "stop dictation")
     CommandSpec("press", _AW),                 # no key presses in the grid
     CommandSpec("scroll", _AG),
     CommandSpec("media", _AW),                 # never in the grid
@@ -405,11 +421,11 @@ def build_command_grammar(mode: str = "any", media: bool = True) -> _G:
     stop, mouse_grid = _phrase("stop listening"), _phrase("mouse grid")
     common = [page, scroll, press, clicks, mouse_grid, stop]
     # Commands legal when awake (and in "any") but never in the grid: media buttons, the dev reload
-    # phrase, "start menu" (= press windows) and the "<verb> window" commands.
+    # phrase, "start menu" (= press windows), "dictate" and the "<verb> window" commands.
     awake_only = [_seq(_W("media"), _alt(*[_phrase(" ".join(k)) for k in MEDIA_ACTIONS]))] if media else []
     awake_only.append(_phrase(" ".join(RELOAD_PHRASE)))
     awake_only.append(_phrase("start menu"))
-    awake_only += [_phrase(" ".join(k)) for k in WINDOW_COMMANDS]
+    awake_only += [_phrase(" ".join(p)) for c in COMMAND_TABLE if c.awake_only for p in c.phrases]
     if mode == "any":
         return _plus(_alt(_phrase("start listening"), *common, *awake_only, grid_only))
     if mode == "grid":
@@ -430,7 +446,7 @@ _COMMON_EXAMPLES = ["mouse grid", "page down", "page up", "scroll down", "scroll
 BASE_EXAMPLES = _COMMON_EXAMPLES + ["move mouse", "mark", "back", "cancel", "start listening"] + list(NUMBER_WORDS)
 GRID_BASE_EXAMPLES = [e for e in BASE_EXAMPLES if e != "start listening"]
 AWAKE_BASE_EXAMPLES = (list(_COMMON_EXAMPLES) + MEDIA_EXAMPLES + [" ".join(RELOAD_PHRASE)]
-                       + [" ".join(k) for k in WINDOW_COMMANDS] + ["press context menu", "start menu"])
+                       + [" ".join(k) for k in WINDOW_COMMANDS] + ["press context menu", "start menu", "dictate"])
 
 
 def grammar_sentences(g: _G, repeat: int = GRAMMAR_REPEAT, max_len: int = GRAMMAR_MAX_LEN,
@@ -869,7 +885,7 @@ class GridNavigator:
 # the boundary, e.g. "mouse grid five"), but they are listed separately here because these sets are
 # read in execution order, after the state has actually advanced.
 ALLOWED: dict[str, set] = {st: {c.token for c in COMMAND_TABLE if st in c.states}
-                    for st in (SLEEPING, AWAKE, GRID)}
+                    for st in (SLEEPING, AWAKE, GRID, DICTATE)}
 
 
 def command_token(cmd) -> str:
@@ -892,7 +908,9 @@ def next_state(state: str, token: str) -> str:
     if state == SLEEPING:
         return AWAKE if token == "start" else state
     if state == AWAKE:
-        return GRID if token == "grid" else state
+        return GRID if token == "grid" else DICTATE if token == "dictate" else state
+    if state == DICTATE:
+        return AWAKE if token == "listen" else state
     return AWAKE if token in ("left", "right", "double", "move", "cancel") else state   # GRID
 
 
@@ -919,13 +937,14 @@ class Controller:
     """State machine: SLEEPING <-> AWAKE <-> GRID. Talks to `mouse` and `overlay`."""
 
     def __init__(self, bounds: Region, mouse, overlay, on_state=lambda s: None, keyboard=None,
-                 media=None, on_reload=None, windows=None):
+                 media=None, on_reload=None, windows=None, dictation=None):
         self.nav = GridNavigator(bounds)
         self.on_reload = on_reload or (lambda: print("reload requested (nothing wired up)"))
         self.mouse, self.overlay, self.on_state = mouse, overlay, on_state
         self.keyboard = keyboard
         self.media = media                    # object with .send(action), or None (--no-media)
         self.windows = windows                # object with .act(action): minimize/maximize/restore
+        self.dictation = dictation            # DictationSession (or a stand-in); see "dictate"
         self.state = SLEEPING
         self.mark: tuple[int, int] | None = None
 
@@ -936,11 +955,27 @@ class Controller:
             self.overlay.hide()
             self.mark = None
             self.nav.reset()
-        self.state = state
+        was, self.state = self.state, state
+        if was != state and self.dictation:
+            self.dictation.cancel_pending()           # a queued "dictate" is stale once anything changes
+            if state == DICTATE:
+                self.dictation.start()
+            elif was == DICTATE:
+                self.dictation.stop()                 # also delivers a phrase still being spoken
         self.on_state(state)
 
     def _show(self) -> None:
         self.overlay.show(self.nav.current, self.mark)
+
+    def _start_dictation(self) -> None:
+        """"dictate": switch to typing what is said. If the speech models are not loaded yet this
+        starts loading them, and dictation begins by itself when they are ready."""
+        if self.dictation is None:
+            print("dictation is not available")
+        elif not self.dictation.ready:
+            self.dictation.request()
+        else:
+            self._set(DICTATE)
 
     def _leave_grid(self, new_state: str = AWAKE) -> None:
         self.overlay.hide()
@@ -973,10 +1008,10 @@ class Controller:
         # five" opens the grid (allowed while AWAKE) and only then uses the digit (allowed in GRID).
         token = command_token(cmd)
         if token not in ALLOWED[self.state]:
-            if self.state == GRID and (token in ("press", "media", "reload")
+            if self.state == GRID and (token in ("press", "media", "reload", "dictate")
                                        or token in WINDOW_COMMANDS.values()):
-                print("ignored: key presses, media buttons and window commands are off while the "
-                      "mouse grid is open (click, move mouse or cancel first)")
+                print("ignored: key presses, media buttons, dictation and window commands are off "
+                      "while the mouse grid is open (click, move mouse or cancel first)")
             return
 
         if isinstance(cmd, Media):
@@ -1003,9 +1038,18 @@ class Controller:
                 self._set(AWAKE)
             return
 
+        if self.state == DICTATE:             # speech is going to the dictation engine, not Vosk
+            if cmd == "listen":                   # timeout, or "stop dictation": back to listening
+                self._set(AWAKE)
+            elif cmd == "stop":                   # the hotkey / status-box toggle: go to sleep
+                self._set(SLEEPING)
+            return
+
         if self.state == AWAKE:
             if cmd == "stop":
                 self._set(SLEEPING)
+            elif cmd == "dictate":
+                self._start_dictation()
             elif cmd == "reload":
                 self.on_reload()
             elif cmd in WINDOW_COMMANDS.values():
@@ -1487,8 +1531,9 @@ class Overlay:
 
 class StatusPill:
     COLORS = {SLEEPING: ("#444444", "Sleeping", "say \"start listening\""),
-              AWAKE: ("#1e8e3e", "Listening", "\"mouse grid\" or \"press ...\""),
-              GRID: ("#c5221f", "Grid", "say 1-9, back, mark, cancel")}
+              AWAKE: ("#1e8e3e", "Listening", "\"mouse grid\", \"press ...\" or \"dictate\""),
+              GRID: ("#c5221f", "Grid", "say 1-9, back, mark, cancel"),
+              DICTATE: ("#1a5fb4", "Dictating", "just talk; go quiet to stop")}
     METER_W, METER_H = 90, 10
     HINT_SECONDS = 6          # how long the hint / last-heard phrase stay visible
     PAD = 8                   # spacing between every element and around the edge
@@ -1733,6 +1778,7 @@ class SpeechThread(threading.Thread):
         self.last_heard = ""     # last recognised phrase, read by the UI
         self.heard_seq = 0       # bumped on each recognition so the UI can tell repeats apart
         self.get_state, self.out = get_state, out_queue
+        self.dictation_feed = None      # while the state is DICTATE, mic audio goes here instead of Vosk
         self.audio: queue.Queue[bytes] = queue.Queue()
         self.mic_ok = False             # True while audio is flowing
         self._last_audio = time.monotonic()
@@ -2066,6 +2112,11 @@ class SpeechThread(threading.Thread):
                         stream = None
                     continue
                 state = self.get_state()
+                if state == DICTATE:                  # the dictation engine owns the audio now
+                    loop.last_state = state
+                    if self.dictation_feed:
+                        self.dictation_feed(data)
+                    continue
                 if state != loop.last_state:          # state flipped: drop stale audio
                     recs[state].Reset()
                     loop.last_state = state
@@ -2101,6 +2152,246 @@ class SpeechThread(threading.Thread):
             finisher.join(timeout=2)
             if log is not None:
                 log.close()
+
+
+# --------------------------------------------------------------------------
+# Dictation ("dictate"): type what you say into the focused window. The engine is voice_dictate.py
+# (draft model while you speak, accurate final model at each pause). While it is on, the microphone
+# audio goes to it instead of Vosk; it hands control back to listening when you stop talking.
+# --------------------------------------------------------------------------
+@dataclass
+class DictationOptions:
+    draft_model: str | None = None        # None = voice_dictate's default
+    final_model: str | None = None
+    no_draft: bool = False                # True: only type each phrase when you pause
+    device: str = "cpu"                   # cpu / cuda / auto
+    model_dir: str | None = None
+    compute_type: str | None = None       # Whisper models only
+    language: str | None = "en"
+    prompt: str | None = None
+    beam: int = 3
+    draft_threads: int = 0                # 0 = share the CPU cores sensibly
+    final_threads: int = 0
+    vad_level: int = 2
+    pause_ms: int = 900                   # silence that ends a phrase
+    long_after: float = 12.0
+    long_pause_ms: int = 600
+    max_phrase: float = 20.0
+    draft_interval: float = 0.3
+    idle: float = 3.0                     # seconds of silence before it returns to listening (0 = never)
+    verbose: bool = False
+
+
+def dictation_available(opts: DictationOptions) -> tuple[bool, str]:
+    """Are the packages the chosen dictation models need installed? (ok, message if not)"""
+    try:
+        import numpy, sounddevice  # noqa: F401
+        vd = __import__("voice_dictate")
+        names = [opts.final_model or vd.DEFAULT_FINAL] + ([] if opts.no_draft else [opts.draft_model or vd.DEFAULT_DRAFT])
+        if any(vd.engine_kind(n) == "whisper" for n in names):
+            import faster_whisper  # noqa: F401
+        if any(vd.engine_kind(n) != "whisper" for n in names):
+            import sherpa_onnx  # noqa: F401
+    except ImportError as e:
+        return False, (f"dictation needs the package '{e.name}': "
+                       f"{os.path.basename(sys.executable)} -m pip install -r requirements.txt")
+    return True, ""
+
+
+class Reframer:
+    """Re-cuts the microphone's blocks into the fixed-size frames the voice-activity detector wants."""
+
+    def __init__(self, frame_bytes: int):
+        self.n, self.buf = frame_bytes, bytearray()
+
+    def push(self, data: bytes) -> list[bytes]:
+        self.buf += data
+        out = []
+        while len(self.buf) >= self.n:
+            out.append(bytes(self.buf[:self.n]))
+            del self.buf[:self.n]
+        return out
+
+    def reset(self) -> None:
+        self.buf.clear()
+
+
+class DictationUnavailable:
+    """Stands in for DictationSession when --no-dictation is given or its packages are missing, so
+    saying "dictate" explains why nothing happens instead of failing silently."""
+    ready = False
+
+    def __init__(self, say, reason: str):
+        self.say, self.reason = say, reason
+
+    def request(self, want: bool = True) -> None:
+        self.say(self.reason)
+
+    def cancel_pending(self) -> None: pass
+    def start(self) -> None: pass
+    def stop(self) -> None: pass
+    def feed(self, data: bytes) -> None: pass
+    def poll(self) -> None: pass
+
+
+class DictationSession:
+    """Everything dictation needs, behind five calls the rest of the program uses:
+
+        request()   load the models in the background (first use; the first run downloads them).
+                    Dictation then starts by itself, via on_ready, if it is still wanted.
+        start()/stop()  begin / end typing. stop() still delivers a phrase being spoken.
+        feed(pcm)   microphone audio, called from the speech thread while dictating.
+        poll()      call from the UI thread a few times a second: types what the engine produced
+                    and reports the timeout (on_idle) or the spoken "stop" (on_stop).
+
+    Typing happens on the UI thread (in poll), decoding on worker threads, voice detection on the
+    speech thread. voice_dictate does the actual work; this class only connects it to voice_mouse.
+    """
+
+    def __init__(self, opts: DictationOptions, say, on_idle, on_stop, on_ready, typist=None,
+                 foreground=None, vad=None, load=None, clock=time.monotonic):
+        import importlib
+        vd = self.vd = importlib.import_module("voice_dictate")
+        self.opts, self.say = opts, say
+        self.on_idle, self.on_stop, self.on_ready = on_idle, on_stop, on_ready
+        self.draft_tr = self.final_tr = None
+        self._loader = load or self._load_models
+        self._ready = threading.Event()
+        self._loading = False
+        self.wanted = False                     # "dictate" was said while the models were loading
+        self._lock = threading.Lock()           # speech thread feeds, UI thread starts / stops
+        self.out: queue.Queue = queue.Queue()
+        self.reframer = Reframer(vd.FRAME_BYTES)
+        self.draft_worker = None if opts.no_draft else vd.LatestWorker(self._run_draft)
+        self.final_worker = vd.FifoWorker(self._run_final)
+        self.final_worker.start()
+        if self.draft_worker:
+            self.draft_worker.start()
+        self.pipeline = vd.Pipeline(
+            vad or vd.make_vad(opts.vad_level),
+            (lambda uid, pcm: self.draft_worker.submit((uid, pcm))) if self.draft_worker else None,
+            lambda uid, pcm: self.final_worker.submit((uid, pcm)), self.out,
+            vd.Segmenter(end_silence_ms=opts.pause_ms, soft_after_s=opts.long_after,
+                         soft_silence_ms=min(opts.long_pause_ms, opts.pause_ms), max_s=opts.max_phrase),
+            draft_every_s=opts.draft_interval,
+            discard_draft=self.draft_worker.discard if self.draft_worker else (lambda uid: None),
+            idle_s=opts.idle, clock=clock)
+        self.dictator = vd.Dictator(typist or vd.WinTyper(), foreground or vd.foreground_window,
+                                    on_stop=lambda: self.on_stop(), notice=say)
+
+    # ---- models
+    @property
+    def ready(self) -> bool:
+        return self._ready.is_set()
+
+    def request(self, want: bool = True) -> None:
+        if want:
+            self.wanted = True
+        if self.ready or self._loading:
+            return
+        self._loading = True
+        self.say("loading dictation models (the first run downloads them, about 750 MB) ...")
+        threading.Thread(target=self._load, daemon=True, name="dictation-loader").start()
+
+    def cancel_pending(self) -> None:
+        self.wanted = False
+
+    def _load(self) -> None:
+        t0, error = time.time(), None
+        try:
+            self.draft_tr, self.final_tr = self._loader()
+        except Exception as e:
+            error = e
+            traceback.print_exc()
+        if error is None:
+            self._ready.set()
+            self._loading = False
+            self.say(f"dictation ready ({time.time() - t0:.1f}s)")
+        else:
+            self.wanted = False
+            self._loading = False                     # so it can be tried again
+            self.say(f"dictation models failed to load: {error}")
+
+    def _load_models(self):
+        vd, o = self.vd, self.opts
+        cores = os.cpu_count() or 4
+        if o.no_draft:
+            dthreads, fthreads = 0, o.final_threads or cores
+        else:
+            dthreads = o.draft_threads or max(1, cores // 2)
+            fthreads = o.final_threads or max(1, cores - dthreads)
+        from types import SimpleNamespace
+        args = SimpleNamespace(device=o.device, model_dir=o.model_dir, compute_type=o.compute_type,
+                               language=o.language)
+        final = vd.make_transcriber(o.final_model or vd.DEFAULT_FINAL, fthreads, o.beam, args, o.prompt)
+        draft = None if o.no_draft else vd.make_transcriber(o.draft_model or vd.DEFAULT_DRAFT, dthreads, 1, args)
+        models = [m for m in (draft, final) if m]
+        threads = [threading.Thread(target=m.load) for m in models]       # loaded side by side
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        if not all(m.model for m in models):
+            raise RuntimeError("a model failed to load")
+        return draft, final
+
+    # ---- decode jobs (worker threads)
+    def _run_draft(self, job) -> None:
+        uid, pcm = job
+        t = time.time()
+        text = self.draft_tr(pcm, uid)
+        if self.opts.verbose:
+            print(f"draft {uid}: {time.time() - t:.2f}s for {len(pcm) / 32000:.1f}s -> {text!r}")
+        self.out.put(("draft", uid, text))
+
+    def _run_final(self, job) -> None:
+        uid, pcm = job
+        t = time.time()
+        try:
+            text = self.final_tr(pcm)
+        except Exception:
+            traceback.print_exc()
+            text = ""                                       # never leave a phrase undecided
+        if self.opts.verbose:
+            print(f"final {uid}: {time.time() - t:.2f}s for {len(pcm) / 32000:.1f}s -> {text!r}")
+        self.out.put(("final", uid, text))
+
+    # ---- the calls the program uses
+    def start(self) -> None:
+        with self._lock:
+            self.reframer.reset()
+            self.pipeline.set_active(True)              # the idle clock starts now
+
+    def stop(self) -> None:
+        with self._lock:
+            self.pipeline.set_active(False)
+
+    def feed(self, data: bytes) -> None:
+        with self._lock:
+            for frame in self.reframer.push(data):
+                try:
+                    self.pipeline.feed(frame)
+                except Exception:
+                    traceback.print_exc()
+
+    def poll(self) -> None:
+        handlers = {"start": self.dictator.begin, "cancel": self.dictator.cancel,
+                    "draft": self.dictator.draft, "final": self.dictator.final}
+        while True:
+            try:
+                ev = self.out.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if ev[0] == "idle":
+                    self.on_idle()
+                else:
+                    handlers[ev[0]](*ev[1:])
+            except Exception:
+                traceback.print_exc()
+        if self.wanted and self.ready:
+            self.wanted = False
+            self.on_ready()
 
 
 # --------------------------------------------------------------------------
@@ -2156,6 +2447,26 @@ def main() -> None:
                          "pythonw is the reliable way to run with no console at all)")
     ap.add_argument("--no-media", action="store_true",
                     help="turn off the media-button commands (\"media play\", \"media next\", ...)")
+    ap.add_argument("--no-dictation", action="store_true",
+                    help="turn off the \"dictate\" command (typing what you say; see voice_dictate.py)")
+    ap.add_argument("--dictate-idle", type=float, default=3.0, metavar="SECONDS",
+                    help="dictation goes back to listening after this many seconds of silence "
+                         "(default 3; 0 = never)")
+    ap.add_argument("--preload-dictation", action="store_true",
+                    help="load the dictation models at start-up instead of the first time you say "
+                         "\"dictate\" (uses memory and CPU for a while at start)")
+    ap.add_argument("--draft-model", help="dictation: fast live model (default: voice_dictate's)")
+    ap.add_argument("--final-model", help="dictation: accurate model run at each pause")
+    ap.add_argument("--no-draft", action="store_true",
+                    help="dictation: no live typing, only type each phrase when you pause (least CPU)")
+    ap.add_argument("--dictate-device", choices=("cpu", "cuda", "auto"), default="cpu",
+                    help="dictation: where the models run (default cpu)")
+    ap.add_argument("--dictate-pause-ms", type=int, default=900,
+                    help="dictation: silence that ends a phrase (default 900)")
+    ap.add_argument("--dictate-prompt", help="dictation: names / jargon to bias a Whisper final model towards")
+    ap.add_argument("--dictate-model-dir",
+                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"),
+                    help="dictation: where its models are kept / downloaded (default: ./models)")
     ap.add_argument("--start-awake", action="store_true")
     ap.add_argument("--corner", choices=StatusPill.CORNERS, default="bottom-right",
                     help="screen corner the status box starts in (the arrow button cycles through all four)")
@@ -2208,10 +2519,46 @@ def main() -> None:
         ctl.handle("start")
 
     cmds: queue.Queue[str] = queue.Queue()
+    dictation = None                         # set below; the lambdas only run once it exists
     speech = SpeechThread(model_path, args.device, args.min_conf, lambda: ctl.state, cmds,
                           args.open_vocab, args.word_conf, args.nbest, log_path, args.lenient, args.flat_grammar,
                           early_digits=not args.no_early_digits, media=not args.no_media)
+
+    # ---- dictation: "dictate" types what you say; it returns to listening when you go quiet
+    say = lambda text: speech._say(text)
+    if args.no_dictation:
+        dictation = DictationUnavailable(say, "dictation is turned off (--no-dictation)")
+    else:
+        d_opts = DictationOptions(
+            draft_model=args.draft_model, final_model=args.final_model, no_draft=args.no_draft,
+            device=args.dictate_device, model_dir=args.dictate_model_dir, prompt=args.dictate_prompt,
+            pause_ms=args.dictate_pause_ms, idle=args.dictate_idle)
+        ok, why = dictation_available(d_opts)
+        if not ok:
+            print(f"note: {why}")
+            dictation = DictationUnavailable(say, why)
+        else:
+            def dictation_idle():
+                if ctl.state == DICTATE:
+                    say(f"no speech for {args.dictate_idle:g}s - back to listening")
+                    ctl.handle("listen")
+            dictation = DictationSession(
+                d_opts, say, on_idle=dictation_idle, on_stop=lambda: ctl.handle("listen"),
+                on_ready=lambda: ctl.handle("dictate"))
+            speech.dictation_feed = dictation.feed
+            if args.preload_dictation:
+                dictation.request(want=False)
+    ctl.dictation = dictation
     speech.start()
+
+    def dictation_poll():
+        try:
+            dictation.poll()
+        except Exception as e:
+            print(f"dictation error: {e}")
+        root.after(15, dictation_poll)
+
+    root.after(15, dictation_poll)
 
     def meter_poll():
         pill.set_level(speech.level)
