@@ -1,7 +1,10 @@
-faster-whisper
+sherpa-onnx
 sounddevice
 webrtcvad-wheels
 numpy
+
+# Optional: only if you pick a Whisper model with --draft-model / --final-model (e.g. small.en)
+#   faster-whisper
 
 # Optional, only for --device cuda (NVIDIA GPU such as the GT 1030). faster-whisper's GPU build needs
 # the CUDA 12 runtime libraries on the PATH; the pip route is:

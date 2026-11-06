@@ -14,9 +14,16 @@ and capital letters, in the same way.
                       |-- every ~0.3 s ----> DRAFT  model (small, fast)  -> type / correct on screen
                       '-- at a pause -------> FINAL  model (bigger)      -> final correction, commit
 
-Both models are Whisper (faster-whisper, CTranslate2). They run on separate threads, each with its
-own share of the CPU cores, so a slow final never stalls the live draft of the next phrase. The RAM
-is what lets two models sit loaded at once.
+Default engines (both run offline through sherpa-onnx, no GPU needed):
+  draft  sherpa-onnx-streaming-zipformer-en-2023-06-26   a true streaming recogniser: fast enough to
+                                                          re-read the whole phrase every 0.3 s on a
+                                                          few CPU cores. Lower case, no punctuation.
+  final  sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8      NVIDIA Parakeet TDT 0.6B, English; accurate,
+                                                          adds punctuation and capital letters.
+Whisper (faster-whisper) is still available for either role by giving a Whisper name, e.g.
+--final-model small.en. The two models run on separate threads, each with its own share of the CPU
+cores, so a slow final never stalls the live draft of the next phrase. The RAM is what lets two
+models sit loaded at once. The first run downloads each model (about 300 MB and 460 MB) into ./models.
 
 Voice commands (say each one as its own phrase, i.e. pause before and after)
   "new line"            presses Enter
@@ -38,21 +45,24 @@ Things worth knowing
   * Typing uses SendInput with Unicode characters, so any character works and it is fast. Windows
     blocks a normal program from typing into windows that run as administrator; start with --admin
     to reach those.
-  * The first run downloads the models (a few hundred MB) into ./models; after that it is offline.
+  * The first run downloads the models into ./models; after that it is offline.
 
-Speed / accuracy knobs (the models are named like faster-whisper's)
-  --draft-model tiny.en     the live guesser: tiny.en (fastest), base.en (better, ~3x slower)
-  --final-model small.en    the settled text: small.en (default), distil-small.en (faster),
-                            medium.en / distil-medium.en (more accurate, slower), large-v3-turbo
+Speed / accuracy knobs. A model name picks the engine: names starting "sherpa-onnx-streaming" are
+streaming recognisers, "sherpa-onnx-nemo" are Parakeet-style offline ones (both downloaded from the
+sherpa-onnx "asr-models" release), anything else is a faster-whisper model name.
+  --draft-model             e.g. sherpa-onnx-streaming-zipformer-en-20M-2023-02-17 (smallest, fastest),
+                            sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06 (54 MB), or tiny.en
+  --final-model             e.g. sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8, or small.en / distil-small.en
+                            / medium.en / large-v3-turbo (Whisper)
   --no-draft                only type when you pause (least CPU)
   --pause-ms 600            how long a pause ends a phrase (lower = snappier, more splits)
   --device cuda             use the NVIDIA GPU instead of the CPU. A GT 1030 has 2 GB and no fast
-                            half-precision, so use --compute-type int8 and small models only; it
-                            also needs the CUDA 12 runtime libraries (see requirements.txt). Try
-                            --benchmark first: on some machines the CPU is just as quick.
+                            half-precision, so use small models only; it also needs the CUDA 12
+                            runtime libraries and a CUDA build of the engine (see requirements.txt).
+                            Try --benchmark first: on this class of machine the CPU is often as quick.
   --benchmark               records 6 seconds, times the chosen models, and exits
   --prompt "Kubernetes, Perth, Dr Nguyen"
-                            words / names to bias the final model towards
+                            words / names to bias a Whisper final model towards (ignored by the others)
 
 Run:  python voice_dictate.py --start-active
       python voice_dictate.py --list-devices
@@ -69,6 +79,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.request
 from dataclasses import dataclass
 
 # The status box, DPI handling, priority and admin helpers are shared with voice_mouse.py, so the
@@ -605,6 +616,140 @@ class WhisperTranscriber:
         return clean_transcript("".join(keep))
 
 
+# ---- sherpa-onnx engines ------------------------------------------------------------------------
+SHERPA_RELEASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{}.tar.bz2"
+DEFAULT_DRAFT = "sherpa-onnx-streaming-zipformer-en-2023-06-26"
+DEFAULT_FINAL = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
+
+
+def engine_kind(name: str) -> str:
+    """Which engine a model name belongs to: 'stream', 'nemo' or 'whisper'."""
+    if name.startswith("sherpa-onnx-streaming"):
+        return "stream"
+    if name.startswith("sherpa-onnx-nemo"):
+        return "nemo"
+    return "whisper"
+
+
+def find_model_files(d: str) -> dict:
+    """encoder / decoder / joiner / tokens inside an unpacked sherpa-onnx transducer model folder.
+    The int8 files are preferred (smaller and faster on a CPU) when both kinds are present."""
+    files = os.listdir(d)
+
+    def pick(prefix: str) -> str:
+        found = sorted((f for f in files if f.startswith(prefix) and f.endswith(".onnx")),
+                       key=lambda f: ("int8" not in f, len(f), f))
+        if not found:
+            raise FileNotFoundError(f"no {prefix}*.onnx in {d}")
+        return os.path.join(d, found[0])
+
+    tokens = os.path.join(d, "tokens.txt")
+    if not os.path.isfile(tokens):
+        raise FileNotFoundError(f"no tokens.txt in {d}")
+    return {"encoder": pick("encoder"), "decoder": pick("decoder"), "joiner": pick("joiner"),
+            "tokens": tokens}
+
+
+def ensure_sherpa_model(name: str, model_dir: str) -> str:
+    """Folder of the named sherpa-onnx model, downloading and unpacking it on first use."""
+    import tarfile
+    target = os.path.join(model_dir, name)
+    if os.path.isdir(target):
+        return target
+    os.makedirs(model_dir, exist_ok=True)
+    archive = target + ".tar.bz2"
+    url = SHERPA_RELEASE.format(name)
+    print(f"Downloading {name} from {url} ...")
+    urllib.request.urlretrieve(url, archive)
+    with tarfile.open(archive, "r:bz2") as tf:
+        root = os.path.realpath(model_dir)
+        for m in tf.getmembers():                           # refuse paths that escape the folder
+            if not os.path.realpath(os.path.join(model_dir, m.name)).startswith(root + os.sep):
+                raise RuntimeError(f"unsafe path in archive: {m.name}")
+        tf.extractall(model_dir)
+    os.remove(archive)
+    if not os.path.isdir(target):
+        raise RuntimeError(f"{archive} did not unpack to {target}")
+    return target
+
+
+def _pcm_to_float(pcm: bytes):
+    import numpy as np
+    return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def _result_text(result) -> str:
+    return result if isinstance(result, str) else getattr(result, "text", "")
+
+
+class SherpaStreaming:
+    """Streaming recogniser as the DRAFT stage. Each call re-reads the whole phrase so far from a
+    fresh stream: that is only affordable because the model is so much faster than real time, and it
+    keeps this a drop-in replacement for the Whisper draft. Output is lower-cased: the final pass
+    supplies the capitals and punctuation."""
+
+    def __init__(self, name: str, threads: int, device: str = "cpu", model_dir: str | None = None):
+        self.name, self.threads, self.device, self.model_dir = name, threads, device, model_dir
+        self.model = None
+
+    def load(self) -> "SherpaStreaming":
+        import sherpa_onnx
+        f = find_model_files(ensure_sherpa_model(self.name, self.model_dir or "models"))
+        self.model = sherpa_onnx.OnlineRecognizer.from_transducer(
+            tokens=f["tokens"], encoder=f["encoder"], decoder=f["decoder"], joiner=f["joiner"],
+            num_threads=self.threads, sample_rate=SAMPLE_RATE, feature_dim=80,
+            decoding_method="greedy_search", provider="cuda" if self.device == "cuda" else "cpu")
+        return self
+
+    def __call__(self, pcm: bytes) -> str:
+        import numpy as np
+        rec = self.model
+        stream = rec.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, _pcm_to_float(pcm))
+        stream.accept_waveform(SAMPLE_RATE, np.zeros(int(0.4 * SAMPLE_RATE), dtype=np.float32))  # flush the tail
+        stream.input_finished()
+        while rec.is_ready(stream):
+            rec.decode_stream(stream)
+        return clean_transcript(_result_text(rec.get_result(stream)).lower())
+
+
+class SherpaNemo:
+    """Offline NeMo transducer (Parakeet) as the FINAL stage: whole phrase in, punctuated text out."""
+
+    def __init__(self, name: str, threads: int, device: str = "cpu", model_dir: str | None = None):
+        self.name, self.threads, self.device, self.model_dir = name, threads, device, model_dir
+        self.model = None
+
+    def load(self) -> "SherpaNemo":
+        import sherpa_onnx
+        f = find_model_files(ensure_sherpa_model(self.name, self.model_dir or "models"))
+        kw = dict(tokens=f["tokens"], encoder=f["encoder"], decoder=f["decoder"], joiner=f["joiner"],
+                  num_threads=self.threads, sample_rate=SAMPLE_RATE, feature_dim=128,
+                  decoding_method="greedy_search", provider="cuda" if self.device == "cuda" else "cpu")
+        try:
+            self.model = sherpa_onnx.OfflineRecognizer.from_transducer(model_type="nemo_transducer", **kw)
+        except TypeError:                                  # an older build without the model_type argument
+            self.model = sherpa_onnx.OfflineRecognizer.from_transducer(**kw)
+        return self
+
+    def __call__(self, pcm: bytes) -> str:
+        stream = self.model.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, _pcm_to_float(pcm))
+        self.model.decode_stream(stream)
+        return clean_transcript(_result_text(stream.result))
+
+
+def make_transcriber(name: str, threads: int, beam: int, args, prompt=None):
+    """The right engine object for a model name (not loaded yet; call .load())."""
+    kind = engine_kind(name)
+    if kind == "stream":
+        return SherpaStreaming(name, threads, args.device, args.model_dir)
+    if kind == "nemo":
+        return SherpaNemo(name, threads, args.device, args.model_dir)
+    return WhisperTranscriber(name, threads, beam, args.device, args.compute_type or "int8",
+                              args.language, prompt, args.model_dir)
+
+
 class LatestWorker(threading.Thread):
     """Runs fn(job) on the newest submitted job only: if jobs arrive faster than fn finishes, the
     ones in between are dropped (a draft that is already out of date is not worth decoding)."""
@@ -754,8 +899,7 @@ def benchmark(args) -> None:
         threads = threads or max(1, cores // 2)
         beam = 1 if label == "draft" else args.beam
         t = time.time()
-        tr = WhisperTranscriber(name, threads, beam, args.device, args.compute_type or "int8",
-                                args.language, args.prompt, args.model_dir).load()
+        tr = make_transcriber(name, threads, beam, args, args.prompt if label == "final" else None).load()
         print(f"{label} model {name}: loaded in {time.time() - t:.1f}s ({threads} threads, {args.device})")
         for run in (1, 2):                              # the first run includes warm-up
             t = time.time()
@@ -766,16 +910,16 @@ def benchmark(args) -> None:
 # --------------------------------------------------------------------------
 def main() -> None:
     ap = argparse.ArgumentParser(description="Offline voice dictation for Windows")
-    ap.add_argument("--draft-model", default="tiny.en", help="fast live model (default tiny.en)")
-    ap.add_argument("--final-model", default="small.en", help="accurate model run at each pause (default small.en)")
+    ap.add_argument("--draft-model", default=DEFAULT_DRAFT, help=f"fast live model (default {DEFAULT_DRAFT})")
+    ap.add_argument("--final-model", default=DEFAULT_FINAL, help=f"accurate model run at each pause (default {DEFAULT_FINAL})")
     ap.add_argument("--no-draft", action="store_true", help="no live typing: only type each phrase when you pause")
     ap.add_argument("--device", choices=("cpu", "cuda", "auto"), default="cpu")
-    ap.add_argument("--compute-type", default=None, help="CTranslate2 compute type (default int8)")
+    ap.add_argument("--compute-type", default=None, help="Whisper only: CTranslate2 compute type (default int8)")
     ap.add_argument("--draft-threads", type=int, default=0, help="CPU threads for the draft model (default: half the cores)")
     ap.add_argument("--final-threads", type=int, default=0, help="CPU threads for the final model (default: the rest)")
-    ap.add_argument("--beam", type=int, default=3, help="beam size of the final model (default 3; 1 = fastest)")
-    ap.add_argument("--language", default="en", help="language code, or 'auto' (multilingual models only)")
-    ap.add_argument("--prompt", help="names / jargon to bias the final model towards")
+    ap.add_argument("--beam", type=int, default=3, help="Whisper only: beam size of the final model (default 3; 1 = fastest)")
+    ap.add_argument("--language", default="en", help="Whisper only: language code, or 'auto' (multilingual models only)")
+    ap.add_argument("--prompt", help="Whisper only: names / jargon to bias the final model towards")
     ap.add_argument("--model-dir", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
     ap.add_argument("--mic", type=int, help="input device index (see --list-devices)")
     ap.add_argument("--list-devices", action="store_true")
@@ -803,7 +947,12 @@ def main() -> None:
         print(sd.query_devices())
         return
     try:
-        import faster_whisper, numpy, sounddevice  # noqa: F401
+        import numpy, sounddevice  # noqa: F401
+        names = [args.final_model] + ([] if args.no_draft and not args.benchmark else [args.draft_model])
+        if any(engine_kind(n) == "whisper" for n in names):
+            import faster_whisper  # noqa: F401
+        if any(engine_kind(n) != "whisper" for n in names):
+            import sherpa_onnx  # noqa: F401
     except ImportError as e:
         sys.exit(f"Missing package ({e.name}). Install the requirements with:\n"
                  f"    {os.path.basename(sys.executable)} -m pip install -r requirements.txt")
@@ -844,11 +993,8 @@ def main() -> None:
     else:
         draft_threads = args.draft_threads or max(1, cores // 2)
         final_threads = args.final_threads or max(1, cores - draft_threads)
-    compute = args.compute_type or "int8"
-    final_tr = WhisperTranscriber(args.final_model, final_threads, args.beam, args.device, compute,
-                                  args.language, args.prompt, args.model_dir)
-    draft_tr = None if args.no_draft else WhisperTranscriber(
-        args.draft_model, draft_threads, 1, args.device, compute, args.language, None, args.model_dir)
+    final_tr = make_transcriber(args.final_model, final_threads, args.beam, args, args.prompt)
+    draft_tr = None if args.no_draft else make_transcriber(args.draft_model, draft_threads, 1, args)
     ready = threading.Event()
 
     def load_models():

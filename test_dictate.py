@@ -343,6 +343,82 @@ def test_dictator_focus_change_with_nothing_typed_keeps_the_phrase():
     assert t.text == "Still arrives."
 
 
+def test_engine_selection_and_defaults():
+    assert engine_kind(DEFAULT_DRAFT) == "stream" and engine_kind(DEFAULT_FINAL) == "nemo"
+    assert engine_kind("sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06") == "stream"
+    for whisper in ("tiny.en", "small.en", "large-v3-turbo", "distil-small.en"):
+        assert engine_kind(whisper) == "whisper", whisper
+    import types
+    args = types.SimpleNamespace(device="cpu", model_dir="m", compute_type=None, language="en")
+    assert isinstance(make_transcriber(DEFAULT_DRAFT, 2, 1, args), SherpaStreaming)
+    assert isinstance(make_transcriber(DEFAULT_FINAL, 2, 3, args), SherpaNemo)
+    w = make_transcriber("small.en", 2, 3, args, "Perth")
+    assert isinstance(w, WhisperTranscriber) and w.prompt == "Perth" and w.beam == 3
+
+
+def test_find_model_files_prefers_int8():
+    import os, tempfile
+    with tempfile.TemporaryDirectory() as d:
+        for f in ("encoder-epoch-99-avg-1-chunk-16-left-128.onnx", "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
+                  "decoder-epoch-99-avg-1-chunk-16-left-128.onnx", "joiner-epoch-99-avg-1-chunk-16-left-128.onnx",
+                  "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx", "tokens.txt", "README.md"):
+            open(os.path.join(d, f), "w").close()
+        got = find_model_files(d)
+        assert got["encoder"].endswith(".int8.onnx") and got["joiner"].endswith(".int8.onnx")
+        assert got["decoder"].endswith("left-128.onnx") and got["tokens"].endswith("tokens.txt")
+        os.remove(os.path.join(d, "tokens.txt"))
+        try:
+            find_model_files(d)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("missing tokens.txt not reported")
+
+
+def test_ensure_sherpa_model_uses_existing_folder():
+    import os, tempfile
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "some-model"))
+        assert ensure_sherpa_model("some-model", d) == os.path.join(d, "some-model")     # no download attempted
+
+
+def test_sherpa_wrappers_with_fake_recognisers():
+    import numpy as np
+    pcm = (np.ones(1600, dtype=np.int16) * 1000).tobytes()
+
+    class FakeStream:
+        def __init__(self): self.fed, self.done, self.result = [], False, types.SimpleNamespace(text="Hello, world.")
+        def accept_waveform(self, rate, samples): self.fed.append((rate, len(samples)))
+        def input_finished(self): self.done = True
+
+    import types
+
+    class FakeOnline:
+        def __init__(self, result): self.result, self.ready, self.decoded = result, 3, 0
+        def create_stream(self): self.s = FakeStream(); return self.s
+        def is_ready(self, s):
+            self.ready -= 1
+            return self.ready >= 0
+        def decode_stream(self, s): self.decoded += 1
+        def get_result(self, s): return self.result
+
+    st = SherpaStreaming("n", 2)
+    st.model = FakeOnline("HELLO WORLD")                                              # older builds return a str
+    assert st(pcm) == "hello world" and st.model.decoded == 3 and st.model.s.done
+    assert st.model.s.fed[0] == (SAMPLE_RATE, 1600) and st.model.s.fed[1][1] == int(0.4 * SAMPLE_RATE)
+    st.model = FakeOnline(types.SimpleNamespace(text="Hi There"))                      # newer builds return an object
+    assert st(pcm) == "hi there"
+    st.model = FakeOnline("[BLANK_AUDIO]")
+    assert st(pcm) == ""                                                               # noise tags still filtered
+
+    class FakeOffline:
+        def create_stream(self): return FakeStream()
+        def decode_stream(self, s): pass
+    nm = SherpaNemo("n", 2)
+    nm.model = FakeOffline()
+    assert nm(pcm) == "Hello, world."                                                  # case and punctuation kept
+
+
 def test_hotkey():
     assert parse_hotkey("ctrl+alt+d") == [0x11, 0x12, ord("D")]
     assert parse_hotkey("Ctrl + F9") == [0x11, 0x78] and parse_hotkey("win+space") == [0x5B, 0x20]
