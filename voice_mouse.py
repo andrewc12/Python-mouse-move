@@ -92,6 +92,11 @@ complete, well-ordered command for the current state ("page" only before up/down
 after a key, grid words only in the grid ...); (3) with --nbest the best-ranked alternative that
 passes the check wins. --lenient restores the old skip-stray-words behaviour.
 
+Always on top: the status box and the grid are raised to the top of the always-on-top order a few
+times a second, so they stay above the taskbar, the Start menu and other topmost windows (turn off
+with --no-keep-on-top). Windows' own highest layer (on-screen keyboard, Magnifier, the lock screen)
+cannot be covered by an ordinary program.
+
 Priority: the program runs at high process priority so recognition and clicks stay responsive while
 other things hog the CPU (--priority normal / above / high; real-time is deliberately not offered).
 
@@ -1332,6 +1337,20 @@ def make_click_through(widget, clickable: bool = False) -> None:
     u.SetWindowLongW(hwnd, GWL_EXSTYLE, style | extra)
 
 
+def raise_topmost(widget) -> None:
+    """Put the window at the very top of the always-on-top band, without taking focus or moving it.
+    Windows keeps topmost windows in the order they were last raised, so re-raising ours (it is
+    called a few times a second) puts it back above the taskbar, the Start menu and other
+    always-on-top windows that have since been raised. Windows in the system's higher UI-access band
+    (the on-screen keyboard, Magnifier, Task Manager when set to stay on top, the lock screen) cannot
+    be covered by a normal program."""
+    import ctypes
+    u = ctypes.windll.user32
+    hwnd = u.GetAncestor(widget.winfo_id(), 2)           # GA_ROOT
+    HWND_TOPMOST, FLAGS = -1, 0x0001 | 0x0002 | 0x0010   # NOSIZE | NOMOVE | NOACTIVATE
+    u.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, FLAGS)
+
+
 class Overlay:
     KEY = "#010203"      # colour treated as fully transparent
 
@@ -1348,8 +1367,15 @@ class Overlay:
         self.canvas.pack(fill="both", expand=True)
         make_click_through(self.win)
         self.win.withdraw()
+        self.shown = False
+
+    def raise_(self) -> None:
+        """Back to the top of the screen (only while the grid is showing)."""
+        if self.shown:
+            raise_topmost(self.win)
 
     def hide(self) -> None:
+        self.shown = False
         self.win.withdraw()
         self.win.update()        # process the unmap now; Tk would otherwise defer it until idle
 
@@ -1384,6 +1410,8 @@ class Overlay:
             c.create_line(mx, my - 16, mx, my + 16, fill="#00e5ff", width=2)
         self.win.deiconify()
         self.win.attributes("-topmost", True)
+        self.shown = True
+        raise_topmost(self.win)
 
 
 class StatusPill:
@@ -1496,6 +1524,9 @@ class StatusPill:
         self.canvas.itemconfig(self.bar, fill=colour)
 
     # ---- interaction ---------------------------------------------------------
+    def raise_(self) -> None:
+        raise_topmost(self.win)
+
     def _clicked(self, event=None) -> None:
         now = time.monotonic()
         if now - self._last_click < 0.35:       # ignore bounce / duplicate events
@@ -1963,6 +1994,9 @@ def main() -> None:
                          "(default: zoom on each number as soon as it is recognised)")
     ap.add_argument("--no-minor-grid", action="store_true",
                     help="don't draw the thin dashed 9x9 lines that preview the next zoom level")
+    ap.add_argument("--no-keep-on-top", action="store_true",
+                    help="don't keep re-raising the status box and grid above everything else "
+                         "(they are still always-on-top windows)")
     ap.add_argument("--priority", choices=sorted(PRIORITY_CLASSES), default="high",
                     help="Windows process priority (default high). Keeps clicks and speech responsive "
                          "when the PC is busy; 'normal' turns it off")
@@ -2036,6 +2070,14 @@ def main() -> None:
         root.after(40, meter_poll)
 
     root.after(40, meter_poll)
+
+    def keep_on_top():
+        overlay.raise_()                    # the grid first ...
+        pill.raise_()                       # ... then the status box above it, so it is never hidden
+        root.after(250, keep_on_top)
+
+    if not args.no_keep_on_top:
+        root.after(250, keep_on_top)
 
     def poll():
         try:
