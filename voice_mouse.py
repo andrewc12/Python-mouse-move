@@ -1032,14 +1032,19 @@ class Overlay:
         c, s = self.canvas, self.screen
         c.delete("all")
         # minor grid: each of the nine cells split 3x3 again (a preview of the next zoom level),
-        # thin and dashed so it reads as secondary. Skipped when the minor cells would be tiny.
+        # dashed, with a dark shadow underneath, so it stands out on any background but still
+        # reads as secondary. Skipped when the minor cells would be tiny.
         if self.minor_grid and min(r.w, r.h) / 9 >= 4:
-            minor = dict(fill="#ff9a9a", width=1, dash=(3, 4))
+            # Two strokes per line - a dark one under a bright one - so it shows on any background.
+            shadow = dict(fill="black", width=4)
+            minor = dict(fill="#ff7a7a", width=2, dash=(8, 5))
             for k in range(1, 9):
                 if k % 3 == 0:
                     continue                      # those are the major lines, drawn below
-                c.create_line(r.x + r.w * k / 9, r.y, r.x + r.w * k / 9, r.y + r.h, **minor)
-                c.create_line(r.x, r.y + r.h * k / 9, r.x + r.w, r.y + r.h * k / 9, **minor)
+                x, y = r.x + r.w * k / 9, r.y + r.h * k / 9
+                for style in (shadow, minor):
+                    c.create_line(x, r.y, x, r.y + r.h, **style)
+                    c.create_line(r.x, y, r.x + r.w, y, **style)
         # major grid (the rest of the screen is left undimmed)
         c.create_rectangle(r.x, r.y, r.x + r.w, r.y + r.h, outline="#ff2d2d", width=3)
         for i in (1, 2):
