@@ -189,6 +189,54 @@ def test_pipeline_without_drafts():
     assert len(finals) == 1
 
 
+def test_pipeline_idle_timeout():
+    now = [0.0]
+    p, drafts, finals, discards, out = _pipe(lambda: now[0], idle_s=10.0)
+    p.set_active(True)
+
+    def run(frames, step=0.03):
+        for f in frames:
+            now[0] += step
+            p.feed(f)
+
+    def idles():
+        n = 0
+        while not out.empty():
+            n += out.get_nowait() == ("idle",)
+        return n
+    run([b"q"] * 300)                                                              # 9 s of silence
+    assert idles() == 0
+    run([b"q"] * 100)                                                              # past 10 s
+    assert idles() == 1
+    run([b"q"] * 100)                                                              # one per quiet spell
+    assert idles() == 0
+    run([b"q"] * 250)
+    assert idles() == 1                                                            # ... then again after 10 s more
+    p.set_active(False)
+    now[0] += 100
+    p.set_active(True)
+    run([b"q"] * 100)
+    assert idles() == 0                                                            # resuming restarts the clock
+
+
+def test_pipeline_idle_timeout_speech_resets_and_off_by_default():
+    now = [0.0]
+    p, *_rest, out = _pipe(lambda: now[0], idle_s=5.0)
+    p.set_active(True)
+    for _ in range(20):                                                            # a phrase every ~4 s
+        for f in [b"S"] * 20 + [b"q"] * 100:
+            now[0] += 0.03
+            p.feed(f)
+    assert not any(e == ("idle",) for e in list(out.queue))
+    now2 = [0.0]
+    p2, *_r, out2 = _pipe(lambda: now2[0])                                         # idle_s default 0 = never
+    p2.set_active(True)
+    for _ in range(5000):
+        now2[0] += 0.03
+        p2.feed(b"q")
+    assert not any(e == ("idle",) for e in list(out2.queue))
+
+
 def test_dictator_types_and_corrects_in_place():
     d, t, *_ = mk()
     d.begin(1)

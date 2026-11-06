@@ -567,24 +567,30 @@ class Segmenter:
 class Pipeline:
     """VAD thread's brain: frames in; utterance events and decode jobs out.
 
-    out receives ("start", uid) / ("cancel", uid). Decode jobs go through submit_draft(uid, pcm)
+    out receives ("start", uid) / ("cancel", uid), and ("idle",) once when `idle_s` seconds pass with no
+    speech (the owner then pauses dictation). Decode jobs go through submit_draft(uid, pcm)
     (called every `draft_every_s` while someone is speaking, once `draft_after_s` of audio exists;
     pass None to disable drafts) and submit_final(uid, pcm). discard_draft(uid) is called when an
     utterance ends so a stale draft is not decoded after its final.
     """
 
     def __init__(self, vad, submit_draft, submit_final, out, segmenter=None, draft_after_s: float = 0.45,
-                 draft_every_s: float = 0.3, discard_draft=lambda uid: None, clock=time.monotonic):
+                 draft_every_s: float = 0.3, discard_draft=lambda uid: None, clock=time.monotonic,
+                 idle_s: float = 0.0):
         self.vad, self.submit_draft, self.submit_final, self.out = vad, submit_draft, submit_final, out
         self.seg = segmenter or Segmenter()
         self.draft_after_s, self.draft_every_s, self.clock = draft_after_s, draft_every_s, clock
         self.discard_draft = discard_draft
+        self.idle_s = idle_s                            # 0 = never stop by itself
         self.active = False
         self._last_draft = 0.0
+        self._last_speech = clock()
 
     def set_active(self, on: bool) -> None:
         if self.active and not on:
             self._handle(self.seg.force_end())          # pausing mid-sentence still delivers it
+        if on and not self.active:
+            self._last_speech = self.clock()            # the silence clock starts now
         self.active = on
         if not on:
             self.seg.reset()
@@ -605,7 +611,14 @@ class Pipeline:
     def feed(self, frame: bytes) -> None:
         if not self.active:
             return
-        self._handle(self.seg.feed(frame, bool(self.vad(frame))))
+        now = self.clock()
+        speech = bool(self.vad(frame))
+        if speech or self.seg.active:                   # talking (or mid-phrase): not idle
+            self._last_speech = now
+        self._handle(self.seg.feed(frame, speech))
+        if self.idle_s and now - self._last_speech >= self.idle_s:
+            self._last_speech = now                     # one "idle" per quiet spell
+            self.out.put(("idle",))
         if self.submit_draft and self.seg.active and self.seg.seconds >= self.draft_after_s:
             now = self.clock()
             if now - self._last_draft >= self.draft_every_s:
@@ -1221,6 +1234,8 @@ def main() -> None:
                     help="voice-activity strictness: 3 ignores more noise, 0 hears more (default 2)")
     ap.add_argument("--pause-ms", type=int, default=600, help="silence that ends a phrase (default 600)")
     ap.add_argument("--draft-interval", type=float, default=0.3, help="seconds between draft updates (default 0.3)")
+    ap.add_argument("--idle-timeout", type=float, default=60.0,
+                    help="seconds of silence after which dictation pauses by itself (default 60; 0 = never)")
     ap.add_argument("--hotkey", default="ctrl+alt+d", help="toggle chord (default ctrl+alt+d)")
     ap.add_argument("--no-hotkey", action="store_true")
     ap.add_argument("--start-active", action="store_true", help="start dictating as soon as the models are loaded")
@@ -1239,6 +1254,7 @@ def main() -> None:
         args.language = None
     if args.always_on:
         args.start_active = args.no_hotkey = True
+        args.idle_timeout = 0
 
     if args.list_devices:
         import sounddevice as sd
@@ -1348,7 +1364,8 @@ def main() -> None:
         (lambda uid, pcm: draft_worker.submit((uid, pcm))) if draft_worker else None,
         lambda uid, pcm: final_worker.submit((uid, pcm)), out,
         Segmenter(end_silence_ms=args.pause_ms), draft_every_s=args.draft_interval,
-        discard_draft=(draft_worker.discard if draft_worker else (lambda uid: None)))
+        discard_draft=(draft_worker.discard if draft_worker else (lambda uid: None)),
+        idle_s=args.idle_timeout)
     listener = Listener(args.mic, pipeline, notice)
     listener.start()
 
@@ -1374,6 +1391,11 @@ def main() -> None:
         try:
             while True:
                 ev = out.get_nowait()
+                if ev[0] == "idle":
+                    if pipeline.active:
+                        notice.say(f"no speech for {args.idle_timeout:g}s - paused")
+                        set_listening(False, "idle")
+                    continue
                 try:
                     {"start": dictator.begin, "cancel": dictator.cancel,
                      "draft": dictator.draft, "final": dictator.final}[ev[0]](*ev[1:])
