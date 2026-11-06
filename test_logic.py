@@ -428,7 +428,7 @@ print("next_state matches controller ok")
 
 # ---- per-state grammars: what an utterance may START with, and which pairs are taught ----
 assert AWAKE_GRAMMAR_G.first == {"click", "left", "right", "double", "mouse", "page", "press",
-                                 "scroll", "stop", "media"}, AWAKE_GRAMMAR_G.first
+                                 "scroll", "stop", "media", "super"}, AWAKE_GRAMMAR_G.first
 assert {"five", "mark", "cancel", "back", "move"} <= GRID_GRAMMAR_G.first
 assert not ({"five", "mark", "cancel", "back", "move"} & AWAKE_GRAMMAR_G.first)
 assert "start" not in GRID_GRAMMAR_G.first | AWAKE_GRAMMAR_G.first
@@ -606,3 +606,24 @@ assert st2._commands("media play", [], AWAKE) is None and st2._commands("press t
 st3 = SpeechThread("m", None, 0.6, lambda: AWAKE, None)
 assert st3._commands("media play", [], AWAKE) == [Media("play_pause")]
 print("media buttons ok")
+
+
+# ================= dev reload phrase =================
+PH = "super secret dev menu reload"
+assert V(PH, AWAKE) == ["reload"] and V(PH, SLEEPING) is None and V(PH, GRID) is None
+assert V(PH, AWAKE, media=False) == ["reload"]                    # independent of --no-media
+assert V(PH + " left click", AWAKE) == ["reload", "left"]
+assert V(PH + " reload", AWAKE) is None and V(PH + " delta", AWAKE) is None   # stray words reject it
+assert V("super secret dev menu", AWAKE) is None and V("reload", AWAKE) is None
+assert V("secret dev menu reload", AWAKE) is None
+assert "super" in AWAKE_GRAMMAR_G.first and "super" not in GRID_GRAMMAR_G.first
+assert ("menu", "reload") in AWAKE_GRAMMAR_G.pairs
+assert any(PH in s for s in AWAKE_SENTENCES) and not any("super" in s for s in GRID_SENTENCES)
+reloads = []
+c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), on_reload=lambda: reloads.append(1))
+say(c, PH); assert reloads == []                                    # asleep: ignored
+say(c, "start listening " + PH); assert reloads == [1]
+say(c, "mouse grid"); say(c, PH); assert reloads == [1]               # grid: ignored
+cmd = relaunch_command()
+assert "--start-awake" in cmd and cmd[0] == sys.executable
+print("dev reload ok")

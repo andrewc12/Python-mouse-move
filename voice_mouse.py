@@ -54,6 +54,10 @@ Media buttons (awake only; say "media" first so "stop", "next", "back" etc. keep
                                          players act on it
   Turn all of this off with --no-media.
 
+Developer
+  "super secret dev menu reload"       restart the program (same options, comes back listening);
+                                       awake only, and the whole phrase has to be heard
+
 Hotkey (no voice needed): tap Ctrl + Left-Windows together, then let go. It toggles between
 sleeping and listening (and leaves the grid). A high beep = now listening, low beep = sleeping.
 Ctrl+Win combined with any other key (e.g. virtual-desktop switching) is left alone.
@@ -127,6 +131,8 @@ MEDIA_VK = {"play_pause": 0xB3, "stop": 0xB2, "next": 0xB0, "previous": 0xB1}   
 MEDIA_APPCOMMAND = {"fast_forward": 49, "rewind": 50}                            # APPCOMMAND_MEDIA_*
 MEDIA_EXAMPLES = ["media play", "media pause", "media stop", "media next", "media previous",
                   "media fast forward", "media rewind", "media skip back", "media skip forward"]
+
+RELOAD_PHRASE = ("super", "secret", "dev", "menu", "reload")      # -> the "reload" command
 
 MAX_REPEAT = 500          # safety cap for "press down <N>" / "scroll down <N>"
 SCROLL_DEFAULT = 5        # notches for a bare "scroll down"
@@ -207,6 +213,7 @@ SYMBOL_KEYS: dict[tuple[str, ...], tuple[tuple[str, ...], str]] = {
 
 _KEY_WORDS = (set(SPOKEN_KEYS) | set(LETTER_WORDS) | set(MODIFIERS) | set(UNITS) | set(TENS)
               | {"press", "times", "function", "page", "hundred", "click", "scroll", "media"}
+              | set(RELOAD_PHRASE)
               | {w for phrase in MEDIA_ACTIONS for w in phrase}
               | {w for phrase in SYMBOL_KEYS for w in phrase})
 
@@ -319,6 +326,7 @@ def build_command_grammar(mode: str = "any", media: bool = True) -> _G:
     stop, mouse_grid = _phrase("stop listening"), _phrase("mouse grid")
     common = [page, scroll, press, clicks, mouse_grid, stop]
     media_cmd = [_seq(_W("media"), _alt(*[_phrase(" ".join(k)) for k in MEDIA_ACTIONS]))] if media else []
+    media_cmd.append(_phrase(" ".join(RELOAD_PHRASE)))         # the dev "reload" phrase: awake only
     if mode == "any":
         return _plus(_alt(_phrase("start listening"), *common, *media_cmd, grid_only))
     if mode == "grid":
@@ -337,7 +345,7 @@ _COMMON_EXAMPLES = ["mouse grid", "page down", "page up", "scroll down", "scroll
                     "press left arrow", "stop listening"] + _CLICKS
 BASE_EXAMPLES = _COMMON_EXAMPLES + ["move mouse", "mark", "back", "cancel", "start listening"] + list(NUMBER_WORDS)
 GRID_BASE_EXAMPLES = [e for e in BASE_EXAMPLES if e != "start listening"]
-AWAKE_BASE_EXAMPLES = list(_COMMON_EXAMPLES) + MEDIA_EXAMPLES
+AWAKE_BASE_EXAMPLES = list(_COMMON_EXAMPLES) + MEDIA_EXAMPLES + [" ".join(RELOAD_PHRASE)]
 
 
 def grammar_sentences(g: _G, repeat: int = GRAMMAR_REPEAT, max_len: int = GRAMMAR_MAX_LEN,
@@ -612,6 +620,10 @@ def parse_commands(text, min_word_conf: float = 0.0, strict: bool = False, media
                     i += 1
             out.append(KeyPress((Chord((), key, count),)))
             continue
+        if tuple(words[i:i + len(RELOAD_PHRASE)]) == RELOAD_PHRASE:      # whole phrase or nothing
+            out.append("reload")
+            i += len(RELOAD_PHRASE)
+            continue
         if words[i] == "media" and media:
             for n in (2, 1):                                # "fast forward" before a one-word name
                 action = MEDIA_ACTIONS.get(tuple(words[i + 1:i + 1 + n]))
@@ -736,7 +748,7 @@ SLEEPING, AWAKE, GRID = "sleeping", "awake", "grid"
 # read in execution order, after the state has actually advanced.
 ALLOWED: dict[str, set] = {
     SLEEPING: {"start"},
-    AWAKE: {"stop", "grid", "left", "right", "double", "press", "scroll", "media"},
+    AWAKE: {"stop", "grid", "left", "right", "double", "press", "scroll", "media", "reload"},
     GRID: {"stop", "grid", "back", "mark", "cancel", "move", "left", "right", "double",
            "scroll", *[str(n) for n in range(1, 10)]},      # no "press": no key presses in the grid
 }
@@ -787,8 +799,9 @@ class Controller:
     """State machine: SLEEPING <-> AWAKE <-> GRID. Talks to `mouse` and `overlay`."""
 
     def __init__(self, bounds: Region, mouse, overlay, on_state=lambda s: None, keyboard=None,
-                 media=None):
+                 media=None, on_reload=None):
         self.nav = GridNavigator(bounds)
+        self.on_reload = on_reload or (lambda: print("reload requested (nothing wired up)"))
         self.mouse, self.overlay, self.on_state = mouse, overlay, on_state
         self.keyboard = keyboard
         self.media = media                    # object with .send(action), or None (--no-media)
@@ -827,7 +840,7 @@ class Controller:
         # five" opens the grid (allowed while AWAKE) and only then uses the digit (allowed in GRID).
         token = command_token(cmd)
         if token not in ALLOWED[self.state]:
-            if token in ("press", "media") and self.state == GRID:
+            if token in ("press", "media", "reload") and self.state == GRID:
                 print("ignored: key presses and media buttons are off while the mouse grid is open "
                       "(click, move mouse or cancel first)")
             return
@@ -855,6 +868,8 @@ class Controller:
         if self.state == AWAKE:
             if cmd == "stop":
                 self._set(SLEEPING)
+            elif cmd == "reload":
+                self.on_reload()
             elif cmd == "grid":
                 self.nav.reset()
                 self.mark = None
@@ -915,6 +930,26 @@ def make_dpi_aware() -> None:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+
+
+def relaunch_command() -> list[str]:
+    """Command line that starts this program again with the same options, listening from the start."""
+    frozen = "__compiled__" in globals() or getattr(sys, "frozen", False)
+    args = [a for a in sys.argv[1:]]
+    if "--start-awake" not in args:
+        args.append("--start-awake")
+    if frozen:
+        return [os.path.abspath(sys.argv[0]), *args]
+    return [sys.executable, os.path.abspath(sys.argv[0]), *args]
+
+
+def reload_program() -> None:
+    """Start a fresh copy, then exit this one (which frees the microphone and the hooks)."""
+    import subprocess
+    print("reloading ...")
+    subprocess.Popen(relaunch_command())
+    sys.stdout.flush()
+    os._exit(0)
 
 
 def primary_screen() -> Region:
@@ -1626,7 +1661,7 @@ def main() -> None:
     pill = StatusPill(root, screen, corner=args.corner)
     overlay = Overlay(root, screen, minor_grid=not args.no_minor_grid)
     ctl = Controller(screen, WinMouse(), overlay, on_state=pill.set, keyboard=WinKeyboard(),
-                     media=None if args.no_media else WinMedia())
+                     media=None if args.no_media else WinMedia(), on_reload=reload_program)
     if args.start_awake:
         ctl.handle("start")
 
