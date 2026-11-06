@@ -429,10 +429,11 @@ print("next_state matches controller ok")
 # ---- per-state grammars: what an utterance may START with, and which pairs are taught ----
 assert AWAKE_GRAMMAR_G.first == {"click", "left", "right", "double", "mouse", "page", "press",
                                  "scroll", "stop", "media", "super", "minimize", "maximize", "restore",
-                                 "control", "alt", "shift"}, AWAKE_GRAMMAR_G.first
+                                 "control", "alt", "shift", "start"}, AWAKE_GRAMMAR_G.first
 assert {"five", "mark", "cancel", "back", "move"} <= GRID_GRAMMAR_G.first
 assert not ({"five", "mark", "cancel", "back", "move"} & AWAKE_GRAMMAR_G.first)
-assert "start" not in GRID_GRAMMAR_G.first | AWAKE_GRAMMAR_G.first
+assert "start" not in GRID_GRAMMAR_G.first          # awake may start "start menu", but never "start listening"
+assert ("start", "listening") not in AWAKE_GRAMMAR_G.pairs | GRID_GRAMMAR_G.pairs
 assert ("mouse", "grid") in AWAKE_GRAMMAR_G.pairs and ("grid", "five") in AWAKE_GRAMMAR_G.pairs
 def _after_in(sents, a):
     return {y for s in sents for x, y in zip(s.split(), s.split()[1:]) if x == a}
@@ -441,7 +442,8 @@ for sents in (AWAKE_SENTENCES, GRID_SENTENCES):
     assert "delta" not in _after_in(sents, "scroll") | _after_in(sents, "function")
 firsts = lambda sents: {s.split()[0] for s in sents if s != "[unk]"}
 assert firsts(AWAKE_SENTENCES) <= AWAKE_GRAMMAR_G.first and firsts(GRID_SENTENCES) <= GRID_GRAMMAR_G.first
-assert "start" not in firsts(AWAKE_SENTENCES) | firsts(GRID_SENTENCES)
+assert "start" not in firsts(GRID_SENTENCES)
+assert not any("start listening" in s for s in AWAKE_SENTENCES + GRID_SENTENCES)   # only "start menu" awake
 
 # ---- SpeechThread decision logic (no audio / vosk needed) ----
 def mk(**kw):
@@ -732,3 +734,15 @@ assert hk.log[-1] == ("release", ("ctrl",))                                     
 c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay()); c.state = AWAKE
 c.handle(ModClick("left", ("ctrl",)))                                                       # no keyboard: still clicks
 print("modifier clicks ok")
+
+
+# ================= several modifiers on a click; Start menu =================
+assert V("control shift click", AWAKE) == [ModClick("left", ("ctrl", "shift"))]
+assert V("control alt shift double click", AWAKE) == [ModClick("double", ("ctrl", "alt", "shift"))]
+assert V("start menu", AWAKE) == [KeyPress((Chord((), "win", 1),))] == V("press windows", AWAKE)
+assert V("start menu", GRID) is None and V("start menu", SLEEPING) is None      # a key press: awake only
+assert V("start listening", SLEEPING) == ["start"] and V("start", AWAKE) is None and V("start menu left click", AWAKE) is not None
+assert V("stop listening", AWAKE) == ["stop"]
+kb = FakeKb(); c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=kb)
+say(c, "start listening start menu"); assert kb.log == [((), "win", 1)], kb.log
+print("start menu ok")

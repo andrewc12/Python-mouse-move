@@ -62,6 +62,7 @@ Windows (awake only; acts on the window you are using, never the desktop or task
   "maximize window"                    maximise it
   "restore window"                     bring a maximised window back to its normal size
   (US spellings: that is what the speech model knows.)
+  "start menu"                         taps the Windows key (opens the Start menu); same as "press windows"
   "press context menu"                 the keyboard's menu key: opens the right-click menu for whatever
                                        has keyboard focus (use "right click" to open it at the pointer)
 
@@ -251,7 +252,7 @@ SYMBOL_KEYS: dict[tuple[str, ...], tuple[tuple[str, ...], str]] = {
 
 _KEY_WORDS = (set(SPOKEN_KEYS) | set(LETTER_WORDS) | set(MODIFIERS) | set(UNITS) | set(TENS)
               | {"press", "times", "function", "page", "hundred", "click", "scroll", "media"}
-              | set(RELOAD_PHRASE) | {w for phrase in WINDOW_COMMANDS for w in phrase}
+              | set(RELOAD_PHRASE) | {"menu"} | {w for phrase in WINDOW_COMMANDS for w in phrase}
               | {w for phrase in MEDIA_ACTIONS for w in phrase}
               | {w for phrase in SYMBOL_KEYS for w in phrase})
 
@@ -366,6 +367,7 @@ def build_command_grammar(mode: str = "any", media: bool = True) -> _G:
     common = [page, scroll, press, clicks, mouse_grid, stop]
     media_cmd = [_seq(_W("media"), _alt(*[_phrase(" ".join(k)) for k in MEDIA_ACTIONS]))] if media else []
     media_cmd.append(_phrase(" ".join(RELOAD_PHRASE)))         # the dev "reload" phrase: awake only
+    media_cmd.append(_phrase("start menu"))                          # = press windows
     media_cmd += [_phrase(" ".join(k)) for k in WINDOW_COMMANDS]   # "minimize window" ...: awake only
     if mode == "any":
         return _plus(_alt(_phrase("start listening"), *common, *media_cmd, grid_only))
@@ -387,7 +389,7 @@ _COMMON_EXAMPLES = ["mouse grid", "page down", "page up", "scroll down", "scroll
 BASE_EXAMPLES = _COMMON_EXAMPLES + ["move mouse", "mark", "back", "cancel", "start listening"] + list(NUMBER_WORDS)
 GRID_BASE_EXAMPLES = [e for e in BASE_EXAMPLES if e != "start listening"]
 AWAKE_BASE_EXAMPLES = (list(_COMMON_EXAMPLES) + MEDIA_EXAMPLES + [" ".join(RELOAD_PHRASE)]
-                       + [" ".join(k) for k in WINDOW_COMMANDS] + ["press context menu"])
+                       + [" ".join(k) for k in WINDOW_COMMANDS] + ["press context menu", "start menu"])
 
 
 def grammar_sentences(g: _G, repeat: int = GRAMMAR_REPEAT, max_len: int = GRAMMAR_MAX_LEN,
@@ -699,6 +701,10 @@ def parse_commands(text, min_word_conf: float = 0.0, strict: bool = False, media
             else:
                 bad = True                                  # modifier(s) with nothing to click
             i = j + used
+            continue
+        if words[i:i + 2] == ["start", "menu"]:             # same as "press windows": taps the Windows key
+            out.append(KeyPress((Chord((), "win", 1),)))
+            i += 2
             continue
         if tuple(words[i:i + len(RELOAD_PHRASE)]) == RELOAD_PHRASE:      # whole phrase or nothing
             out.append("reload")
