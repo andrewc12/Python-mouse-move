@@ -531,6 +531,41 @@ def hands_self_command() -> list[str]:
     return [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]
 
 
+def open_log(path: str, max_bytes: int = 2_000_000) -> None:
+    """Send print() output (and tracebacks) to a time-stamped log file as well as the console, if any.
+    A log over `max_bytes` is moved aside to <path>.old first, so it cannot grow without limit."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    try:
+        if os.path.getsize(path) > max_bytes:
+            os.replace(path, path + ".old")
+    except OSError:
+        pass
+    fh = open(path, "a", encoding="utf-8", buffering=1)
+
+    class Tee:
+        def __init__(self, stream):
+            self.stream, self.at_line_start = stream, True
+
+        def write(self, text):
+            text = str(text)
+            for part in text.splitlines(True):
+                fh.write((time.strftime("%Y-%m-%d %H:%M:%S ") if self.at_line_start else "") + part)
+                self.at_line_start = part.endswith("\n")
+            if self.stream:
+                self.stream.write(text)
+            return len(text)
+
+        def flush(self):
+            fh.flush()
+            if self.stream:
+                self.stream.flush()
+
+        def isatty(self):
+            return False
+    sys.stdout, sys.stderr = Tee(sys.__stdout__), Tee(sys.__stderr__)
+    print(f"hands: log {path}")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Voice Mouse hands: the small, elevated-capable input helper")
     ap.add_argument("--token-file", default=default_token_file(),
@@ -538,7 +573,11 @@ def main(argv=None) -> int:
     ap.add_argument("--port", type=int, default=0, help="loopback port (default 0 = pick a free one)")
     ap.add_argument("--admin", action="store_true", help="restart elevated (shows the UAC prompt)")
     ap.add_argument("--idle-exit", type=float, default=0, metavar="SECONDS",
-                    help="exit when no main program has been connected for this long (default 0 = never)")
+                    help="exit when no main program has been connected for this long (default 0 = never: "
+                         "it runs like a server until closed)")
+    ap.add_argument("--log", metavar="FILE", help="write everything printed here to FILE (default: hands.log "
+                    "next to the token file), so a hidden or scheduled run can still be diagnosed")
+    ap.add_argument("--no-log", action="store_true", help="do not write a log file")
     args = ap.parse_args(argv)
 
     if args.admin and not is_admin():
@@ -546,6 +585,8 @@ def main(argv=None) -> int:
         if relaunch_elevated():
             return 0
         print("Could not get administrator rights (prompt declined?); carrying on without them.")
+    if not args.no_log:
+        open_log(args.log or os.path.join(os.path.dirname(os.path.abspath(args.token_file)), "hands.log"))
     make_dpi_aware()
     hands = Hands(WinMouse(), WinKeyboard(), WinWindow(), WinMedia(), WinTyper())
     token = secrets.token_hex(32)

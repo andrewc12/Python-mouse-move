@@ -30,7 +30,7 @@ Dictation (awake only)
   go back to listening; the hotkey / box click goes to sleep instead.
   Inside dictation, as whole phrases: "new line", "new paragraph", "scratch that" (deletes the last
   phrase; also "delete that").
-  The models load (the first run downloads about 750 MB into ./models, --dictate-model-dir) in a
+  The models load (the first run downloads about 750 MB into the shared models folder, --models-dir) in a
   background thread at start-up, while the mouse and keyboard commands are already usable; the status
   box says when dictation is ready. If you say "dictate" before then, it starts by itself once loaded.
   --lazy-dictation waits until the first "dictate" instead; --no-dictation turns the command off. Needs: pip install sherpa-onnx webrtcvad-wheels numpy
@@ -137,7 +137,9 @@ Run as administrator) to reach them. It has no effect on windows that were not e
 That elevates the whole program, models included. The safer way is to elevate only the small
 voice_mouse_hands.py, which does all the clicking, keys and typing and imports nothing but the
 standard library: start with --admin-hands (the program starts it elevated if it is not running),
-or run voice_mouse_hands.py --admin yourself and start this with --use-hands. Speech recognition,
+or run voice_mouse_hands.py --admin yourself and start this with --use-hands. The hands keep
+running like a server until closed (install_hands_task.bat starts them elevated at every logon, with
+no prompt). Speech recognition,
 the models and the screen overlay then run as your normal user. Anything running as you can still
 read the hands' token file and ask them to press keys, so this limits the elevated code; it does
 not make an untrusted program on your account harmless.
@@ -145,7 +147,7 @@ not make an untrusted program on your account harmless.
 No console window: run it with  pythonw voice_mouse.py  (or double-click a .pyw copy) and there is
 never a console. --hide-console hides the console after start-up instead; it does not work inside
 Windows Terminal (the Windows 11 default), where only the tab can be closed. A compiled build can use
---windows-console-mode=disable in build_exe.bat / build_onefile.bat. With no console, messages go
+--windows-console-mode=disable (MAIN_CONSOLE in build.bat). With no console, messages go
 nowhere; heard.jsonl (--log) still records what was recognised.
 
 Log and crashes: everything the console shows (with time stamps, and any traceback or native crash)
@@ -154,6 +156,12 @@ is still there with no console or after a crash. The program runs as a small sup
 real program: if the real one crashes (or its speech thread dies) it is started again after 2 s,
 already listening, up to 5 times a minute; Ctrl+C, closing the window and the reload phrase end it for good.
 --no-restart runs it as a single process.
+
+Models: never packed into an exe. All of them live in one shared folder (--models-dir, default
+%LOCALAPPDATA%\\voice_mouse\\models, or the VOICE_MOUSE_MODELS variable), so every build and copy
+reuses the same download. voice_mouse.py --download-models fetches them all and exits.
+
+Build: build.bat makes dist\\voice_mouse_hands.exe and dist\\voice_mouse.exe (two single-file builds).
 
 Run:  python voice_mouse.py            (downloads the ~40 MB model on first run)
       python voice_mouse.py --list-devices
@@ -1572,28 +1580,52 @@ class StatusPill:
 # --------------------------------------------------------------------------
 # Speech
 # --------------------------------------------------------------------------
-def ensure_model(path: str | None) -> str:
+def default_models_dir() -> str:
+    """One folder for every model, shared by all builds and copies of the program: the environment
+    variable VOICE_MOUSE_MODELS, else %LOCALAPPDATA%\\voice_mouse\\models. Nothing is packed into the exe."""
+    env = os.environ.get("VOICE_MOUSE_MODELS")
+    if env:
+        return os.path.abspath(env)
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "voice_mouse", "models")
+
+
+def ensure_model(path: str | None, models_dir: str | None = None) -> str:
+    """The Vosk model folder: --model if given, else <models dir>/<name>, downloading it on first use.
+    A copy in ./models beside the program (where older versions kept it) is used rather than downloaded again."""
     if path:
         return path
-    # Look in order: bundled inside the program (onefile builds unpack beside __file__), next to
-    # the executable (compiled __file__ may be a temp folder, so use argv[0] there), else download.
-    frozen = "__compiled__" in globals() or getattr(sys, "frozen", False)
-    exe_dir = os.path.dirname(os.path.abspath(sys.argv[0] if frozen else __file__))
-    bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", MODEL_NAME)
-    beside = os.path.join(exe_dir, "models", MODEL_NAME)
-    for candidate in (bundled, beside):
-        if os.path.isdir(candidate):
-            return candidate
-    base = os.path.join(exe_dir, "models")
+    base = models_dir or default_models_dir()
     target = os.path.join(base, MODEL_NAME)
+    if os.path.isdir(target):
+        return target
+    legacy = os.path.join(app_dir(), "models", MODEL_NAME)
+    if os.path.isdir(legacy):
+        return legacy
     os.makedirs(base, exist_ok=True)
     zip_path = target + ".zip"
-    print(f"Downloading speech model (~40 MB) from {MODEL_URL} ...")
+    print(f"Downloading speech model (~40 MB) from {MODEL_URL} into {base} ...")
     urllib.request.urlretrieve(MODEL_URL, zip_path)
     with zipfile.ZipFile(zip_path) as z:
         z.extractall(base)
     os.remove(zip_path)
     return target
+
+
+def download_models(models_dir: str, opts: "DictationOptions | None" = None, dictation: bool = True) -> None:
+    """Fetch every model the program can use into `models_dir` (what --download-models runs), so a
+    build never has to carry them. Whisper models are fetched by faster-whisper the first time they load."""
+    print(f"Models folder: {models_dir}")
+    print(f"  speech commands: {ensure_model(None, models_dir)}")
+    if not dictation:
+        return
+    opts = opts or DictationOptions()
+    for name in dict.fromkeys([opts.draft_model or DEFAULT_DRAFT, opts.final_model or DEFAULT_FINAL]):
+        if engine_kind(name) == "whisper":
+            print(f"  {name}: downloaded by faster-whisper when first used")
+        else:
+            print(f"  dictation: {ensure_sherpa_model(name, models_dir)}")
+    print("All models are in place.")
 
 
 def find_input_device(devices, name: str, hostapi=None):
@@ -2527,15 +2559,16 @@ class RemoteTyper:
             self.hands.call("edit", backspaces=0, text=text[i:i + MAX_TEXT])
 
 
-def hands_command(token_file: str, idle_exit: float = 90.0) -> list[str]:
-    """Command line that starts the hands process (the caller adds elevation)."""
+def hands_command(token_file: str, idle_exit: float = 0.0) -> list[str]:
+    """Command line that starts the hands process (the caller adds elevation). It runs until it is
+    closed, like a server; pass idle_exit seconds to make it quit when unused."""
     frozen = "__compiled__" in globals() or getattr(sys, "frozen", False)
     here = os.path.dirname(os.path.abspath(sys.argv[0] if frozen else __file__))
     if frozen:
         target = [os.path.join(here, "voice_mouse_hands.exe")]
     else:
         target = [sys.executable, os.path.join(here, "voice_mouse_hands.py")]
-    return target + ["--token-file", token_file, "--idle-exit", f"{idle_exit:g}"]
+    return target + ["--token-file", token_file] + (["--idle-exit", f"{idle_exit:g}"] if idle_exit else [])
 
 
 def connect_hands(token_file: str, wait: float = 0.0, sleep=time.sleep, clock=time.monotonic,
@@ -3335,9 +3368,13 @@ def main() -> None:
     ap.add_argument("--dictate-pause-ms", type=int, default=900,
                     help="dictation: silence that ends a phrase (default 900)")
     ap.add_argument("--dictate-prompt", help="dictation: names / jargon to bias a Whisper final model towards")
-    ap.add_argument("--dictate-model-dir",
-                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"),
-                    help="dictation: where its models are kept / downloaded (default: ./models)")
+    ap.add_argument("--models-dir", default=default_models_dir(), metavar="DIR",
+                    help="where ALL models are kept and downloaded, shared by every build (default: %(default)s; "
+                         "or set VOICE_MOUSE_MODELS). They are never packed into the exe")
+    ap.add_argument("--download-models", action="store_true",
+                    help="download every model into --models-dir, then exit (run it once after building)")
+    ap.add_argument("--dictate-model-dir", default=None, metavar="DIR",
+                    help="dictation: use this folder for its models instead of --models-dir")
     ap.add_argument("--console-log", metavar="FILE", default=os.path.join(app_dir(), "voice_mouse.log"),
                     help="write everything the console shows, with time stamps and any crash, to FILE "
                          "(default: voice_mouse.log next to the program; kept to about 5 MB + one old copy)")
@@ -3358,6 +3395,10 @@ def main() -> None:
     if args.list_devices:
         import sounddevice as sd
         print(sd.query_devices())
+        return
+    if args.download_models:
+        download_models(args.models_dir, DictationOptions(draft_model=args.draft_model, final_model=args.final_model,
+                                                          no_draft=args.no_draft), dictation=not args.no_dictation)
         return
     if sys.platform != "win32":
         sys.exit("This tool controls the Windows mouse; run it on Windows.")
@@ -3402,7 +3443,7 @@ def main() -> None:
 
     import tkinter as tk
     make_dpi_aware()
-    model_path = ensure_model(args.model)
+    model_path = ensure_model(args.model, args.models_dir)
     log_path = None if args.no_log else os.path.abspath(args.log)
 
     root = tk.Tk()
@@ -3452,7 +3493,7 @@ def main() -> None:
     else:
         d_opts = DictationOptions(
             draft_model=args.draft_model, final_model=args.final_model, no_draft=args.no_draft,
-            device=args.dictate_device, model_dir=args.dictate_model_dir, prompt=args.dictate_prompt,
+            device=args.dictate_device, model_dir=args.dictate_model_dir or args.models_dir, prompt=args.dictate_prompt,
             pause_ms=args.dictate_pause_ms, idle=args.dictate_idle, start_wait=args.dictate_start_wait,
             vad_level=args.dictate_vad_level, verbose=args.dictate_verbose)
         ok, why = dictation_available(d_opts)

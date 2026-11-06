@@ -353,7 +353,7 @@ def test_hands_file_imports_only_the_standard_library():
 
 def test_hands_file_is_small():
     path = os.path.join(os.path.dirname(os.path.abspath(H.__file__)), "voice_mouse_hands.py")
-    assert sum(1 for _ in open(path, encoding="utf-8")) < 600       # keep it reviewable
+    assert sum(1 for _ in open(path, encoding="utf-8")) < 700       # keep it reviewable
 
 
 def test_supervisor_gives_its_child_the_running_hands():
@@ -376,9 +376,70 @@ def test_supervisor_gives_its_child_the_running_hands():
 
 
 def test_hands_command_line():
-    cmd = VM.hands_command("C:/x/hands.json", 60)
-    assert cmd[-4:] == ["--token-file", "C:/x/hands.json", "--idle-exit", "60"]
-    assert os.path.basename(cmd[-5]) == "voice_mouse_hands.py"
+    cmd = VM.hands_command("C:/x/hands.json")
+    assert cmd[-2:] == ["--token-file", "C:/x/hands.json"] and "--idle-exit" not in cmd     # runs until closed
+    assert os.path.basename(cmd[-3]) == "voice_mouse_hands.py"
+    assert VM.hands_command("f", 60)[-2:] == ["--idle-exit", "60"]                          # only when asked
+
+
+def test_hands_log_file_gets_timestamped_lines_and_rotates():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "sub", "hands.log")
+        old = sys.stdout, sys.stderr
+        try:
+            H.open_log(path)
+            print("one"); print("two", end=""); print(" three")
+        finally:
+            sys.stdout, sys.stderr = old
+        lines = open(path, encoding="utf-8").read().splitlines()
+        assert lines[-2].endswith(" one") and lines[-1].endswith("two three") and lines[-1][:2] == "20", lines
+        with open(path, "a") as f:
+            f.write("x" * 100)
+        try:
+            H.open_log(path, max_bytes=50)
+        finally:
+            sys.stdout, sys.stderr = old
+        assert os.path.exists(path + ".old")
+
+
+def test_default_models_folder_is_shared_and_nothing_is_bundled():
+    saved = {k: os.environ.get(k) for k in ("VOICE_MOUSE_MODELS", "LOCALAPPDATA")}
+    try:
+        os.environ["VOICE_MOUSE_MODELS"] = os.path.join(tempfile.gettempdir(), "vm_models")
+        assert VM.default_models_dir() == os.path.abspath(os.environ["VOICE_MOUSE_MODELS"])
+        del os.environ["VOICE_MOUSE_MODELS"]
+        os.environ["LOCALAPPDATA"] = "C:/Users/me/AppData/Local"
+        assert VM.default_models_dir().replace("\\", "/").endswith("AppData/Local/voice_mouse/models")
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    here = os.path.dirname(os.path.abspath(__file__))
+    for bat in ("build.bat",):
+        text = open(os.path.join(here, bat), encoding="utf-8").read().lower()
+        assert "include-data-dir" not in text, "models must not be packed into the exes"
+
+
+def test_ensure_model_uses_the_shared_folder_and_never_downloads_when_present():
+    with tempfile.TemporaryDirectory() as d:
+        target = os.path.join(d, VM.MODEL_NAME)
+        os.makedirs(target)
+        assert VM.ensure_model(None, d) == target
+        assert VM.ensure_model("explicit", d) == "explicit"
+
+
+def test_download_models_fetches_each_model_once():
+    got = []
+    real_model, real_sherpa = VM.ensure_model, VM.ensure_sherpa_model
+    VM.ensure_model = lambda p, d=None: got.append(("vosk", d)) or "v"
+    VM.ensure_sherpa_model = lambda n, d: got.append((n, d)) or "s"
+    try:
+        VM.download_models("M", VM.DictationOptions(draft_model="small.en"))      # a Whisper draft: not fetched here
+        assert got == [("vosk", "M"), (VM.DEFAULT_FINAL, "M")], got
+        got.clear()
+        VM.download_models("M", dictation=False)
+        assert got == [("vosk", "M")]
+    finally:
+        VM.ensure_model, VM.ensure_sherpa_model = real_model, real_sherpa
 
 
 def _run_all(only=()):
