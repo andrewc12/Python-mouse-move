@@ -1235,6 +1235,48 @@ def test_session_spoken_stop_and_load_requests():
     assert ev["stop"] == 1 and typed.text == ""
 
 
+def test_session_first_words_get_extra_time_then_the_normal_timeout():
+    for wait, expect_at in ((3.0, 6.0), (0.0, 3.0)):
+        now = [0.0]
+        sess, typed, ev = make_session(lambda: now[0], start_wait=wait)
+        sess.request(want=False); pump(sess, lambda: sess.ready)
+        sess.start()
+        fired_at = None
+        for i in range(400):
+            now[0] += 0.03
+            sess.feed(b"q" * 960)
+            sess.poll()
+            if ev["idle"] and fired_at is None:
+                fired_at = now[0]
+        assert fired_at is not None and abs(fired_at - expect_at) < 0.2, (wait, fired_at)
+    now = [0.0]
+    sess, typed, ev = make_session(lambda: now[0], start_wait=3.0)
+    sess.request(want=False); pump(sess, lambda: sess.ready); sess.start()
+    for _ in range(60):                                                 # speak, then it is a plain 3 s timeout
+        now[0] += 0.03; sess.feed(b"S" * 960)
+    sess.poll()
+    assert sess.pipeline.idle_s == 3.0
+
+
+def test_session_reports_what_the_microphone_gave_it():
+    now = [0.0]
+    sess, typed, ev = make_session(lambda: now[0])
+    sess.request(want=False); pump(sess, lambda: sess.ready); sess.start()
+    for _ in range(250):
+        now[0] += 0.03; sess.feed(b"q" * 960)
+    sess.poll()
+    assert sess.stats["frames"] == 250 and sess.stats["speech"] == 0 and ev["idle"] == 1
+    assert any("no speech" in t and "microphone level" in t for t in ev["said"]), ev["said"]    # says why, on the pill
+    sess.stop(); sess.start()
+    assert sess.stats == {"frames": 0, "speech": 0, "phrases": 0}        # fresh counts each time
+    for _ in range(60):
+        now[0] += 0.03; sess.feed(b"S" * 960)
+    for _ in range(40):
+        now[0] += 0.03; sess.feed(b"q" * 960)
+    pump(sess, lambda: sess.stats["phrases"] == 1)
+    assert sess.stats["speech"] >= 55 and sess.stats["phrases"] == 1
+
+
 def test_session_failed_load_is_reported_and_forgotten():
     def broken(): raise RuntimeError("no network")
     sess = DictationSession(DictationOptions(), lambda t: said.append(t), lambda: None, lambda: None, lambda: None,

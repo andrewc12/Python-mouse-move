@@ -2,7 +2,7 @@
 vosk
 sounddevice
 
-# Dictation (the "dictate" command, and voice_dictate.py on its own). Without these the mouse and
+# Dictation (the "dictate" command). Without these the mouse and
 # keyboard commands still work and "dictate" just says what is missing.
 sherpa-onnx
 webrtcvad-wheels

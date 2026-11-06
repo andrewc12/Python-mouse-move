@@ -20,15 +20,24 @@ In grid  : "one" ... "nine"              -> zoom into that cell (cursor moves to
 
 Dictation (awake only)
 ----------------------
-  "dictate"                          type what you say into the focused window (voice_dictate.py's
-                                     engines: a fast draft while you talk, corrected at each pause).
-                                     The status box turns blue and says Dictating.
-  stops by itself after 3 s of silence (--dictate-idle), or say "stop dictation" / "stop listening"
-  as a phrase of its own: both go back to listening. The hotkey / box click goes to sleep instead.
-  "new line", "new paragraph", "scratch that" work inside dictation (see voice_dictate.py).
-  The first "dictate" loads the models in the background (the first run downloads about 750 MB);
-  dictation then starts by itself. --preload-dictation loads them at start-up; --no-dictation turns
-  the command off. Needs: pip install sherpa-onnx webrtcvad-wheels numpy (see requirements.txt).
+  "dictate"                          type what you say into the focused window: a fast draft model
+                                     while you talk, corrected by an accurate one at each pause (see
+                                     "Dictation engine" below). The status box turns blue and says
+                                     Dictating, with a high beep (a low one when it ends).
+  Pause after saying "dictate": it must be a phrase of its own. You then have 6 s to start talking
+  (--dictate-idle plus --dictate-start-wait), and after that 3 s of silence ends it (--dictate-idle).
+  It also ends when you say "stop dictation" or "stop listening" as a phrase of its own. All of these
+  go back to listening; the hotkey / box click goes to sleep instead.
+  Inside dictation, as whole phrases: "new line", "new paragraph", "scratch that" (deletes the last
+  phrase; also "delete that").
+  The first "dictate" loads the models in the background (the first run downloads about 750 MB into
+  ./models, --dictate-model-dir); dictation then starts by itself. --preload-dictation loads them at
+  start-up; --no-dictation turns the command off. Needs: pip install sherpa-onnx webrtcvad-wheels numpy
+  (requirements.txt). The console prints what dictation hears ("dictation: heard '...'") and, when it
+  ends, how many audio frames had speech in them: zero means the microphone / --dictate-vad-level.
+  Other knobs: --draft-model / --final-model (a sherpa-onnx or Whisper model name, e.g. small.en),
+  --no-draft (only type at pauses; least CPU), --dictate-device cuda, --dictate-pause-ms,
+  --dictate-prompt (names to bias Whisper), --dictate-verbose (decode timings).
 
 Keyboard (awake only; ignored while the mouse grid is open)
 ------------------------------------
@@ -137,11 +146,13 @@ Run:  python voice_mouse.py            (downloads the ~40 MB model on first run)
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime
 import json
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -2155,13 +2166,718 @@ class SpeechThread(threading.Thread):
 
 
 # --------------------------------------------------------------------------
-# Dictation ("dictate"): type what you say into the focused window. The engine is voice_dictate.py
-# (draft model while you speak, accurate final model at each pause). While it is on, the microphone
-# audio goes to it instead of Vosk; it hands control back to listening when you stop talking.
+# Dictation engine: voice activity -> phrases -> draft / final models -> text typed into the focused
+# window. While you speak a fast "draft" model keeps guessing and the text on screen is corrected in
+# place (backspace the wrong tail, type the better one), like Windows voice typing; at each pause a
+# more accurate "final" model re-reads the phrase and fixes it, with punctuation and capitals.
+#
+#     microphone -> VAD -> utterance Segmenter
+#                      |-- every ~0.3 s ----> DRAFT model (small, fast)  -> type / correct on screen
+#                      '-- at a pause -------> FINAL model (bigger)      -> final correction, commit
+#
+# Default engines (offline, through sherpa-onnx; no GPU needed):
+#   draft  sherpa-onnx-streaming-zipformer-en-2023-06-26   streaming; lower case, no punctuation
+#   final  sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8      NVIDIA Parakeet TDT 0.6B; punctuation + capitals
+# A Whisper name (e.g. small.en, via faster-whisper) works for either role. A model name picks the
+# engine: "sherpa-onnx-streaming*" = streaming, "sherpa-onnx-nemo*" = Parakeet-style offline, else Whisper.
+# Text is only corrected while a phrase is still being decided; once final it is never touched again
+# except by "scratch that". If focus moves to another window mid-phrase the old window is abandoned
+# (never backspaced into). Typing uses SendInput with Unicode characters; Windows blocks it into
+# administrator windows unless this program is elevated (--admin).
+# --------------------------------------------------------------------------
+
+FRAME_MS = 30                                   # webrtcvad takes 10, 20 or 30 ms frames
+
+
+FRAME_BYTES = SAMPLE_RATE * FRAME_MS // 1000 * 2
+
+
+# ---- cleaning what the model says -------------------------------------------------------------
+# Whisper invents these on silence, breaths and keyboard noise.
+HALLUCINATIONS = {"you", "thanks for watching", "thank you for watching", "please subscribe",
+                  "subtitles by the amara org community"}
+
+
+def _spoken_words(text: str) -> list[str]:
+    return re.findall(r"[a-z']+", text.lower())
+
+
+def squash_repeats(text: str, limit: int = 3) -> str:
+    """Whisper sometimes loops ("the the the the ..."): keep at most `limit` of a repeated word."""
+    out, run, prev = [], 0, None
+    for tok in text.split():
+        key = tok.lower().strip(".,!?")
+        run = run + 1 if key == prev else 1
+        prev = key
+        if run <= limit:
+            out.append(tok)
+    return " ".join(out)
+
+
+def clean_transcript(text: str) -> str:
+    """Tidy one model result; '' means 'nothing worth typing' (noise tags, known hallucinations)."""
+    t = " ".join((text or "").split())
+    if not t or re.fullmatch(r"[\[(].*[\])]", t):          # [BLANK_AUDIO], (music), ...
+        return ""
+    if " ".join(_spoken_words(t)) in HALLUCINATIONS:
+        return ""
+    return squash_repeats(t)
+
+
+def clean_draft(text: str) -> str:
+    """A draft is cleaned the same way, and loses a trailing '.' / ',' / '...' : the model puts one
+    on every guess, and it would otherwise be typed and backspaced again on each update."""
+    return re.sub(r"[\s.,\u2026]+$", "", clean_transcript(text))
+
+
+# ---- voice commands ---------------------------------------------------------------------------
+DICTATION_COMMANDS: dict[tuple[str, ...], str] = {
+    ("new", "line"): "newline", ("newline",): "newline", ("new", "paragraph"): "paragraph",
+    ("scratch", "that"): "scratch", ("delete", "that"): "scratch",
+    ("stop", "listening"): "stop", ("stop", "dictation"): "stop",
+}
+
+
+def parse_dictation_command(text: str):
+    """The command a whole phrase stands for ('newline', 'paragraph', 'scratch', 'stop'), or None."""
+    return DICTATION_COMMANDS.get(tuple(_spoken_words(text)))
+
+
+def is_dictation_command_prefix(text: str) -> bool:
+    """Could this (possibly unfinished) phrase still turn out to be a command? Drafts that might be
+    are held back rather than typed and then deleted."""
+    w = tuple(_spoken_words(text))
+    return bool(w) and any(k[:len(w)] == w for k in DICTATION_COMMANDS)
+
+
+# ---- keyboard events ---------------------------------------------------------------------------
+KEYUP, UNICODE = 0x0002, 0x0004
+
+
+VK_BACK, VK_RETURN = 0x08, 0x0D
+
+
+def key_events(backspaces: int, text: str) -> list[tuple[int, int, int]]:
+    """(virtual key, scan code, flags) triples: that many Backspaces, then the text. Newline is the
+    Enter key; everything else is sent as UTF-16 code units with KEYEVENTF_UNICODE."""
+    ev: list[tuple[int, int, int]] = []
+    for _ in range(backspaces):
+        ev += [(VK_BACK, 0, 0), (VK_BACK, 0, KEYUP)]
+    for ch in text.replace("\r", ""):
+        if ch == "\n":
+            ev += [(VK_RETURN, 0, 0), (VK_RETURN, 0, KEYUP)]
+            continue
+        data = ch.encode("utf-16-le")
+        for i in range(0, len(data), 2):
+            unit = int.from_bytes(data[i:i + 2], "little")
+            ev += [(0, unit, UNICODE), (0, unit, UNICODE | KEYUP)]
+    return ev
+
+
+# ---- voice activity -> utterances ---------------------------------------------------------------
+class Segmenter:
+    """Turns a stream of 30 ms frames plus a speech / not-speech flag per frame into utterances.
+
+    feed() returns events:
+      ("start", uid)                       an utterance began (its pre-roll is included)
+      ("end", uid, pcm, reason)            it finished; reason: pause / soft / max / flush
+      ("cancel", uid)                      too short to be speech; throw it away
+
+    * start: `ring_need` of the last `ring` frames are speech (a single click is not enough).
+    * end: `end_silence_ms` of silence. A long phrase is also cut at a shorter pause (`soft_*`) and
+      at `max_s` regardless, because the model's cost grows with the length of what it re-reads.
+    * a little pre-roll is kept so the first syllable is not clipped, and a little trailing silence.
+    """
+
+    def __init__(self, frame_ms: int = FRAME_MS, ring: int = 5, ring_need: int = 3,
+                 pre_roll_ms: int = 300, end_silence_ms: int = 600, soft_after_s: float = 6.0,
+                 soft_silence_ms: int = 300, max_s: float = 14.0, min_speech_ms: int = 240,
+                 tail_keep_ms: int = 150):
+        self.frame_ms, self.ring_need = frame_ms, ring_need
+        self.end_silence_ms, self.soft_after_s = end_silence_ms, soft_after_s
+        self.soft_silence_ms, self.max_s = soft_silence_ms, max_s
+        self.min_speech_ms, self.tail_keep = min_speech_ms, tail_keep_ms // frame_ms
+        self._ring = collections.deque(maxlen=ring)
+        self._pre = collections.deque(maxlen=max(1, pre_roll_ms // frame_ms))
+        self.uid = 0
+        self.active = False
+        self.buf: list[bytes] = []
+        self.voiced = self.silent = 0
+
+    @property
+    def seconds(self) -> float:
+        return len(self.buf) * self.frame_ms / 1000.0
+
+    def snapshot(self) -> bytes:
+        return b"".join(self.buf)
+
+    def reset(self) -> None:
+        self.active, self.buf, self.voiced, self.silent = False, [], 0, 0
+        self._ring.clear()
+        self._pre.clear()
+
+    def _begin(self, frames, voiced: int) -> tuple:
+        self.uid += 1
+        self.active, self.buf, self.voiced, self.silent = True, list(frames), voiced, 0
+        return ("start", self.uid)
+
+    def _finish(self, reason: str) -> tuple:
+        uid, voiced_ms = self.uid, self.voiced * self.frame_ms
+        drop = max(0, self.silent - self.tail_keep)
+        buf = self.buf[:len(self.buf) - drop] if drop else self.buf
+        self.reset()
+        if voiced_ms < self.min_speech_ms:
+            return ("cancel", uid)
+        return ("end", uid, b"".join(buf), reason)
+
+    def force_end(self) -> list:
+        """End the utterance in progress (used when dictation is paused mid-sentence)."""
+        return [self._finish("flush")] if self.active else []
+
+    def feed(self, frame: bytes, speech: bool) -> list:
+        ev: list = []
+        if not self.active:
+            self._pre.append(frame)
+            self._ring.append(speech)
+            if speech and sum(self._ring) >= self.ring_need:
+                ev.append(self._begin(self._pre, sum(self._ring)))
+                self._pre.clear()
+                self._ring.clear()
+            return ev
+        self.buf.append(frame)
+        if speech:
+            self.voiced += 1
+            self.silent = 0
+        else:
+            self.silent += 1
+        sil_ms = self.silent * self.frame_ms
+        if sil_ms >= self.end_silence_ms:
+            reason = "pause"
+        elif self.seconds >= self.soft_after_s and sil_ms >= self.soft_silence_ms:
+            reason = "soft"
+        elif self.seconds >= self.max_s:
+            reason = "max"
+        else:
+            return ev
+        ev.append(self._finish(reason))
+        if reason == "max" and speech:             # still talking: carry straight on, no gap
+            ev.append(self._begin([], 0))
+        return ev
+
+
+class Pipeline:
+    """VAD thread's brain: frames in; utterance events and decode jobs out.
+
+    out receives ("start", uid) / ("cancel", uid), and ("idle",) once when `idle_s` seconds pass with no
+    speech (the owner then pauses dictation). Decode jobs go through submit_draft(uid, pcm)
+    (called every `draft_every_s` while someone is speaking, once `draft_after_s` of audio exists;
+    pass None to disable drafts) and submit_final(uid, pcm). discard_draft(uid) is called when an
+    utterance ends so a stale draft is not decoded after its final.
+    """
+
+    def __init__(self, vad, submit_draft, submit_final, out, segmenter=None, draft_after_s: float = 0.45,
+                 draft_every_s: float = 0.3, discard_draft=lambda uid: None, clock=time.monotonic,
+                 idle_s: float = 0.0):
+        self.vad, self.submit_draft, self.submit_final, self.out = vad, submit_draft, submit_final, out
+        self.seg = segmenter or Segmenter()
+        self.draft_after_s, self.draft_every_s, self.clock = draft_after_s, draft_every_s, clock
+        self.discard_draft = discard_draft
+        self.idle_s = idle_s                            # 0 = never stop by itself
+        self.active = False
+        self._last_draft = 0.0
+        self._last_speech = clock()
+
+    def set_active(self, on: bool) -> None:
+        if self.active and not on:
+            self._handle(self.seg.force_end())          # pausing mid-sentence still delivers it
+        if on and not self.active:
+            self._last_speech = self.clock()            # the silence clock starts now
+        self.active = on
+        if not on:
+            self.seg.reset()
+
+    def _handle(self, events: list) -> None:
+        for e in events:
+            kind, uid = e[0], e[1]
+            if kind == "start":
+                self._last_draft = 0.0
+                self.out.put(("start", uid))
+            elif kind == "cancel":
+                self.discard_draft(uid)
+                self.out.put(("cancel", uid))
+            elif kind == "end":
+                self.discard_draft(uid)
+                self.submit_final(uid, e[2])
+
+    def feed(self, frame: bytes) -> None:
+        if not self.active:
+            return
+        now = self.clock()
+        speech = bool(self.vad(frame))
+        if speech or self.seg.active:                   # talking (or mid-phrase): not idle
+            self._last_speech = now
+        self._handle(self.seg.feed(frame, speech))
+        if self.idle_s and now - self._last_speech >= self.idle_s:
+            self._last_speech = now                     # one "idle" per quiet spell
+            self.out.put(("idle",))
+        if self.submit_draft and self.seg.active and self.seg.seconds >= self.draft_after_s:
+            now = self.clock()
+            if now - self._last_draft >= self.draft_every_s:
+                self._last_draft = now
+                self.submit_draft(self.seg.uid, self.seg.snapshot())
+
+
+# ---- the text on screen -------------------------------------------------------------------------
+@dataclass
+class Part:
+    """One utterance's contribution to the text still being decided."""
+    uid: int
+    text: str = ""
+    kind: str = "text"          # text / newline / paragraph / scratch / stop
+    final: bool = False
+
+    def shown(self) -> str:
+        return {"newline": "\n", "paragraph": "\n\n", "scratch": "", "stop": ""}.get(self.kind, self.text)
+
+
+def _needs_space(last: str | None, text: str) -> bool:
+    return bool(last) and not last.isspace() and last not in "([{" \
+        and not text[0].isspace() and text[0] not in ",.;:!?)]}%\u2026"
+
+
+class Dictator:
+    """Keeps the text on screen equal to the best current reading of what was said.
+
+    `parts` are the utterances not yet settled, oldest first; `shown` is exactly what is on screen for
+    them. Every draft or final just changes a part and calls _update(), which renders all the parts
+    to one string, finds where it first differs from `shown`, and sends the typist "backspace this
+    many, then type this". So a late FINAL for an earlier phrase can fix it even though the next
+    phrase has already started appearing after it. Settled (final, front-of-queue) parts move to
+    `history` and are never edited again, except by "scratch that".
+
+    typist.edit(backspaces, text) types. foreground() returns the active window id: if it changes
+    while text is still undecided, the old window is abandoned instead of being backspaced into.
+    """
+    HISTORY = 50
+
+    def __init__(self, typist, foreground=lambda: 0, on_stop=lambda: None, notice=lambda s: None):
+        self.typist, self.foreground, self.on_stop, self.notice = typist, foreground, on_stop, notice
+        self.parts: list[Part] = []
+        self.shown = ""
+        self.history: list[str] = []          # rendered text of settled phrases, newest last
+        self.committed_last: str | None = None
+        self.ignore_upto = 0                  # utterances at or below this were abandoned
+        self._hwnd = None
+
+    # -- events from the pipeline
+    def begin(self, uid: int) -> None:
+        self._sync_focus()
+        if uid > self.ignore_upto and not self._find(uid):
+            self.parts.append(Part(uid))
+
+    def draft(self, uid: int, text: str) -> None:
+        self._sync_focus()
+        part = self._find(uid)
+        if not part or part.final or uid <= self.ignore_upto:
+            return
+        part.text = "" if is_dictation_command_prefix(text) else clean_draft(text)
+        self._update()
+
+    def final(self, uid: int, text: str) -> None:
+        self._sync_focus()
+        part = self._find(uid)
+        if not part or uid <= self.ignore_upto:
+            return
+        cleaned = clean_transcript(text)
+        part.kind = parse_dictation_command(cleaned) or "text"
+        part.text = "" if part.kind != "text" else cleaned
+        part.final = True
+        self._update()
+
+    def cancel(self, uid: int) -> None:
+        part = self._find(uid)
+        if part and not part.final:
+            self.parts.remove(part)
+            self._update()
+
+    # -- internals
+    def _find(self, uid: int):
+        return next((p for p in self.parts if p.uid == uid), None)
+
+    def _sync_focus(self) -> None:
+        hwnd = self.foreground()
+        if self._hwnd is None:
+            self._hwnd = hwnd
+        elif hwnd != self._hwnd:
+            if self.shown and self.parts:                 # undecided text sits in the old window
+                self.ignore_upto = max(self.ignore_upto, max(p.uid for p in self.parts))
+                self.parts.clear()
+                self.notice("window changed")
+            self.shown = ""
+            self.history.clear()                          # "scratch that" must not reach into it
+            self.committed_last = None
+            self._hwnd = hwnd
+
+    def _pieces(self) -> list[tuple[Part, str]]:
+        out, last = [], self.committed_last
+        for p in self.parts:
+            t = p.shown()
+            if not t:
+                out.append((p, ""))
+                continue
+            out.append((p, (" " if _needs_space(last, t) else "") + t))
+            last = t[-1]
+        return out
+
+    def _apply(self) -> None:
+        target = "".join(piece for _, piece in self._pieces())
+        if target == self.shown:
+            return
+        n = min(len(target), len(self.shown))
+        i = 0
+        while i < n and target[i] == self.shown[i]:
+            i += 1
+        self.typist.edit(len(self.shown) - i, target[i:])
+        self.shown = target
+
+    def _update(self) -> None:
+        for _ in range(500):
+            self._apply()
+            if not self.parts or not self.parts[0].final:
+                return
+            front = self.parts[0]
+            if front.kind == "stop":
+                self.parts.pop(0)
+                self.on_stop()
+            elif front.kind == "scratch":
+                self.parts.pop(0)
+                if self.history:                          # un-settle the last phrase; _apply deletes it
+                    self.shown = self.history.pop() + self.shown
+                    self.committed_last = self.history[-1][-1] if self.history else None
+                    self.notice("scratched")
+                else:
+                    self.notice("nothing to scratch")
+            else:
+                piece = self._pieces()[0][1]
+                self.parts.pop(0)
+                if piece:
+                    self.history.append(piece)
+                    del self.history[:-self.HISTORY]
+                    self.committed_last = piece[-1]
+                    self.shown = self.shown[len(piece):]
+
+
+# --------------------------------------------------------------------------
+# Windows specifics
+# --------------------------------------------------------------------------
+_INPUT_TYPES = None
+
+
+def _input_types():
+    global _INPUT_TYPES
+    if _INPUT_TYPES is None:
+        import ctypes
+        from ctypes import wintypes
+
+        class MOUSEINPUT(ctypes.Structure):          # not used, but it sizes the INPUT union correctly
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.c_size_t)]
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+
+        class _U(ctypes.Union):
+            _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+        _INPUT_TYPES = (INPUT, KEYBDINPUT)
+    return _INPUT_TYPES
+
+
+class WinTyper:
+    """Backspaces and text into the focused window, in as few SendInput calls as possible."""
+    CHUNK = 400                                       # events per call (even, so down/up stay together)
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self.INPUT, _ = _input_types()
+        self.u = ctypes.windll.user32
+        self.u.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(self.INPUT), ctypes.c_int]
+        self.u.SendInput.restype = wintypes.UINT
+        self._warned = False
+
+    def edit(self, backspaces: int, text: str) -> None:
+        import ctypes
+        events = key_events(backspaces, text)
+        for i in range(0, len(events), self.CHUNK):
+            chunk = events[i:i + self.CHUNK]
+            arr = (self.INPUT * len(chunk))()
+            for slot, (vk, scan, flags) in zip(arr, chunk):
+                slot.type = 1                         # INPUT_KEYBOARD
+                slot.u.ki.wVk, slot.u.ki.wScan, slot.u.ki.dwFlags = vk, scan, flags
+            sent = self.u.SendInput(len(chunk), arr, ctypes.sizeof(self.INPUT))
+            if sent < len(chunk) and not self._warned:
+                self._warned = True
+                print("warning: Windows refused some typed input (the window is probably running as "
+                      "administrator; start with --admin)")
+
+
+def foreground_window() -> int:
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    u.GetForegroundWindow.restype = wintypes.HWND
+    return u.GetForegroundWindow() or 0
+
+
+# --------------------------------------------------------------------------
+# Speech: VAD, models, workers, microphone
+# --------------------------------------------------------------------------
+def make_vad(level: int):
+    """frame bytes -> is it speech? webrtcvad if installed, else a plain loudness threshold."""
+    try:
+        import webrtcvad
+        v = webrtcvad.Vad(level)
+        return lambda frame: v.is_speech(frame, SAMPLE_RATE)
+    except ImportError:
+        print("webrtcvad not installed (pip install webrtcvad-wheels); using a loudness threshold")
+        return lambda frame: level_from_pcm(frame) > 0.35
+
+
+class WhisperTranscriber:
+    """pcm16 mono 16 kHz bytes -> cleaned text, with faster-whisper."""
+
+    def __init__(self, name: str, threads: int, beam: int, device: str = "cpu", compute: str = "int8",
+                 language: str | None = "en", prompt: str | None = None, model_dir: str | None = None):
+        self.name, self.threads, self.beam, self.device, self.compute = name, threads, beam, device, compute
+        self.language, self.prompt, self.model_dir = language, prompt, model_dir
+        self.model = None
+
+    def load(self) -> "WhisperTranscriber":
+        from faster_whisper import WhisperModel
+        self.model = WhisperModel(self.name, device=self.device, compute_type=self.compute,
+                                  cpu_threads=self.threads, download_root=self.model_dir)
+        return self
+
+    def __call__(self, pcm: bytes, uid=None) -> str:
+        import numpy as np
+        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        segments, _ = self.model.transcribe(
+            audio, language=self.language, beam_size=self.beam, temperature=0.0,
+            condition_on_previous_text=False, without_timestamps=True, vad_filter=False,
+            initial_prompt=self.prompt)
+        keep = [s.text for s in segments if not (s.no_speech_prob > 0.6 and s.avg_logprob < -0.8)]
+        return clean_transcript("".join(keep))
+
+
+# ---- sherpa-onnx engines ------------------------------------------------------------------------
+SHERPA_RELEASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{}.tar.bz2"
+
+
+DEFAULT_DRAFT = "sherpa-onnx-streaming-zipformer-en-2023-06-26"
+
+
+DEFAULT_FINAL = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
+
+
+def engine_kind(name: str) -> str:
+    """Which engine a model name belongs to: 'stream', 'nemo' or 'whisper'."""
+    if name.startswith("sherpa-onnx-streaming"):
+        return "stream"
+    if name.startswith("sherpa-onnx-nemo"):
+        return "nemo"
+    return "whisper"
+
+
+def find_model_files(d: str) -> dict:
+    """encoder / decoder / joiner / tokens inside an unpacked sherpa-onnx transducer model folder.
+    The int8 files are preferred (smaller and faster on a CPU) when both kinds are present."""
+    files = os.listdir(d)
+
+    def pick(prefix: str) -> str:
+        found = sorted((f for f in files if f.startswith(prefix) and f.endswith(".onnx")),
+                       key=lambda f: ("int8" not in f, len(f), f))
+        if not found:
+            raise FileNotFoundError(f"no {prefix}*.onnx in {d}")
+        return os.path.join(d, found[0])
+
+    tokens = os.path.join(d, "tokens.txt")
+    if not os.path.isfile(tokens):
+        raise FileNotFoundError(f"no tokens.txt in {d}")
+    return {"encoder": pick("encoder"), "decoder": pick("decoder"), "joiner": pick("joiner"),
+            "tokens": tokens}
+
+
+def ensure_sherpa_model(name: str, model_dir: str) -> str:
+    """Folder of the named sherpa-onnx model, downloading and unpacking it on first use."""
+    import tarfile
+    target = os.path.join(model_dir, name)
+    if os.path.isdir(target):
+        return target
+    os.makedirs(model_dir, exist_ok=True)
+    archive = target + ".tar.bz2"
+    url = SHERPA_RELEASE.format(name)
+    print(f"Downloading {name} from {url} ...")
+    urllib.request.urlretrieve(url, archive)
+    with tarfile.open(archive, "r:bz2") as tf:
+        root = os.path.realpath(model_dir)
+        for m in tf.getmembers():                           # refuse paths that escape the folder
+            if not os.path.realpath(os.path.join(model_dir, m.name)).startswith(root + os.sep):
+                raise RuntimeError(f"unsafe path in archive: {m.name}")
+        tf.extractall(model_dir)
+    os.remove(archive)
+    if not os.path.isdir(target):
+        raise RuntimeError(f"{archive} did not unpack to {target}")
+    return target
+
+
+def _pcm_to_float(pcm: bytes):
+    import numpy as np
+    return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def _result_text(result) -> str:
+    return result if isinstance(result, str) else getattr(result, "text", "")
+
+
+class SherpaStreaming:
+    """Streaming recogniser as the DRAFT stage.
+
+    One recogniser stream is kept per phrase and each call feeds it only the audio that arrived since
+    the last call, so the work per update stays the same however long the phrase gets (the model's
+    state carries the earlier words along). A new phrase, or a snapshot that is shorter than what was
+    already fed, starts a fresh stream. The text lags the audio by a fraction of a second (the model
+    needs a little right-hand context), which is fine for a draft: the final pass has the last word.
+    Output is lower-cased; the final pass supplies the capitals and punctuation."""
+
+    def __init__(self, name: str, threads: int, device: str = "cpu", model_dir: str | None = None):
+        self.name, self.threads, self.device, self.model_dir = name, threads, device, model_dir
+        self.model = None
+        self._uid, self._stream, self._fed = None, None, 0       # bytes of the phrase already fed
+
+    def load(self) -> "SherpaStreaming":
+        import sherpa_onnx
+        f = find_model_files(ensure_sherpa_model(self.name, self.model_dir or "models"))
+        self.model = sherpa_onnx.OnlineRecognizer.from_transducer(
+            tokens=f["tokens"], encoder=f["encoder"], decoder=f["decoder"], joiner=f["joiner"],
+            num_threads=self.threads, sample_rate=SAMPLE_RATE, feature_dim=80,
+            decoding_method="greedy_search", provider="cuda" if self.device == "cuda" else "cpu")
+        return self
+
+    def __call__(self, pcm: bytes, uid=None) -> str:
+        rec = self.model
+        if self._stream is None or uid is None or uid != self._uid or len(pcm) < self._fed:
+            self._stream, self._uid, self._fed = rec.create_stream(), uid, 0
+        new = pcm[self._fed:len(pcm) // 2 * 2]
+        if new:
+            self._stream.accept_waveform(SAMPLE_RATE, _pcm_to_float(new))
+            self._fed += len(new)
+        while rec.is_ready(self._stream):
+            rec.decode_stream(self._stream)
+        return clean_transcript(_result_text(rec.get_result(self._stream)).lower())
+
+
+class SherpaNemo:
+    """Offline NeMo transducer (Parakeet) as the FINAL stage: whole phrase in, punctuated text out."""
+
+    def __init__(self, name: str, threads: int, device: str = "cpu", model_dir: str | None = None):
+        self.name, self.threads, self.device, self.model_dir = name, threads, device, model_dir
+        self.model = None
+
+    def load(self) -> "SherpaNemo":
+        import sherpa_onnx
+        f = find_model_files(ensure_sherpa_model(self.name, self.model_dir or "models"))
+        kw = dict(tokens=f["tokens"], encoder=f["encoder"], decoder=f["decoder"], joiner=f["joiner"],
+                  num_threads=self.threads, sample_rate=SAMPLE_RATE, feature_dim=128,
+                  decoding_method="greedy_search", provider="cuda" if self.device == "cuda" else "cpu")
+        try:
+            self.model = sherpa_onnx.OfflineRecognizer.from_transducer(model_type="nemo_transducer", **kw)
+        except TypeError:                                  # an older build without the model_type argument
+            self.model = sherpa_onnx.OfflineRecognizer.from_transducer(**kw)
+        return self
+
+    def __call__(self, pcm: bytes, uid=None) -> str:
+        stream = self.model.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, _pcm_to_float(pcm))
+        self.model.decode_stream(stream)
+        return clean_transcript(_result_text(stream.result))
+
+
+def make_transcriber(name: str, threads: int, beam: int, args, prompt=None):
+    """The right engine object for a model name (not loaded yet; call .load())."""
+    kind = engine_kind(name)
+    if kind == "stream":
+        return SherpaStreaming(name, threads, args.device, args.model_dir)
+    if kind == "nemo":
+        return SherpaNemo(name, threads, args.device, args.model_dir)
+    return WhisperTranscriber(name, threads, beam, args.device, args.compute_type or "int8",
+                              args.language, prompt, args.model_dir)
+
+
+class LatestWorker(threading.Thread):
+    """Runs fn(job) on the newest submitted job only: if jobs arrive faster than fn finishes, the
+    ones in between are dropped (a draft that is already out of date is not worth decoding)."""
+
+    def __init__(self, fn, name="draft"):
+        super().__init__(daemon=True, name=name)
+        self.fn, self.cv, self.job = fn, threading.Condition(), None
+
+    def submit(self, job) -> None:
+        with self.cv:
+            self.job = job
+            self.cv.notify()
+
+    def discard(self, uid) -> None:
+        with self.cv:
+            if self.job and self.job[0] == uid:
+                self.job = None
+
+    def run(self) -> None:
+        while True:
+            with self.cv:
+                while self.job is None:
+                    self.cv.wait()
+                job, self.job = self.job, None
+            try:
+                self.fn(job)
+            except Exception:
+                traceback.print_exc()
+
+
+class FifoWorker(threading.Thread):
+    """Runs fn(job) for every job, in order."""
+
+    def __init__(self, fn, name="final"):
+        super().__init__(daemon=True, name=name)
+        self.fn, self.q = fn, queue.Queue()
+
+    def submit(self, job) -> None:
+        self.q.put(job)
+
+    def run(self) -> None:
+        while True:
+            job = self.q.get()
+            try:
+                self.fn(job)
+            except Exception:
+                traceback.print_exc()
+
+
+# --------------------------------------------------------------------------
+# Dictation ("dictate"): connecting the engine to voice_mouse. While it is on, the microphone audio
+# goes to the engine instead of Vosk; it hands control back to listening when you stop talking.
 # --------------------------------------------------------------------------
 @dataclass
 class DictationOptions:
-    draft_model: str | None = None        # None = voice_dictate's default
+    draft_model: str | None = None        # None = DEFAULT_DRAFT
     final_model: str | None = None
     no_draft: bool = False                # True: only type each phrase when you pause
     device: str = "cpu"                   # cpu / cuda / auto
@@ -2179,6 +2895,8 @@ class DictationOptions:
     max_phrase: float = 20.0
     draft_interval: float = 0.3
     idle: float = 3.0                     # seconds of silence before it returns to listening (0 = never)
+    start_wait: float = 3.0               # extra seconds allowed before the FIRST words (the command
+                                          # that started dictation, and any model loading, lag behind you)
     verbose: bool = False
 
 
@@ -2186,11 +2904,10 @@ def dictation_available(opts: DictationOptions) -> tuple[bool, str]:
     """Are the packages the chosen dictation models need installed? (ok, message if not)"""
     try:
         import numpy, sounddevice  # noqa: F401
-        vd = __import__("voice_dictate")
-        names = [opts.final_model or vd.DEFAULT_FINAL] + ([] if opts.no_draft else [opts.draft_model or vd.DEFAULT_DRAFT])
-        if any(vd.engine_kind(n) == "whisper" for n in names):
+        names = [opts.final_model or DEFAULT_FINAL] + ([] if opts.no_draft else [opts.draft_model or DEFAULT_DRAFT])
+        if any(engine_kind(n) == "whisper" for n in names):
             import faster_whisper  # noqa: F401
-        if any(vd.engine_kind(n) != "whisper" for n in names):
+        if any(engine_kind(n) != "whisper" for n in names):
             import sherpa_onnx  # noqa: F401
     except ImportError as e:
         return False, (f"dictation needs the package '{e.name}': "
@@ -2245,13 +2962,11 @@ class DictationSession:
                     and reports the timeout (on_idle) or the spoken "stop" (on_stop).
 
     Typing happens on the UI thread (in poll), decoding on worker threads, voice detection on the
-    speech thread. voice_dictate does the actual work; this class only connects it to voice_mouse.
+    speech thread. The engine above does the actual work; this class connects it to voice_mouse.
     """
 
     def __init__(self, opts: DictationOptions, say, on_idle, on_stop, on_ready, typist=None,
                  foreground=None, vad=None, load=None, clock=time.monotonic):
-        import importlib
-        vd = self.vd = importlib.import_module("voice_dictate")
         self.opts, self.say = opts, say
         self.on_idle, self.on_stop, self.on_ready = on_idle, on_stop, on_ready
         self.draft_tr = self.final_tr = None
@@ -2261,22 +2976,31 @@ class DictationSession:
         self.wanted = False                     # "dictate" was said while the models were loading
         self._lock = threading.Lock()           # speech thread feeds, UI thread starts / stops
         self.out: queue.Queue = queue.Queue()
-        self.reframer = Reframer(vd.FRAME_BYTES)
-        self.draft_worker = None if opts.no_draft else vd.LatestWorker(self._run_draft)
-        self.final_worker = vd.FifoWorker(self._run_final)
+        self.reframer = Reframer(FRAME_BYTES)
+        self.draft_worker = None if opts.no_draft else LatestWorker(self._run_draft)
+        self.final_worker = FifoWorker(self._run_final)
         self.final_worker.start()
         if self.draft_worker:
             self.draft_worker.start()
-        self.pipeline = vd.Pipeline(
-            vad or vd.make_vad(opts.vad_level),
+        base_vad = vad or make_vad(opts.vad_level)
+        self.stats = {"frames": 0, "speech": 0, "phrases": 0}     # what the microphone gave us this time
+
+        def counting_vad(frame):
+            heard = bool(base_vad(frame))
+            self.stats["frames"] += 1
+            self.stats["speech"] += heard
+            return heard
+        self._load_started = self._last_note = 0.0
+        self.pipeline = Pipeline(
+            counting_vad,
             (lambda uid, pcm: self.draft_worker.submit((uid, pcm))) if self.draft_worker else None,
             lambda uid, pcm: self.final_worker.submit((uid, pcm)), self.out,
-            vd.Segmenter(end_silence_ms=opts.pause_ms, soft_after_s=opts.long_after,
+            Segmenter(end_silence_ms=opts.pause_ms, soft_after_s=opts.long_after,
                          soft_silence_ms=min(opts.long_pause_ms, opts.pause_ms), max_s=opts.max_phrase),
             draft_every_s=opts.draft_interval,
             discard_draft=self.draft_worker.discard if self.draft_worker else (lambda uid: None),
             idle_s=opts.idle, clock=clock)
-        self.dictator = vd.Dictator(typist or vd.WinTyper(), foreground or vd.foreground_window,
+        self.dictator = Dictator(typist or WinTyper(), foreground or foreground_window,
                                     on_stop=lambda: self.on_stop(), notice=say)
 
     # ---- models
@@ -2290,6 +3014,7 @@ class DictationSession:
         if self.ready or self._loading:
             return
         self._loading = True
+        self._load_started = self._last_note = time.monotonic()
         self.say("loading dictation models (the first run downloads them, about 750 MB) ...")
         threading.Thread(target=self._load, daemon=True, name="dictation-loader").start()
 
@@ -2313,7 +3038,7 @@ class DictationSession:
             self.say(f"dictation models failed to load: {error}")
 
     def _load_models(self):
-        vd, o = self.vd, self.opts
+        o = self.opts
         cores = os.cpu_count() or 4
         if o.no_draft:
             dthreads, fthreads = 0, o.final_threads or cores
@@ -2323,8 +3048,8 @@ class DictationSession:
         from types import SimpleNamespace
         args = SimpleNamespace(device=o.device, model_dir=o.model_dir, compute_type=o.compute_type,
                                language=o.language)
-        final = vd.make_transcriber(o.final_model or vd.DEFAULT_FINAL, fthreads, o.beam, args, o.prompt)
-        draft = None if o.no_draft else vd.make_transcriber(o.draft_model or vd.DEFAULT_DRAFT, dthreads, 1, args)
+        final = make_transcriber(o.final_model or DEFAULT_FINAL, fthreads, o.beam, args, o.prompt)
+        draft = None if o.no_draft else make_transcriber(o.draft_model or DEFAULT_DRAFT, dthreads, 1, args)
         models = [m for m in (draft, final) if m]
         threads = [threading.Thread(target=m.load) for m in models]       # loaded side by side
         for th in threads:
@@ -2360,11 +3085,18 @@ class DictationSession:
     def start(self) -> None:
         with self._lock:
             self.reframer.reset()
+            self.stats.update(frames=0, speech=0, phrases=0)
+            idle = self.opts.idle
+            self.pipeline.idle_s = idle + self.opts.start_wait if idle else 0.0   # until the first words
             self.pipeline.set_active(True)              # the idle clock starts now
+        wait = f" ({idle + self.opts.start_wait:g}s to start, then {idle:g}s of silence ends it)" if idle else ""
+        print(f"dictation: listening{wait}")
 
     def stop(self) -> None:
         with self._lock:
             self.pipeline.set_active(False)
+        s = self.stats
+        print(f"dictation: ended - {s['frames']} audio frames, {s['speech']} with speech, {s['phrases']} phrases")
 
     def feed(self, data: bytes) -> None:
         with self._lock:
@@ -2384,11 +3116,24 @@ class DictationSession:
                 break
             try:
                 if ev[0] == "idle":
+                    s = self.stats
+                    self.say("dictation heard no speech (is the microphone level too low?) - back to listening"
+                             if not s["speech"] else
+                             f"no speech for {self.opts.idle:g}s - back to listening")
                     self.on_idle()
                 else:
+                    if ev[0] == "start":
+                        self.stats["phrases"] += 1
+                        self.pipeline.idle_s = self.opts.idle        # the first words arrived: normal timeout
+                        print("dictation: speech detected")
+                    elif ev[0] == "final":
+                        print(f"dictation: heard {ev[2]!r}")
                     handlers[ev[0]](*ev[1:])
             except Exception:
                 traceback.print_exc()
+        if self._loading and time.monotonic() - self._last_note >= 5.0:
+            self._last_note = time.monotonic()
+            self.say(f"still loading dictation models ... {time.monotonic() - self._load_started:.0f}s")
         if self.wanted and self.ready:
             self.wanted = False
             self.on_ready()
@@ -2448,15 +3193,23 @@ def main() -> None:
     ap.add_argument("--no-media", action="store_true",
                     help="turn off the media-button commands (\"media play\", \"media next\", ...)")
     ap.add_argument("--no-dictation", action="store_true",
-                    help="turn off the \"dictate\" command (typing what you say; see voice_dictate.py)")
+                    help="turn off the \"dictate\" command (typing what you say)")
     ap.add_argument("--dictate-idle", type=float, default=3.0, metavar="SECONDS",
                     help="dictation goes back to listening after this many seconds of silence "
                          "(default 3; 0 = never)")
+    ap.add_argument("--dictate-start-wait", type=float, default=3.0, metavar="SECONDS",
+                    help="extra time allowed before your first words, on top of --dictate-idle (default 3), "
+                         "because the \"dictate\" command and any model loading lag a little behind you")
+    ap.add_argument("--dictate-vad-level", type=int, choices=(0, 1, 2, 3), default=2,
+                    help="dictation voice-activity strictness: 3 ignores more noise, 0 hears more (default 2; "
+                         "try 0 or 1 if it does not pick up quiet speech)")
+    ap.add_argument("--dictate-verbose", action="store_true",
+                    help="print every dictation decode with its timing")
     ap.add_argument("--preload-dictation", action="store_true",
                     help="load the dictation models at start-up instead of the first time you say "
                          "\"dictate\" (uses memory and CPU for a while at start)")
-    ap.add_argument("--draft-model", help="dictation: fast live model (default: voice_dictate's)")
-    ap.add_argument("--final-model", help="dictation: accurate model run at each pause")
+    ap.add_argument("--draft-model", help=f"dictation: fast live model (default {DEFAULT_DRAFT})")
+    ap.add_argument("--final-model", help=f"dictation: accurate model run at each pause (default {DEFAULT_FINAL})")
     ap.add_argument("--no-draft", action="store_true",
                     help="dictation: no live typing, only type each phrase when you pause (least CPU)")
     ap.add_argument("--dictate-device", choices=("cpu", "cuda", "auto"), default="cpu",
@@ -2512,7 +3265,17 @@ def main() -> None:
     pill = StatusPill(root, screen, corner=args.corner)
     overlay = Overlay(root, screen, minor_grid=not args.no_minor_grid, inset=args.overlay_inset,
                       adapt=not args.no_adapt_inset)
-    ctl = Controller(screen, WinMouse(), overlay, on_state=pill.set, keyboard=WinKeyboard(),
+    import winsound
+    last_state = [SLEEPING]
+
+    def on_state(state: str) -> None:
+        pill.set(state)
+        was, last_state[0] = last_state[0], state
+        if state == DICTATE or (was == DICTATE and state == AWAKE):   # a beep marks each way round
+            threading.Thread(target=winsound.Beep, args=(1300 if state == DICTATE else 700, 70),
+                             daemon=True).start()
+
+    ctl = Controller(screen, WinMouse(), overlay, on_state=on_state, keyboard=WinKeyboard(),
                      media=None if args.no_media else WinMedia(), on_reload=reload_program,
                      windows=WinWindow())
     if args.start_awake:
@@ -2532,18 +3295,15 @@ def main() -> None:
         d_opts = DictationOptions(
             draft_model=args.draft_model, final_model=args.final_model, no_draft=args.no_draft,
             device=args.dictate_device, model_dir=args.dictate_model_dir, prompt=args.dictate_prompt,
-            pause_ms=args.dictate_pause_ms, idle=args.dictate_idle)
+            pause_ms=args.dictate_pause_ms, idle=args.dictate_idle, start_wait=args.dictate_start_wait,
+            vad_level=args.dictate_vad_level, verbose=args.dictate_verbose)
         ok, why = dictation_available(d_opts)
         if not ok:
             print(f"note: {why}")
             dictation = DictationUnavailable(say, why)
         else:
-            def dictation_idle():
-                if ctl.state == DICTATE:
-                    say(f"no speech for {args.dictate_idle:g}s - back to listening")
-                    ctl.handle("listen")
             dictation = DictationSession(
-                d_opts, say, on_idle=dictation_idle, on_stop=lambda: ctl.handle("listen"),
+                d_opts, say, on_idle=lambda: ctl.handle("listen"), on_stop=lambda: ctl.handle("listen"),
                 on_ready=lambda: ctl.handle("dictate"))
             speech.dictation_feed = dictation.feed
             if args.preload_dictation:
@@ -2588,8 +3348,6 @@ def main() -> None:
         root.after(30, poll)
 
     root.after(30, poll)
-
-    import winsound
 
     def toggle(source: str) -> None:
         ctl.handle("start" if ctl.state == SLEEPING else "stop")

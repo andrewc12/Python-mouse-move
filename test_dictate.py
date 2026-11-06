@@ -1,4 +1,4 @@
-"""Logic tests for voice_dictate (no Windows, Tk, Whisper or microphone needed).
+"""Logic tests for the dictation engine inside voice_mouse.py (no Windows, Tk, Whisper or microphone needed).
 
 Run all:        python3 test_dictate.py           (named results, exit code 1 on any failure)
 Run some:       python3 test_dictate.py segment focus   (tests whose name contains any word)
@@ -9,7 +9,7 @@ import sys
 import threading
 import traceback
 
-from voice_dictate import *
+from voice_mouse import *
 
 
 # ---------------------------------------------------------------- fakes and helpers
@@ -81,16 +81,16 @@ def test_clean_transcript():
 
 
 def test_commands():
-    assert parse_command("New line.") == "newline" and parse_command("newline") == "newline"
-    assert parse_command("New paragraph") == "paragraph"
-    assert parse_command("Scratch that!") == "scratch" and parse_command("delete that") == "scratch"
-    assert parse_command("Stop listening.") == "stop" and parse_command("stop dictation") == "stop"
-    assert parse_command("on the new line") is None and parse_command("hello") is None
-    assert parse_command("") is None
+    assert parse_dictation_command("New line.") == "newline" and parse_dictation_command("newline") == "newline"
+    assert parse_dictation_command("New paragraph") == "paragraph"
+    assert parse_dictation_command("Scratch that!") == "scratch" and parse_dictation_command("delete that") == "scratch"
+    assert parse_dictation_command("Stop listening.") == "stop" and parse_dictation_command("stop dictation") == "stop"
+    assert parse_dictation_command("on the new line") is None and parse_dictation_command("hello") is None
+    assert parse_dictation_command("") is None
     for held in ("new", "New line", "scratch", "stop", "delete that"):
-        assert is_command_prefix(held), held
+        assert is_dictation_command_prefix(held), held
     for typed in ("hello", "new line please", "stop sign", "", "new lines"):
-        assert not is_command_prefix(typed), typed
+        assert not is_dictation_command_prefix(typed), typed
 
 
 def test_segmenter_start_end_and_preroll():
@@ -472,26 +472,6 @@ def test_sherpa_wrappers_with_fake_recognisers():
     nm = SherpaNemo("n", 2)
     nm.model = FakeOffline()
     assert nm(pcm) == "Hello, world."                                                  # case and punctuation kept
-
-
-def test_hotkey():
-    assert parse_hotkey("ctrl+alt+d") == [0x11, 0x12, ord("D")]
-    assert parse_hotkey("Ctrl + F9") == [0x11, 0x78] and parse_hotkey("win+space") == [0x5B, 0x20]
-    for bad in ("ctrl+banana", "d", ""):
-        try:
-            parse_hotkey(bad)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError(bad)
-    down = set()
-    w = ChordWatcher(lambda vk: vk in down, [0x11, 0x12, 0x44])
-    assert w.poll() is False
-    down |= {0x11, 0x12}; assert w.poll() is False
-    down |= {0x44}; assert w.poll() is True
-    assert w.poll() is False                                                         # held: fires once
-    down -= {0x44}; assert w.poll() is False
-    down |= {0x44}; assert w.poll() is True                                          # re-armed by releasing
 
 
 def test_latest_worker_drops_stale_jobs():
