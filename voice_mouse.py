@@ -1924,21 +1924,24 @@ class SpeechThread(threading.Thread):
         self._say("\u26a0 microphone lost; reconnecting ...")
         self._refresh_audio(sd)
 
-    def run(self) -> None:
-        import sounddevice as sd
-        from vosk import KaldiRecognizer, Model, SetLogLevel
-        SetLogLevel(-1)
-        model = Model(self.model_path)
+    # ---- the speech loop, in small pieces ------------------------------------
+    # Two threads share the work (the audio callback is a third, owned by PortAudio):
+    #   decoder  (this thread): audio chunk -> Vosk -> raw result      (the heavy, C++ part)
+    #   finisher (own thread) : raw result -> n-best choice, grammar check, log, pill, commands out
+    # Vosk releases the GIL while it decodes, so the finisher's Python work (JSON, parsing, disk and
+    # console writes) overlaps the decoding of the next chunk instead of delaying it. Everything that
+    # reaches the controller goes through the finisher's single queue, so commands keep their order.
 
-        def make(grammar):
-            r = (KaldiRecognizer(model, SAMPLE_RATE, json.dumps(grammar)) if grammar
-                 else KaldiRecognizer(model, SAMPLE_RATE))     # no grammar = open vocabulary
-            r.SetWords(True)
-            if self.nbest > 0:
-                r.SetMaxAlternatives(self.nbest)   # n-best hypotheses (changes the JSON shape)
-            return r
+    def _make_recogniser(self, model, KaldiRecognizer, grammar):
+        r = (KaldiRecognizer(model, SAMPLE_RATE, json.dumps(grammar)) if grammar
+             else KaldiRecognizer(model, SAMPLE_RATE))        # no grammar = open vocabulary
+        r.SetWords(True)
+        if self.nbest > 0:
+            r.SetMaxAlternatives(self.nbest)                   # n-best hypotheses (changes the JSON shape)
+        return r
 
-        t0 = time.time()
+    def _grammars(self) -> dict:
+        """The recogniser grammar (sentence list, word list or None) for each state."""
         if self.open_vocab:
             awake_g = grid_g = None
         elif self.flat_grammar:
@@ -1948,27 +1951,105 @@ class SpeechThread(threading.Thread):
             if not self.media:               # same grammar without the "media ..." commands
                 awake_g = grammar_sentences(build_command_grammar("awake", media=False),
                                             base=list(_COMMON_EXAMPLES))
-        recs = {SLEEPING: make(WAKE_GRAMMAR), AWAKE: make(awake_g), GRID: make(grid_g)}
-        kind = "open vocabulary" if self.open_vocab else ("flat word list" if self.flat_grammar
-                                                          else f"{len(awake_g)}/{len(grid_g)} sentences")
-        print(f"Recognisers ready in {time.time() - t0:.1f}s (grammar: {kind})")
-        last_state = SLEEPING
-        early, prev_digits = 0, []     # grid numbers already sent from partials; last partial's run
+        return {SLEEPING: WAKE_GRAMMAR, AWAKE: awake_g, GRID: grid_g}
 
+    def _build_recognisers(self, model, KaldiRecognizer) -> dict:
+        """One recogniser per state. Each compiles its own grammar inside Vosk (C++, GIL released),
+        so the three are built side by side; if that fails for any reason, build them one by one."""
+        grammars = self._grammars()
+        build = lambda st: self._make_recogniser(model, KaldiRecognizer, grammars[st])
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=len(grammars)) as pool:
+                recs = dict(zip(grammars, pool.map(build, grammars)))
+        except Exception as e:
+            print(f"parallel start-up failed ({e}); building one at a time")
+            recs = {st: build(st) for st in grammars}
+        return recs
+
+    def _open_log(self):
+        if not self.log_path:
+            return None
+        try:
+            fh = open(self.log_path, "a", encoding="utf-8")
+            print(f"Logging recognitions to {self.log_path}")
+            return fh
+        except OSError as e:
+            print(f"warning: cannot write log file {self.log_path}: {e}")
+            return None
+
+    def _finish(self, item, log) -> None:
+        """Finisher: turn one decoder item into commands for the controller."""
+        kind = item[0]
+        if kind == "digit":                       # an early zoom digit from a partial result
+            self.out.put(item[1])
+            return
+        _, state, result, sent = item             # a final result
+        hyps = self._hypotheses(result)
+        text, _, words = hyps[0]
+        if is_noise(text):                        # "", " " or only [unk]: not worth logging or showing
+            return
+        # With --nbest, prefer the highest-ranked alternative that is a valid utterance in this
+        # state (so "page delta" loses to "page down").
+        chosen = self._choose(hyps, state) if len(hyps) > 1 else 0
+        ctext, _, cwords = hyps[chosen]
+        cmds = self._commands(ctext, cwords, state)
+        if log is not None:                       # record every recognition, even weak ones
+            self._write_log(log, state, state == SLEEPING, hyps, chosen, valid=cmds)
+        # Weak overall confidence is ignored; no per-word data (some result shapes have none)
+        # cannot be judged, so the grammar check decides.
+        if cwords and not self._confident(cwords):
+            return
+        self._report(hyps, chosen, accepted=bool(cmds))
+        if sent and cmds:                         # those leading numbers have already been acted on
+            cmds = drop_applied_digits(cmds, sent)
+        for cmd in cmds or ():
+            self.out.put(cmd)
+
+    def _finisher_loop(self, items: "queue.Queue", log) -> None:
+        while True:
+            item = items.get()
+            if item is None:
+                return
+            try:
+                self._finish(item, log)
+            except Exception:                     # one bad result must not stop the pipeline
+                import traceback
+                traceback.print_exc()
+
+    def _decode(self, rec, state, data, loop, emit) -> None:
+        """Decoder: feed one audio chunk to the recogniser for `state` and emit what comes out."""
+        if rec.AcceptWaveform(data):
+            emit(("final", state, json.loads(rec.Result()), loop.early))
+            loop.early, loop.prev_digits = 0, []
+        elif state == GRID and self.early_digits:
+            # Mid-utterance: zoom as soon as a spoken number is stable (unchanged between two
+            # successive partials), instead of waiting for the whole sequence to end.
+            digits = leading_digits(json.loads(rec.PartialResult()).get("partial", ""))
+            for d in stable_prefix(loop.prev_digits, digits)[loop.early:]:
+                emit(("digit", str(d)))
+                loop.early += 1
+            loop.prev_digits = digits
+
+    class _Loop:
+        """Decoder bookkeeping between chunks."""
+        def __init__(self):
+            self.last_state = SLEEPING
+            self.early = 0                  # grid numbers already sent from partials
+            self.prev_digits = []           # the last partial's run of numbers
+
+        def reset(self):
+            self.early, self.prev_digits = 0, []
+
+    def _listen(self, sd, recs, emit) -> None:
+        """Decoder loop: keep the microphone open and decode until the thread is killed."""
         def cb(indata, frames, t, status):
             data = bytes(indata)
             self._last_audio = time.monotonic()
             self.level = level_from_pcm(data)
             self.audio.put(data)
 
-        log = None
-        if self.log_path:
-            try:
-                log = open(self.log_path, "a", encoding="utf-8")
-                print(f"Logging recognitions to {self.log_path}")
-            except OSError as e:
-                print(f"warning: cannot write log file {self.log_path}: {e}")
-        stream, opened_before = None, False
+        loop, stream, opened_before = self._Loop(), None, False
         try:
             while True:
                 if stream is None:                    # first start, or the microphone came back
@@ -1977,7 +2058,7 @@ class SpeechThread(threading.Thread):
                         self.audio.get_nowait()
                     for r in recs.values():
                         r.Reset()
-                    early, prev_digits = 0, []
+                    loop.reset()
                     self._say("microphone back" if opened_before else
                               "Microphone open. Say \"start listening\".")
                     opened_before = True
@@ -1989,49 +2070,39 @@ class SpeechThread(threading.Thread):
                         stream = None
                     continue
                 state = self.get_state()
-                asleep = state == SLEEPING
-                if state != last_state:               # state flipped: drop stale audio
+                if state != loop.last_state:          # state flipped: drop stale audio
                     recs[state].Reset()
-                    last_state = state
-                    early, prev_digits = 0, []
-                rec = recs[state]
-                if rec.AcceptWaveform(data):
-                    hyps = self._hypotheses(json.loads(rec.Result()))
-                    text, _, words = hyps[0]
-                    sent, early, prev_digits = early, 0, []
-                    if is_noise(text):            # "", " " or only [unk]: not worth logging or showing
-                        continue
-                    # With --nbest, prefer the highest-ranked alternative that is a valid
-                    # utterance in this state (so "page delta" loses to "page down").
-                    chosen = self._choose(hyps, state) if len(hyps) > 1 else 0
-                    ctext, _, cwords = hyps[chosen]
-                    cmds = self._commands(ctext, cwords, state)
-                    if log is not None:               # record every recognition, even weak ones
-                        self._write_log(log, state, asleep, hyps, chosen, valid=cmds)
-                    # Weak overall confidence is ignored as before; no per-word data (some
-                    # result shapes have none) cannot be judged, so the grammar check decides.
-                    if cwords and not self._confident(cwords):
-                        continue
-                    self._report(hyps, chosen, accepted=bool(cmds))
-                    if sent and cmds:             # those leading numbers have already been acted on
-                        cmds = drop_applied_digits(cmds, sent)
-                    for cmd in cmds or ():
-                        self.out.put(cmd)
-                elif state == GRID and self.early_digits:
-                    # Mid-utterance: zoom as soon as a spoken number is stable (unchanged between
-                    # two successive partials), instead of waiting for the whole sequence to end.
-                    part = json.loads(rec.PartialResult()).get("partial", "")
-                    digits = leading_digits(part)
-                    for d in stable_prefix(prev_digits, digits)[early:]:
-                        self.out.put(str(d))
-                        early += 1
-                    prev_digits = digits
+                    loop.last_state = state
+                    loop.reset()
+                self._decode(recs[state], state, data, loop, emit)
         finally:
             if stream is not None:
                 try:
                     stream.close()
                 except Exception:
                     pass
+
+    def run(self) -> None:
+        import sounddevice as sd
+        from vosk import KaldiRecognizer, Model, SetLogLevel
+        SetLogLevel(-1)
+        model = Model(self.model_path)
+        t0 = time.time()
+        recs = self._build_recognisers(model, KaldiRecognizer)
+        g = self._grammars()
+        kind = "open vocabulary" if self.open_vocab else ("flat word list" if self.flat_grammar
+                                                          else f"{len(g[AWAKE])}/{len(g[GRID])} sentences")
+        print(f"Recognisers ready in {time.time() - t0:.1f}s (grammar: {kind})")
+        log = self._open_log()
+        items: "queue.Queue" = queue.Queue()
+        finisher = threading.Thread(target=self._finisher_loop, args=(items, log), daemon=True,
+                                    name="finisher")
+        finisher.start()
+        try:
+            self._listen(sd, recs, items.put)
+        finally:
+            items.put(None)                           # let the finisher drain, then stop
+            finisher.join(timeout=2)
             if log is not None:
                 log.close()
 

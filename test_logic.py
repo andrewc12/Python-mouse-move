@@ -923,6 +923,129 @@ def test_overlay_inset():
     assert i == MAX_INSET
 
 
+# ---- the speech loop end to end, with Vosk and the microphone faked --------------------------------
+class _Stop(BaseException):
+    """Raised by the fake recogniser when its script runs out: ends SpeechThread.run()."""
+
+
+class ScriptRec:
+    """Fake KaldiRecognizer: each audio chunk consumes the next scripted step
+    ('final', result_dict) or ('partial', text)."""
+    script = []
+    resets = 0
+
+    def __init__(self, model, rate, grammar=None):
+        self.grammar, self.step = grammar, None
+
+    def SetWords(self, v): pass
+    def SetMaxAlternatives(self, n): pass
+    def Reset(self): ScriptRec.resets += 1
+
+    def AcceptWaveform(self, data):
+        if not ScriptRec.script:
+            raise _Stop()
+        self.step = ScriptRec.script.pop(0)
+        return self.step[0] == "final"
+
+    def Result(self): return json.dumps(self.step[1])
+    def PartialResult(self): return json.dumps({"partial": self.step[1]})
+
+
+def _final(text):
+    return ("final", {"text": text, "result": [{"word": w, "conf": 1.0} for w in text.split()]})
+
+
+def run_speech(script, state, **kw):
+    """Run SpeechThread.run() against scripted recogniser steps; return what it sent the controller."""
+    import types
+    ScriptRec.script, ScriptRec.resets = list(script), 0
+    vosk = types.SimpleNamespace(Model=lambda path: object(), KaldiRecognizer=ScriptRec,
+                                 SetLogLevel=lambda n: None)
+    class Stream:
+        active = True
+        def __init__(self, cb): self.cb = cb
+        def start(self):
+            import threading
+            def feed():
+                for _ in range(len(script) + 2):
+                    time.sleep(0.01)
+                    self.cb(bytes(1600), 800, None, None)
+            threading.Thread(target=feed, daemon=True).start()
+        def abort(self): self.active = False
+        def close(self): pass
+    sd = types.SimpleNamespace(RawInputStream=lambda **k: Stream(k["callback"]),
+                               _terminate=lambda: None, _initialize=lambda: None)
+    saved = {k: sys.modules.get(k) for k in ("sounddevice", "vosk")}
+    sys.modules["sounddevice"], sys.modules["vosk"] = sd, vosk
+    try:
+        out = queue.Queue()
+        st = SpeechThread("m", None, 0.6, lambda: state, out, **kw)
+        st.log_path = None
+        try:
+            st.run()
+        except _Stop:
+            pass
+        got = []
+        while not out.empty():
+            got.append(out.get_nowait())
+        return got
+    finally:
+        for k, v in saved.items():
+            if v is None: sys.modules.pop(k, None)
+            else: sys.modules[k] = v
+
+
+def test_speech_loop_final_result_becomes_commands():
+    got = run_speech([_final("page down"), _final("left click")], AWAKE)
+    assert got == [KeyPress((Chord((), "pagedown", 1),)), "left"], got
+
+
+def test_speech_loop_ignores_noise_and_invalid_phrases():
+    got = run_speech([_final("[unk]"), _final("[unk] [unk]"), _final("page delta"), _final("")], AWAKE)
+    assert got == [], got
+    assert run_speech([_final("left click")], SLEEPING) == []              # asleep: only the wake phrase
+    assert run_speech([_final("start listening")], SLEEPING) == ["start"]
+
+
+def test_speech_loop_early_digits_are_not_repeated_and_stay_in_order():
+    script = [("partial", "five"), ("partial", "five"), ("partial", "five two"), ("partial", "five two"),
+              _final("five two left click"),
+              ("partial", "nine"), ("partial", "nine"), _final("nine right click")]
+    got = run_speech(script, GRID)
+    assert got == ["5", "2", "left", "9", "right"], got      # digits once each, never after the click
+    got = run_speech(script, GRID, early_digits=False)       # partials ignored: same commands, same order
+    assert got == ["5", "2", "left", "9", "right"], got
+
+
+def test_speech_loop_survives_a_bad_result():
+    bad = ("final", {"text": "page down", "result": "not a list"})
+    got = run_speech([bad, _final("left click")], AWAKE)
+    assert got and got[-1] == "left", got                    # the finisher logged the error and carried on
+
+
+def test_recognisers_are_built_for_every_state_and_fall_back_to_serial():
+    st = new_st()
+    made = []
+    class R:
+        def __init__(self, model, rate, grammar=None): made.append(grammar)
+        def SetWords(self, v): pass
+        def SetMaxAlternatives(self, n): pass
+    recs = st._build_recognisers(object(), R)
+    assert set(recs) == {SLEEPING, AWAKE, GRID} and len(made) == 3
+    calls = []
+    class Flaky(R):
+        def __init__(self, model, rate, grammar=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            super().__init__(model, rate, grammar)
+    try:
+        st._build_recognisers(object(), Flaky)
+    except RuntimeError:
+        pass                                                   # a second failure is allowed to surface
+    assert len(calls) >= 2                                     # ...but the serial retry was attempted
+
+
 def _run_all(only=()):
     tests = [(n, f) for n, f in sorted(globals().items(), key=lambda kv: getattr(kv[1], "__code__", None) and kv[1].__code__.co_firstlineno or 0)
              if n.startswith("test_") and callable(f) and (not only or any(w in n for w in only))]
