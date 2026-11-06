@@ -31,6 +31,9 @@ Keyboard (awake only; ignored while the mouse grid is open)
   letters: say the letter ("a", "bee", "see"...) or NATO words ("alpha", "bravo", ...)
   other keys: enter return tab escape space backspace delete insert home end up down left
               right period comma slash backslash dash equals semicolon
+  volume keys: "press volume up" / "press volume down" / "press mute"; add a number to repeat
+              ("press volume up ten" = ten steps). These are ordinary key presses, so --no-media
+              does not turn them off.
   multi-word keys: "back space" (or "backspace"), "space bar", "caps lock", "print screen",
               "left arrow" / "right arrow" / "up arrow" / "down arrow"
   punctuation: "question mark", "exclamation mark", "colon", "quote", "single quote", "apostrophe",
@@ -179,10 +182,12 @@ VK.update({
     "equals": 0xBB, "semicolon": 0xBA,
     "lbracket": 0xDB, "rbracket": 0xDD, "quote": 0xDE, "backtick": 0xC0,
     "capslock": 0x14, "printscreen": 0x2C,
+    "volumeup": 0xAF, "volumedown": 0xAE, "mute": 0xAD,
     "ctrl": 0x11, "alt": 0x12, "shift": 0x10, "win": 0x5B,
 })
 EXTENDED_KEYS = {"delete", "insert", "home", "end", "pageup", "pagedown",
-                 "left", "up", "right", "down", "win", "printscreen"}
+                 "left", "up", "right", "down", "win", "printscreen",
+                 "volumeup", "volumedown", "mute"}
 
 # Multi-word and punctuation key names: spoken phrase -> (extra modifiers, key). Symbols that need
 # Shift are Shift + the key that carries them on a US layout (the Australian layout is the same).
@@ -190,6 +195,7 @@ EXTENDED_KEYS = {"delete", "insert", "home", "end", "pageup", "pagedown",
 SYMBOL_KEYS: dict[tuple[str, ...], tuple[tuple[str, ...], str]] = {
     ("back", "space"): ((), "backspace"), ("space", "bar"): ((), "space"),
     ("caps", "lock"): ((), "capslock"), ("print", "screen"): ((), "printscreen"),
+    ("volume", "up"): ((), "volumeup"), ("volume", "down"): ((), "volumedown"), ("mute",): ((), "mute"),
     ("left", "arrow"): ((), "left"), ("right", "arrow"): ((), "right"),
     ("up", "arrow"): ((), "up"), ("down", "arrow"): ((), "down"),
     ("question", "mark"): (("shift",), "slash"),

@@ -627,3 +627,21 @@ say(c, "mouse grid"); say(c, PH); assert reloads == [1]               # grid: ig
 cmd = relaunch_command()
 assert "--start-awake" in cmd and cmd[0] == sys.executable
 print("dev reload ok")
+
+
+# ================= volume keys =================
+assert V("press volume up", AWAKE) == [KeyPress((Chord((), "volumeup", 1),))]
+assert V("press volume down ten", AWAKE) == [KeyPress((Chord((), "volumedown", 10),))]
+assert V("press mute", AWAKE) == [KeyPress((Chord((), "mute", 1),))]
+assert V("press volume up five times mute", AWAKE) == [KeyPress((Chord((), "volumeup", 5), Chord((), "mute", 1)))]
+assert V("press mute", AWAKE, media=False) is not None                    # plain key press: unaffected
+assert V("press volume", AWAKE) is None and V("volume up", AWAKE) is None and V("mute", AWAKE) is None
+assert V("press volume up", GRID) is None                                 # no key presses in the grid
+assert V("press up", AWAKE) == [KeyPress((Chord((), "up", 1),))]           # arrow key unchanged
+assert VK["volumeup"] == 0xAF and VK["volumedown"] == 0xAE and VK["mute"] == 0xAD
+assert {"volumeup", "volumedown", "mute"} <= EXTENDED_KEYS
+assert ("volume", "up") in AWAKE_GRAMMAR_G.pairs and ("press", "mute") in AWAKE_GRAMMAR_G.pairs
+kb = FakeKb(); c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=kb)
+say(c, "start listening press volume up three press mute")
+assert kb.log == [((), "volumeup", 3), ((), "mute", 1)], kb.log
+print("volume keys ok")
