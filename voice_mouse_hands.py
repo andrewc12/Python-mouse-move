@@ -16,6 +16,15 @@ Only plain data comes across (never pickle or code). Every message is checked ag
 Run it:      py voice_mouse_hands.py --admin          (asks for administrator rights, then serves)
 Then start:  py voice_mouse.py --use-hands            (or let voice_mouse.py start it: --admin-hands)
 
+It also draws the mouse grid and the status box (voice_mouse_ui.py, Tk, standard library). A window
+is only as "on top" as the program that owns it: normal always-on-top windows can be covered by each
+other, and Windows keeps a higher layer, the UI-access band (Magnifier, the on-screen keyboard, a
+pinned Task Manager), that no ordinary program can cover. A program joins that band if its manifest
+asks for uiAccess, it is signed with a certificate the PC trusts, and it is installed under Program
+Files. Because this file is small and has no model code, it is the one to give that privilege: build
+it with build.bat, then run install_hands_signed.bat (makes and trusts a test certificate, signs and
+installs it, and starts it at logon). Use --no-ui to leave the drawing to the main program instead.
+
 What this does NOT protect against: anything running as you can read the token file, so it can ask
 the hands to press keys as administrator. The split keeps big, downloaded model code out of the
 elevated process; it does not make an untrusted program on your account safe.
@@ -26,6 +35,7 @@ import argparse
 import hmac
 import json
 import os
+import queue
 import secrets
 import socket
 import socketserver
@@ -98,6 +108,29 @@ def is_admin() -> bool:
     import ctypes
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def has_ui_access() -> bool:
+    """Does this process's token have UI access (the privilege that puts its windows in Windows' top
+    layer and lets it drive elevated windows)? False off Windows or if it cannot be read."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k, adv = ctypes.windll.kernel32, ctypes.windll.advapi32
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        adv.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        adv.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                            ctypes.POINTER(wintypes.DWORD)]
+        token = wintypes.HANDLE()
+        if not adv.OpenProcessToken(k.GetCurrentProcess(), 0x0008, ctypes.byref(token)):      # TOKEN_QUERY
+            return False
+        value, size = wintypes.DWORD(0), wintypes.DWORD(0)
+        ok = adv.GetTokenInformation(token, 26, ctypes.byref(value), ctypes.sizeof(value), ctypes.byref(size))  # TokenUIAccess
+        k.CloseHandle(token)
+        return bool(ok and value.value)
     except Exception:
         return False
 
@@ -308,6 +341,11 @@ MAX_TEXT = 5000             # characters in one typing request
 MAX_BACKSPACES = 5000
 MAX_LINE = 64 * 1024        # bytes in one message
 COORD_LIMIT = 100_000       # |x|, |y| (multi-monitor layouts can be negative)
+try:                                                        # the drawing half is optional for tests / --no-ui
+    from voice_mouse_ui import CORNERS, STATES, Region
+except ImportError:                                         # pragma: no cover
+    CORNERS = STATES = ()
+    Region = None
 BUTTONS = ("left", "right")
 DIRECTIONS = ("up", "down", "left", "right")
 WINDOW_ACTIONS = tuple(WinWindow.SW)
@@ -322,6 +360,13 @@ def _int(msg: dict, name: str, lo: int, hi: int) -> int:
     v = msg.get(name)
     if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
         raise BadRequest(f"{name} must be an integer from {lo} to {hi}")
+    return v
+
+
+def _bool(msg: dict, name: str) -> bool:
+    v = msg.get(name)
+    if not isinstance(v, bool):
+        raise BadRequest(f"{name} must be true or false")
     return v
 
 
@@ -348,12 +393,116 @@ def _mods(msg: dict) -> list[str]:
     return list(v)
 
 
+UI_OPS = ("ui_init", "overlay_show", "overlay_hide", "pill")      # handled on the Tk thread, not under the input lock
+MAX_HEARD = 300
+
+
+class UiHost:
+    """Owns the grid overlay and status box. Tk may only be used from the thread that created it, so
+    requests from the socket threads are queued and run by pump(), which that thread calls often.
+    Overlay show / hide wait until done (the caller relies on the order); status box updates are
+    merged, so a busy UI thread only ever has the latest one to apply."""
+
+    def __init__(self, root=None, screen=None, make_overlay=None, make_pill=None):
+        self.root, self.screen = root, screen
+        self.make_overlay = make_overlay or self._real_overlay
+        self.make_pill = make_pill or self._real_pill
+        self.q: queue.Queue = queue.Queue()
+        self.lock = threading.Lock()
+        self.pending: dict = {}
+        self.events: list[str] = []
+        self.overlay = self.pill = None
+        self.keep_on_top = True
+
+    # -- real factories (need Tk; tests pass fakes instead)
+    def _real_overlay(self, o):
+        from voice_mouse_ui import Overlay
+        return Overlay(self.root, self.screen, minor_grid=o["minor_grid"], inset=o["inset"], adapt=o["adapt"])
+
+    def _real_pill(self, o):
+        from voice_mouse_ui import StatusPill
+        return StatusPill(self.root, self.screen, corner=o["corner"])
+
+    # -- called from any thread
+    def submit(self, fn, timeout: float = 5.0):
+        done, box = threading.Event(), []
+        self.q.put((fn, done, box))
+        if not done.wait(timeout):
+            raise TimeoutError("the UI thread is not responding")
+        if isinstance(box[0], Exception):
+            raise box[0]
+        return box[0]
+
+    def update_pill(self, fields: dict) -> list[str]:
+        with self.lock:
+            self.pending.update(fields)
+            events, self.events = self.events, []
+        return events
+
+    # -- run on the Tk thread
+    def pump(self) -> None:
+        while True:
+            try:
+                fn, done, box = self.q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                box.append(fn())
+            except Exception as e:                       # reported to the caller, never kills the pump
+                box.append(e)
+                print(f"ui error: {type(e).__name__}: {e}")
+            finally:
+                done.set()
+        with self.lock:
+            fields, self.pending = self.pending, {}
+        if fields and self.pill is not None:
+            try:
+                self._apply_pill(fields)
+            except Exception as e:
+                print(f"ui error: {type(e).__name__}: {e}")
+
+    def _apply_pill(self, f: dict) -> None:
+        if "state" in f and f["state"] != getattr(self.pill, "state", None):
+            self.pill.set(f["state"])
+        if "level" in f:
+            self.pill.set_level(f["level"])
+        if "heard" in f:
+            self.pill.set_heard(f["heard"], f.get("seq", 0))
+
+    def init(self, o: dict) -> None:
+        for w in (self.overlay, self.pill):
+            if w is not None and hasattr(w, "win"):
+                w.win.destroy()
+        self.keep_on_top = o["keep_on_top"]
+        self.overlay, self.pill = self.make_overlay(o), self.make_pill(o)
+        self.pill.on_click = lambda: self._event("click")
+        self.options = o
+
+    def _event(self, name: str) -> None:
+        with self.lock:
+            self.events.append(name)
+
+    DEFAULTS = {"corner": "bottom-right", "minor_grid": True, "inset": 1, "adapt": True, "keep_on_top": True}
+
+    def ensure(self) -> None:
+        if self.overlay is None:
+            self.init(dict(self.DEFAULTS))
+
+    def raise_all(self) -> None:
+        """Called a few times a second: back above anything that was raised since (overlay first,
+        status box above it)."""
+        if self.keep_on_top and self.overlay is not None:
+            self.overlay.raise_()
+            self.pill.raise_()
+
+
 class Hands:
     """Carries out validated requests on the injected backends (Win* classes, or fakes in tests).
-    One request at a time: the lock keeps typing, key presses and mouse moves from interleaving."""
+    One input request at a time: the lock keeps typing, key presses and mouse moves from interleaving."""
 
-    def __init__(self, mouse, keyboard, window, media, typer):
+    def __init__(self, mouse, keyboard, window, media, typer, ui: UiHost | None = None):
         self.mouse, self.keyboard, self.window, self.media, self.typer = mouse, keyboard, window, media, typer
+        self.ui = ui
         self.lock = threading.Lock()
 
     def handle(self, msg) -> dict:
@@ -364,9 +513,14 @@ class Hands:
             run = getattr(self, "op_" + op, None) if op.isidentifier() else None
             if run is None:
                 raise BadRequest(f"unknown op {op!r}")
-            with self.lock:
-                run(msg)
-            return {"ok": True}
+            if op in UI_OPS:
+                if self.ui is None:
+                    raise BadRequest("this helper has no screen drawing (started with --no-ui or no Tk)")
+                extra = run(msg)
+            else:
+                with self.lock:
+                    extra = run(msg)
+            return {"ok": True, **(extra or {})}
         except BadRequest as e:
             print(f"refused: {e}")
             return {"ok": False, "error": str(e)}
@@ -420,6 +574,40 @@ class Hands:
     def op_media(self, msg):
         self.media.send(_choice(msg, "action", MEDIA_ACTIONS))
 
+    # ---- screen drawing (needs a UiHost)
+    def op_ui_init(self, msg):
+        corner = _choice(msg, "corner", CORNERS)
+        opts = {"corner": corner, "minor_grid": _bool(msg, "minor_grid"), "adapt": _bool(msg, "adapt"),
+                "keep_on_top": _bool(msg, "keep_on_top"), "inset": _int(msg, "inset", 0, 50)}
+        self.ui.submit(lambda: self.ui.init(opts))
+
+    def op_overlay_show(self, msg):
+        region = msg.get("region")
+        if (not isinstance(region, list) or len(region) != 4 or any(
+                isinstance(n, bool) or not isinstance(n, (int, float)) or abs(n) > COORD_LIMIT for n in region)):
+            raise BadRequest("region must be [x, y, width, height]")
+        mark = _point(msg, "mark") if msg.get("mark") is not None else None
+        self.ui.submit(lambda: (self.ui.ensure(), self.ui.overlay.show(Region(*region), mark))[-1])
+
+    def op_overlay_hide(self, msg):
+        self.ui.submit(lambda: self.ui.overlay is not None and self.ui.overlay.hide())
+
+    def op_pill(self, msg):
+        fields = {}
+        if "state" in msg:
+            fields["state"] = _choice(msg, "state", STATES)
+        if "level" in msg:
+            v = msg["level"]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1:
+                raise BadRequest("level must be a number from 0 to 1")
+            fields["level"] = float(v)
+        if "heard" in msg:
+            if not isinstance(msg["heard"], str) or len(msg["heard"]) > MAX_HEARD:
+                raise BadRequest(f"heard must be a string of at most {MAX_HEARD} characters")
+            fields["heard"], fields["seq"] = msg["heard"], _int(msg, "seq", 0, 2 ** 31) if "seq" in msg else 0
+        self.ui.submit(self.ui.ensure)            # first use before ui_init: defaults (also waits for it)
+        return {"events": self.ui.update_pill(fields)}
+
 
 # --------------------------------------------------------------------------
 # The server: loopback socket, token, one JSON object per line
@@ -470,7 +658,8 @@ def serve_connection(rfile, wfile, hands: Hands, token: str, log=print) -> None:
             if (isinstance(msg, dict) and msg.get("op") == "hello" and isinstance(given, str)
                     and hmac.compare_digest(given.encode("utf-8"), token.encode("utf-8"))):
                 authed = True
-                reply({"ok": True, "admin": is_admin()})
+                reply({"ok": True, "admin": is_admin(), "ui": getattr(hands, "ui", None) is not None,
+                       "uiaccess": has_ui_access()})
                 log("hands: client connected")
                 continue
             log("hands: refused a connection (bad or missing token)")
@@ -578,6 +767,8 @@ def main(argv=None) -> int:
     ap.add_argument("--log", metavar="FILE", help="write everything printed here to FILE (default: hands.log "
                     "next to the token file), so a hidden or scheduled run can still be diagnosed")
     ap.add_argument("--no-log", action="store_true", help="do not write a log file")
+    ap.add_argument("--no-ui", action="store_true",
+                    help="do not draw the grid and status box here (the main program then draws them itself)")
     args = ap.parse_args(argv)
 
     if args.admin and not is_admin():
@@ -588,19 +779,53 @@ def main(argv=None) -> int:
     if not args.no_log:
         open_log(args.log or os.path.join(os.path.dirname(os.path.abspath(args.token_file)), "hands.log"))
     make_dpi_aware()
-    hands = Hands(WinMouse(), WinKeyboard(), WinWindow(), WinMedia(), WinTyper())
+    root = ui = None
+    if not args.no_ui:
+        try:
+            import tkinter
+            from voice_mouse_ui import primary_screen
+            root = tkinter.Tk()
+            root.withdraw()
+            ui = UiHost(root, primary_screen())
+        except Exception as e:
+            print(f"hands: no screen drawing ({type(e).__name__}: {e}); the main program will draw instead")
+            root = ui = None
+    hands = Hands(WinMouse(), WinKeyboard(), WinWindow(), WinMedia(), WinTyper(), ui=ui)
     token = secrets.token_hex(32)
     srv = make_server(hands, token, args.port)
     port = srv.server_address[1]
     write_token_file(args.token_file, port, token)
-    print(f"hands ready on 127.0.0.1:{port} ({'administrator' if is_admin() else 'NOT administrator'}); "
-          f"token file: {args.token_file}")
+    print(f"hands ready on 127.0.0.1:{port} ({'administrator' if is_admin() else 'NOT administrator'}; "
+          f"UI access: {'yes' if has_ui_access() else 'no'}; "
+          f"{'drawing the grid and status box' if ui else 'input only'}); token file: {args.token_file}")
     watch_idle(srv, args.idle_exit)
+    server = threading.Thread(target=srv.serve_forever, daemon=True, name="hands-server")
+    server.start()
     try:
-        srv.serve_forever()
+        if root is not None:                         # Tk lives on this thread: serve the UI queue and keep on top
+            def pump() -> None:
+                ui.pump()
+                if server.is_alive():
+                    root.after(8, pump)
+                else:
+                    root.quit()
+
+            def keep() -> None:
+                try:
+                    ui.raise_all()
+                except Exception as e:
+                    print(f"ui error: {type(e).__name__}: {e}")
+                root.after(250, keep)
+            root.after(8, pump)
+            root.after(250, keep)
+            root.mainloop()
+        else:
+            server.join()
     except KeyboardInterrupt:
         pass
     finally:
+        if server.is_alive():
+            srv.shutdown()
         try:
             os.remove(args.token_file)
         except OSError:

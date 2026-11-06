@@ -15,6 +15,7 @@ import time
 import traceback
 
 import voice_mouse_hands as H
+import voice_mouse_ui as UI
 import voice_mouse as VM
 
 
@@ -30,15 +31,49 @@ class Rec:
         return lambda *a: self.log.append((name, *a))
 
 
-def make_hands():
+def make_hands(ui=None):
     r = Rec()
-    return H.Hands(r, r, r, r, r), r
+    return H.Hands(r, r, r, r, r, ui=ui), r
+
+
+class FakeOverlay:
+    def __init__(self, o): self.o, self.log = o, []
+    def show(self, r, mark): self.log.append(("show", r, mark))
+    def hide(self): self.log.append(("hide",))
+    def raise_(self): self.log.append(("raise",))
+
+
+class FakePill:
+    def __init__(self, o): self.o, self.log, self.state, self.on_click = o, [], None, lambda: None
+    def set(self, state): self.state = state; self.log.append(("set", state))
+    def set_level(self, v): self.log.append(("level", v))
+    def set_heard(self, t, seq=0): self.log.append(("heard", t, seq))
+    def raise_(self): self.log.append(("raise",))
+
+
+class Pumped:
+    """A UiHost made of fakes, with its own thread standing in for Tk's main loop."""
+    def __init__(self):
+        self.ui = H.UiHost(make_overlay=FakeOverlay, make_pill=FakePill)
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while not self.stop.is_set():
+            self.ui.pump()
+            time.sleep(0.002)
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(2)
 
 
 class Running:
     """A real hands server on a loopback port with a token file, shut down afterwards."""
-    def __init__(self, token="t" * 64):
-        self.hands, self.rec = make_hands()
+    def __init__(self, token="t" * 64, ui=False):
+        self.pump = Pumped() if ui else None
+        self.hands, self.rec = make_hands(self.pump.ui if ui else None)
         self.dir = tempfile.TemporaryDirectory()
         self.file = os.path.join(self.dir.name, "hands.json")
         self.token = token
@@ -51,6 +86,8 @@ class Running:
         return self
 
     def __exit__(self, *exc):
+        if self.pump:
+            self.pump.close()
         self.srv.shutdown()
         self.srv.server_close()
         self.dir.cleanup()
@@ -271,7 +308,7 @@ def test_client_does_not_resend_when_only_the_reply_was_lost():
         c = client_for(run, timeout=0.3).open()
         slow = threading.Event()
         orig = run.hands.op_click
-        run.hands.op_click = lambda msg: (orig(msg), slow.wait(1))
+        run.hands.op_click = lambda msg: (orig(msg), slow.wait(1), None)[-1]
         try:
             c.call("click", button="left", double=False)
         except VM.HandsError as e:
@@ -337,8 +374,7 @@ def test_remote_typer_splits_big_edits():
 
 
 # ---------------------------------------------------------------- the point of the split
-def test_hands_file_imports_only_the_standard_library():
-    path = os.path.join(os.path.dirname(os.path.abspath(H.__file__)), "voice_mouse_hands.py")
+def _imports(path):
     tree = ast.parse(open(path, encoding="utf-8").read())
     mods = set()
     for node in ast.walk(tree):                              # every import, including ones inside functions
@@ -346,14 +382,22 @@ def test_hands_file_imports_only_the_standard_library():
             mods |= {a.name.split(".")[0] for a in node.names}
         elif isinstance(node, ast.ImportFrom) and node.level == 0:
             mods.add(node.module.split(".")[0])
-    outside = {m for m in mods if m not in sys.stdlib_module_names}
-    assert not outside, f"the elevated file must stay standard-library only, but imports {outside}"
-    assert not {"vosk", "sherpa_onnx", "numpy", "sounddevice", "voice_mouse"} & mods
+    return mods
 
 
-def test_hands_file_is_small():
-    path = os.path.join(os.path.dirname(os.path.abspath(H.__file__)), "voice_mouse_hands.py")
-    assert sum(1 for _ in open(path, encoding="utf-8")) < 700       # keep it reviewable
+def test_elevated_files_import_only_the_standard_library():
+    here = os.path.dirname(os.path.abspath(H.__file__))
+    for name in ("voice_mouse_hands.py", "voice_mouse_ui.py"):
+        mods = _imports(os.path.join(here, name)) - {"voice_mouse_ui"}      # the hands may import their drawing module
+        outside = {m for m in mods if m not in sys.stdlib_module_names}
+        assert not outside, f"{name} must stay standard-library only, but imports {outside}"
+        assert not {"vosk", "sherpa_onnx", "numpy", "sounddevice", "voice_mouse"} & mods, name
+
+
+def test_elevated_code_is_small():
+    here = os.path.dirname(os.path.abspath(H.__file__))
+    n = sum(sum(1 for _ in open(os.path.join(here, f), encoding="utf-8")) for f in ("voice_mouse_hands.py", "voice_mouse_ui.py"))
+    assert n < 1300, n                                       # keep what runs with privileges reviewable
 
 
 def test_supervisor_gives_its_child_the_running_hands():
@@ -373,6 +417,31 @@ def test_supervisor_gives_its_child_the_running_hands():
         subprocess.run, sys.argv = real_run, argv
     cmd = seen[0]
     assert "--use-hands" in cmd and "--admin-hands" not in cmd and "--supervised-by" in cmd, cmd
+
+
+def test_find_hands_exe_prefers_the_installed_copy():
+    with tempfile.TemporaryDirectory() as pf, tempfile.TemporaryDirectory() as here:
+        saved = os.environ.get("ProgramFiles")
+        os.environ["ProgramFiles"] = pf
+        try:
+            assert VM.find_hands_exe(here) == os.path.join(pf, "VoiceMouse", "hands", "voice_mouse_hands.exe")   # none yet
+            beside = os.path.join(here, "voice_mouse_hands.exe")
+            open(beside, "w").close()
+            assert VM.find_hands_exe(here) == beside
+            os.makedirs(os.path.join(here, "hands"))
+            folder = os.path.join(here, "hands", "voice_mouse_hands.exe")
+            open(folder, "w").close()
+            assert VM.find_hands_exe(here) == folder
+            installed = os.path.join(pf, "VoiceMouse", "hands", "voice_mouse_hands.exe")
+            os.makedirs(os.path.dirname(installed))
+            open(installed, "w").close()
+            assert VM.find_hands_exe(here) == installed                                  # signed copy wins
+        finally:
+            os.environ.pop("ProgramFiles", None) if saved is None else os.environ.__setitem__("ProgramFiles", saved)
+
+
+def test_ui_access_check_is_safe_off_windows():
+    assert H.has_ui_access() in (True, False)
 
 
 def test_hands_command_line():
@@ -440,6 +509,150 @@ def test_download_models_fetches_each_model_once():
         assert got == [("vosk", "M")]
     finally:
         VM.ensure_model, VM.ensure_sherpa_model = real_model, real_sherpa
+
+
+# ---------------------------------------------------------------- drawing in the hands
+def test_ui_ops_are_refused_without_a_ui():
+    h, _ = make_hands()
+    for op in ("ui_init", "overlay_show", "overlay_hide", "pill"):
+        assert "no screen drawing" in refused(h, {"op": op})
+
+
+def test_overlay_and_pill_ops_reach_the_ui():
+    p = Pumped()
+    try:
+        h, _ = make_hands(p.ui)
+        assert h.handle({"op": "ui_init", "corner": "top-left", "minor_grid": False, "inset": 2,
+                         "adapt": True, "keep_on_top": True}) == {"ok": True}
+        assert p.ui.overlay.o["corner"] == "top-left" and p.ui.overlay.o["inset"] == 2
+        assert h.handle({"op": "overlay_show", "region": [0, 0, 1920, 1080], "mark": [5, 6]}) == {"ok": True}
+        assert p.ui.overlay.log == [("show", UI.Region(0, 0, 1920, 1080), (5, 6))]
+        h.handle({"op": "overlay_show", "region": [1, 2, 3.5, 4], "mark": None})
+        assert p.ui.overlay.log[-1] == ("show", UI.Region(1, 2, 3.5, 4), None)
+        h.handle({"op": "overlay_hide"})
+        assert p.ui.overlay.log[-1] == ("hide",)
+        out = h.handle({"op": "pill", "state": "grid", "level": 0.4, "heard": "mouse grid", "seq": 3})
+        assert out == {"ok": True, "events": []}
+        time.sleep(0.05)
+        assert p.ui.pill.log == [("set", "grid"), ("level", 0.4), ("heard", "mouse grid", 3)], p.ui.pill.log
+        p.ui.pill.on_click()                               # the user clicked the box
+        assert h.handle({"op": "pill", "level": 0.1})["events"] == ["click"]
+        assert h.handle({"op": "pill", "level": 0.1})["events"] == []          # delivered once
+    finally:
+        p.close()
+
+
+def test_pill_updates_are_merged_when_the_ui_thread_is_busy():
+    ui = H.UiHost(make_overlay=FakeOverlay, make_pill=FakePill)
+    ui.overlay, ui.pill = FakeOverlay({}), FakePill({})
+    for lvl in (0.1, 0.2, 0.9):
+        ui.update_pill({"level": lvl})
+    ui.update_pill({"state": "awake"})
+    ui.pump()
+    assert ui.pill.log == [("set", "awake"), ("level", 0.9)]               # one application of the latest values
+    ui.pump()
+    assert len(ui.pill.log) == 2
+
+
+def test_ui_requests_are_validated():
+    p = Pumped()
+    try:
+        h, _ = make_hands(p.ui)
+        for msg in ({"op": "ui_init", "corner": "middle", "minor_grid": True, "inset": 1, "adapt": True, "keep_on_top": True},
+                    {"op": "ui_init", "corner": "top-left", "minor_grid": "yes", "inset": 1, "adapt": True, "keep_on_top": True},
+                    {"op": "ui_init", "corner": "top-left", "minor_grid": True, "inset": 99, "adapt": True, "keep_on_top": True},
+                    {"op": "overlay_show", "region": [1, 2, 3]}, {"op": "overlay_show", "region": "all"},
+                    {"op": "overlay_show", "region": [0, 0, 10 ** 9, 5]},
+                    {"op": "overlay_show", "region": [0, 0, 5, 5], "mark": [1]},
+                    {"op": "pill", "state": "angry"}, {"op": "pill", "level": 2}, {"op": "pill", "level": "x"},
+                    {"op": "pill", "heard": 5}, {"op": "pill", "heard": "x" * (H.MAX_HEARD + 1)}):
+            refused(h, msg)
+        assert p.ui.overlay is None or p.ui.overlay.log == []
+    finally:
+        p.close()
+
+
+def test_a_ui_that_never_answers_is_reported_not_hung():
+    ui = H.UiHost(make_overlay=FakeOverlay, make_pill=FakePill)            # nobody calls pump()
+    h, _ = make_hands(ui)
+    t0 = time.monotonic()
+    ui_submit = ui.submit
+    ui.submit = lambda fn, timeout=0.2: ui_submit(fn, timeout)
+    out = h.handle({"op": "overlay_hide"})
+    assert out["ok"] is False and "UI thread" in out["error"] and time.monotonic() - t0 < 3
+
+
+def test_hello_says_whether_the_hands_can_draw():
+    with Running(ui=True) as run:
+        assert VM.HandsClient(run.file).open().ui is True
+    with Running(ui=False) as run:
+        assert VM.HandsClient(run.file).open().ui is False
+
+
+def test_remote_overlay_and_pill_end_to_end():
+    with Running(ui=True) as run:
+        c = VM.HandsClient(run.file).open()
+        clicks = []
+        overlay, pill = VM.start_remote_ui(c, "bottom-left", True, 1, True, True)
+        pill.on_click = lambda: clicks.append(1)
+        assert run.pump.ui.pill.o["corner"] == "bottom-left"
+        overlay.show(UI.Region(0, 0, 100, 90), (3, 4))
+        overlay.hide()
+        assert run.pump.ui.overlay.log == [("show", UI.Region(0, 0, 100, 90), (3, 4)), ("hide",)]
+        pill.set("awake")
+        pill.set_level(0.5); pill.set_heard("left click", 1); pill.flush()
+        time.sleep(0.05)
+        assert ("set", "awake") in run.pump.ui.pill.log and ("heard", "left click", 1) in run.pump.ui.pill.log
+        run.pump.ui.pill.on_click()
+        pill.flush()
+        assert clicks == [1]
+        n = len(run.pump.ui.pill.log)
+        pill.flush(); time.sleep(0.05)                       # same phrase again: only the level is resent
+        assert [e for e in run.pump.ui.pill.log[n:] if e[0] == "heard"] == []
+
+
+def test_ui_settings_are_sent_again_after_a_reconnect():
+    with Running(ui=True) as run:
+        c = VM.HandsClient(run.file).open()
+        overlay, pill = VM.start_remote_ui(c, "top-right", False, 3, False, True)
+        pill.set("grid")
+        first = run.pump.ui.pill
+        c.sock.shutdown(socket.SHUT_RDWR)                    # link drops (or the main program restarts)
+        overlay.show(UI.Region(0, 0, 10, 10), None)
+        assert run.pump.ui.pill is not first                 # ui_init was repeated by the reconnect hook
+        assert run.pump.ui.pill.state == "grid" and run.pump.ui.overlay.o["inset"] == 3
+        assert run.pump.ui.overlay.log[-1][0] == "show"
+
+
+def test_remote_pill_reports_a_lost_link_without_raising():
+    class Dead:
+        def call(self, *a, **k): raise VM.HandsError("gone")
+    pill = VM.RemotePill(Dead())
+    pill.set("awake"); pill.flush()                          # must not raise: the status box is not worth a crash
+
+
+def test_main_program_and_ui_module_share_the_same_region_and_states():
+    assert VM.Region is UI.Region and VM.StatusPill is UI.StatusPill and VM.Overlay is UI.Overlay
+    assert (VM.SLEEPING, VM.AWAKE, VM.GRID, VM.DICTATE) == UI.STATES
+    assert tuple(UI.StatusPill.COLORS) == UI.STATES
+
+
+def test_install_and_build_scripts_match_the_ui_access_design():
+    here = os.path.dirname(os.path.abspath(__file__))
+    read = lambda n: open(os.path.join(here, n), encoding="utf-8").read()
+    build = read("build.bat")
+    assert "--windows-uac-uiaccess" in build and "--standalone" in build and "tk-inter" in build
+    assert "dist\\hands" in build and "include-data-dir" not in build
+    ps = read("install_hands.ps1")
+    for needle in ("ProgramFiles", "Set-AuthenticodeSignature", "TrustedPublisher",
+                   "'Root'", "Startup", "ExecutionTimeLimit"):
+        assert needle in ps, needle
+    assert r"VoiceMouse\hands" in ps                              # where find_hands_exe() looks first
+    assert VM.find_hands_exe(os.path.join(here, "nowhere")).endswith("voice_mouse_hands.exe")
+    for bat in ("install_hands_signed.bat", "install_hands_task.bat"):
+        text = read(bat)
+        assert "install_hands.ps1" in text and "net session" in text, bat
+    assert "-Signed" in read("install_hands_signed.bat") and "-Signed" not in read("install_hands_task.bat")
 
 
 def _run_all(only=()):
