@@ -240,14 +240,23 @@ def test_depth_limit():
 def test_key_press_parsing():
     assert P("press tab") == [((), "tab", 1)]
     assert P("press down down enter") == [((), "down", 1), ((), "down", 1), ((), "enter", 1)]
-    assert P("press down twenty") == [((), "down", 20)]
+    assert P("press down twenty times") == [((), "down", 20)]
+    assert P("press down four") == [((), "down", 1), ((), "4", 1)]                  # no "times": type the number
+    assert P("press down four times") == [((), "down", 4)]                          # "times": repeat the key
+    assert P("press down twenty") == [((), "down", 1), ((), "2", 1), ((), "0", 1)]  # multi-digit: each digit
+    assert P("press tab one hundred ten") == [((), "tab", 1), ((), "1", 1), ((), "1", 1), ((), "0", 1)]
+    assert P("press five three times") == [((), "5", 3)]                             # a typed digit repeats too
+    assert P("press control c four times") == [(("ctrl",), "c", 4)]
+    assert P("press control twenty") == [(("ctrl",), "2", 1), ((), "0", 1)]         # modifiers go on the first digit
+    assert parse_commands("press down times") == [KeyPress((Chord((), "down", 1),))]   # lenient: stray "times" dropped
+    assert validate("press down times", AWAKE) is None and validate("press five times", AWAKE) is None
     assert P("press tab twenty five times") == [((), "tab", 25)]
-    assert P("press page down one hundred ten") == [((), "pagedown", 110)]
-    assert P("press down fifty enter") == [((), "down", 50), ((), "enter", 1)]
+    assert P("press page down one hundred ten times") == [((), "pagedown", 110)]
+    assert P("press down fifty times enter") == [((), "down", 50), ((), "enter", 1)]
     assert P("press control c") == [(("ctrl",), "c", 1)]
     assert P("press control shift escape") == [(("ctrl", "shift"), "escape", 1)]
     assert P("press control c control v") == [(("ctrl",), "c", 1), (("ctrl",), "v", 1)]
-    assert P("press control tab five") == [(("ctrl",), "tab", 5)]
+    assert P("press control tab five times") == [(("ctrl",), "tab", 5)]
     assert P("press function five") == [((), "f5", 1)]
     assert P("press function twelve") == [((), "f12", 1)]
     assert P("press one two three") == [((), "1", 1), ((), "2", 1), ((), "3", 1)]
@@ -273,14 +282,14 @@ def test_key_press_controller():
     kb = FakeKb(); m, o = FakeMouse(), FakeOverlay()
     c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb)
     say(c, "press tab"); assert kb.log == []
-    say(c, "start listening press control c press down twenty")
+    say(c, "start listening press control c press down twenty times")
     assert kb.log == [(("ctrl",), "c", 1), ((), "down", 20)], kb.log
     n_before = len(kb.log)
     say(c, "mouse grid press tab")                        # no key presses while the mouse grid is open
     assert c.state == GRID and len(kb.log) == n_before and o.visible
     say(c, "page down five function five"); assert len(kb.log) == n_before      # page keys are keys too
     say(c, "cancel"); assert c.state == AWAKE
-    say(c, "press down nine hundred ninety nine")
+    say(c, "press down nine hundred ninety nine times")
     assert kb.log[-1] == ((), "down", MAX_REPEAT), kb.log[-1]
 
 
@@ -378,7 +387,7 @@ def test_page_keys():
     assert PG("page down nine hundred ninety nine") == [((), "pagedown", MAX_REPEAT)]
     assert parse_commands("page down two page up one") == [KeyPress((Chord((), "pagedown", 2),)), KeyPress((Chord((), "pageup", 1),))]
     assert parse_commands("page") == [] and parse_commands("page banana") == []
-    assert PG("press page down three") == [((), "pagedown", 3)]               # old form still works
+    assert PG("press page down three times") == [((), "pagedown", 3)]         # "press" form needs "times"
     assert parse_commands("scroll down five page down")[1] == KeyPress((Chord((), "pagedown", 1),))
     mix = parse_commands("mouse grid five click page down ten")
     assert mix[:3] == ["grid", "5", "left"] and mix[3] == KeyPress((Chord((), "pagedown", 10),))
@@ -511,7 +520,7 @@ def test_strict_grammar_check():
     assert V("stop listening", AWAKE) == ["stop"] and V("stop listening", GRID) == ["stop"]
     assert V("mouse grid stop listening mouse grid", AWAKE) is None   # asleep after "stop"
     # everything the docs promise still passes
-    for good in ("press tab", "press down down enter", "press down twenty", "press control shift escape",
+    for good in ("press tab", "press down down enter", "press down twenty times", "press control shift escape",
                  "press control c control v", "press function five", "press one two three", "press windows",
                  "scroll down", "scroll left three times", "page up twenty five", "press alpha bravo see"):
         assert V(good, AWAKE) is not None, good
@@ -602,10 +611,10 @@ def test_multi_word_keys_and_punctuation():
     assert P("press exclamation mark") == [(("shift",), "1", 1)] == P("press exclamation point")
     assert P("press shift question mark") == [(("shift",), "slash", 1)]                # no duplicate Shift
     assert P("press control back space") == [(("ctrl",), "backspace", 1)]
-    assert P("press back space five") == [((), "backspace", 5)]                      # repeat count works
-    assert P("press question mark three") == [(("shift",), "slash", 3)]
+    assert P("press back space five times") == [((), "backspace", 5)]               # repeat count works
+    assert P("press question mark three times") == [(("shift",), "slash", 3)]
     assert P("press tab question mark enter") == [((), "tab", 1), (("shift",), "slash", 1), ((), "enter", 1)]
-    assert P("press left arrow twenty") == [((), "left", 20)] and P("press alt left arrow") == [(("alt",), "left", 1)]
+    assert P("press left arrow twenty times") == [((), "left", 20)] and P("press alt left arrow") == [(("alt",), "left", 1)]
     assert P("press space bar") == [((), "space", 1)] and P("press caps lock") == [((), "capslock", 1)]
     assert P("press print screen") == [((), "printscreen", 1)]
     assert P("press colon") == [(("shift",), "semicolon", 1)] and P("press apostrophe") == [((), "quote", 1)]
@@ -629,7 +638,7 @@ def test_multi_word_keys_and_punctuation():
     for phrase, (mods, key) in SYMBOL_KEYS.items():
         assert key in VK and all(m in VK for m in mods), phrase
     # the whole utterance must be valid; stray words reject it
-    for ok in ("press back space", "press question mark", "press shift question mark", "press left arrow ten",
+    for ok in ("press back space", "press question mark", "press shift question mark", "press left arrow ten times",
                "press open paren a close paren enter", "press control back space"):
         assert V(ok, AWAKE) is not None and V(ok, GRID) is None and V(ok, SLEEPING) is None, ok
     for bad in ("press question", "press question delta", "press back", "question mark", "back space",
@@ -647,7 +656,7 @@ def test_multi_word_keys_and_punctuation():
     kb = FakeKb(); m, o = FakeMouse(), FakeOverlay()
     c = Controller(Region(0, 0, 1920, 1080), m, o, keyboard=kb)
     say(c, "press question mark"); assert kb.log == []                                    # asleep
-    say(c, "start listening press back space press question mark three")
+    say(c, "start listening press back space press question mark three times")
     assert kb.log == [((), "backspace", 1), (("shift",), "slash", 3)], kb.log
 
 
@@ -663,7 +672,7 @@ def test_no_key_presses_in_grid():
     assert V("mouse grid scroll down five", AWAKE) is not None            # scrolling is still allowed
     c, m, o = make(); kb = FakeKb(); c.keyboard = kb
     say(c, "start listening mouse grid five")
-    for ignored in ("press tab", "page down", "press question mark three", "press control c"):
+    for ignored in ("press tab", "page down", "press question mark three times", "press control c"):
         say(c, ignored)
     assert kb.log == [] and c.state == GRID and o.visible               # nothing pressed, grid untouched
     say(c, "five left click press tab")                                  # a click closes the grid first
@@ -749,7 +758,7 @@ def test_dev_reload_phrase():
 
 def test_volume_keys():
     assert V("press volume up", AWAKE) == [KeyPress((Chord((), "volumeup", 1),))]
-    assert V("press volume down ten", AWAKE) == [KeyPress((Chord((), "volumedown", 10),))]
+    assert V("press volume down ten times", AWAKE) == [KeyPress((Chord((), "volumedown", 10),))]
     assert V("press mute", AWAKE) == [KeyPress((Chord((), "mute", 1),))]
     assert V("press volume up five times mute", AWAKE) == [KeyPress((Chord((), "volumeup", 5), Chord((), "mute", 1)))]
     assert V("press mute", AWAKE, media=False) is not None                    # plain key press: unaffected
@@ -760,7 +769,7 @@ def test_volume_keys():
     assert {"volumeup", "volumedown", "mute"} <= EXTENDED_KEYS
     assert ("volume", "up") in AWAKE_GRAMMAR_G.pairs and ("press", "mute") in AWAKE_GRAMMAR_G.pairs
     kb = FakeKb(); c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=kb)
-    say(c, "start listening press volume up three press mute")
+    say(c, "start listening press volume up three times press mute")
     assert kb.log == [((), "volumeup", 3), ((), "mute", 1)], kb.log
 
 

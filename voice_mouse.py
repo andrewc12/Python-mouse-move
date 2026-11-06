@@ -22,16 +22,17 @@ Keyboard (awake only; ignored while the mouse grid is open)
 ------------------------------------
   "press tab"                        one key
   "press down down enter"            keys one after another
-  "press down twenty"                a key followed by a number repeats it ("twenty times" also ok)
+  "press down four times"            a key followed by "<number> times" repeats it (down x4)
+  "press down four"                  no "times": press down, then type the digit 4 ("twenty" types 2, 0)
   "press control c"                  modifiers (control, alt, shift, windows) apply to the next key
   "press control shift escape"       ... several modifiers
   "press control c control v"        chords one after another
-  "press function five"              F5          "press page down fifty"   Page Down x50
-  "press one two three"              digit keys  (numbers straight after "press" are digits)
+  "press function five"              F5          "press page down fifty times"   Page Down x50
+  "press one two three"              digit keys  (numbers without "times" are always typed digits)
   letters: say the letter ("a", "bee", "see"...) or NATO words ("alpha", "bravo", ...)
   other keys: enter return tab escape space backspace delete insert home end up down left
               right period comma slash backslash dash equals semicolon
-  volume keys: "press volume up" / "press volume down" / "press mute"; add a number to repeat
+  volume keys: "press volume up" / "press volume down" / "press mute"; add "<number> times" to repeat
               ("press volume up ten" = ten steps). These are ordinary key presses, so --no-media
               does not turn them off.
   multi-word keys: "back space" (or "backspace"), "space bar", "caps lock", "print screen",
@@ -384,18 +385,17 @@ def build_command_grammar(mode: str = "any", media: bool = True) -> _G:
     It mirrors ALLOWED / next_state() below, and a test keeps the two in step.
     """
     units19 = [w for w, v in UNITS.items() if 1 <= v <= 9]
-    digit_words = [w for w, v in UNITS.items() if v < 10]
     tens_part = _seq(_words(TENS), _opt(_words(units19)))
     number = _alt(_words(UNITS), tens_part,
                   _seq(_words(units19), _W("hundred"), _opt(_alt(_words(UNITS), tens_part))))
     count = _seq(number, _opt(_W("times")))
     mods = _words(MODIFIERS)
-    key = _alt(_words(set(LETTER_WORDS) | set(SPOKEN_KEYS) | set(digit_words)),
+    key = _alt(_words(set(LETTER_WORDS) | set(SPOKEN_KEYS)), number,        # a number types its digits
                _seq(_W("page"), _words(["up", "down"])),
                _seq(_W("function"), _words(units19 + ["ten", "eleven", "twelve"])),
                *[_phrase(" ".join(k)) for k in SYMBOL_KEYS])
     key_item = _alt(_seq(_opt(_plus(mods)), key), _plus(mods))
-    press = _seq(_W("press"), _plus(_seq(key_item, _opt(count))))
+    press = _seq(_W("press"), _plus(_seq(key_item, _opt(_seq(number, _W("times"))))))   # "down 4 times"
     page = _seq(_W("page"), _words(["up", "down"]), _opt(count))
     scroll = _seq(_W("scroll"), _words(["up", "down", "left", "right"]), _opt(count))
     plain_clicks = _alt(*[_phrase(p) for p in ("left click", "right click", "double click")],
@@ -425,7 +425,7 @@ _CLICKS = ["left click", "right click", "double click", "click",
            "control left click", "shift left click", "alt right click", "control shift left click"]
 _COMMON_EXAMPLES = ["mouse grid", "page down", "page up", "scroll down", "scroll up",
                     "page down five", "scroll down ten times", "press tab", "press enter",
-                    "press control c", "press down twenty", "press back space", "press question mark",
+                    "press control c", "press down twenty times", "press back space", "press question mark",
                     "press left arrow", "stop listening"] + _CLICKS
 BASE_EXAMPLES = _COMMON_EXAMPLES + ["move mouse", "mark", "back", "cancel", "start listening"] + list(NUMBER_WORDS)
 GRID_BASE_EXAMPLES = [e for e in BASE_EXAMPLES if e != "start listening"]
@@ -622,7 +622,7 @@ def _parse_press(words: list[str], i: int, strict: bool = False):
     n = len(words)
     chords: list[Chord] = []
     mods: list[str] = []
-    countable = False           # last chord was a non-digit key a number can repeat
+    countable = False           # the last chord is a key that "<number> times" can repeat
     while i < n:
         w = words[i]
         if w == "[unk]":
@@ -641,20 +641,16 @@ def _parse_press(words: list[str], i: int, strict: bool = False):
             mods.append(MODIFIERS[w])
             i += 1
         elif w in UNITS or w in TENS:
-            num = parse_number(words, i) if (chords and not mods and countable) else None
-            if num:             # "down twenty [times]" -> repeat last key
-                c = chords[-1]
-                chords[-1] = Chord(c.mods, c.key, min(num[0], MAX_REPEAT))
-                i = num[1]
-                if i < n and words[i] == "times":
-                    i += 1
-                countable = False
-            elif w in UNITS and UNITS[w] < 10:      # digit key
-                chords.append(Chord(tuple(mods), str(UNITS[w])))
-                mods, countable = [], False
-                i += 1
-            else:
-                break
+            num = parse_number(words, i)
+            value, j = num
+            if chords and not mods and countable and words[j:j + 1] == ["times"]:
+                c = chords[-1]              # "down four times" -> repeat the last key
+                chords[-1] = Chord(c.mods, c.key, min(value, MAX_REPEAT))
+                i, countable = j + 1, False
+            else:                           # "down four" -> press down, then type 4 ("twenty" = 2, 0)
+                for k, digit in enumerate(str(value)):
+                    chords.append(Chord(tuple(mods) if k == 0 else (), digit))
+                i, mods, countable = j, [], True
         else:
             sym = _parse_symbol(words, i)
             if sym:                 # "question mark", "back space", "left arrow" ...
