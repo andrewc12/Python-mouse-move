@@ -141,6 +141,13 @@ Windows Terminal (the Windows 11 default), where only the tab can be closed. A c
 --windows-console-mode=disable in build_exe.bat / build_onefile.bat. With no console, messages go
 nowhere; heard.jsonl (--log) still records what was recognised.
 
+Log and crashes: everything the console shows (with time stamps, and any traceback or native crash)
+is also written to voice_mouse.log next to the program (--console-log FILE, --no-console-log), so it
+is still there with no console or after a crash. The program runs as a small supervisor plus the
+real program: if the real one crashes (or its speech thread dies) it is started again after 2 s,
+already listening, up to 5 times a minute; Ctrl+C, closing the window and the reload phrase end it for good.
+--no-restart runs it as a single process.
+
 Run:  python voice_mouse.py            (downloads the ~40 MB model on first run)
       python voice_mouse.py --list-devices
 """
@@ -1137,7 +1144,14 @@ def make_dpi_aware() -> None:
 def self_command() -> list[str]:
     """Command line that starts this program again exactly as it was started."""
     frozen = "__compiled__" in globals() or getattr(sys, "frozen", False)
-    args = list(sys.argv[1:])
+    args, skip = [], False
+    for a in sys.argv[1:]:                  # --supervised-by belongs to ONE supervisor: never pass it on
+        if skip:
+            skip = False
+        elif a == "--supervised-by":
+            skip = True
+        elif not a.startswith("--supervised-by="):
+            args.append(a)
     if frozen:
         return [os.path.abspath(sys.argv[0]), *args]
     return [sys.executable, os.path.abspath(sys.argv[0]), *args]
@@ -3141,6 +3155,173 @@ class DictationSession:
 
 
 # --------------------------------------------------------------------------
+# Running unattended: a log file with everything the console shows, and a supervisor that restarts
+# the program if it crashes.
+# --------------------------------------------------------------------------
+def app_dir() -> str:
+    frozen = "__compiled__" in globals() or getattr(sys, "frozen", False)
+    return os.path.dirname(os.path.abspath(sys.argv[0] if frozen else __file__))
+
+
+class Tee:
+    """A stand-in for sys.stdout / sys.stderr that also writes every line, with a time stamp, to a
+    log file. The original stream may be None (pythonw has no console): then only the file gets it."""
+
+    def __init__(self, stream, fh, tag: str = ""):
+        self.stream, self.fh, self.tag, self._buf = stream, fh, tag, ""
+
+    def write(self, text) -> int:
+        text = str(text)
+        if self.stream is not None:
+            try:
+                self.stream.write(text)
+            except Exception:
+                pass
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._emit(line)
+        return len(text)
+
+    def _emit(self, line: str) -> None:
+        try:                                 # one write per line, so two processes rarely interleave
+            self.fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {self.tag}{line}\n")
+            self.fh.flush()
+        except Exception:
+            pass
+
+    def flush(self) -> None:
+        if self._buf:                        # a partial line is still worth keeping
+            line, self._buf = self._buf, ""
+            self._emit(line)
+        if self.stream is not None:
+            try:
+                self.stream.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        return bool(self.stream is not None and getattr(self.stream, "isatty", lambda: False)())
+
+    def __getattr__(self, name):             # encoding, fileno, ... come from the real stream
+        if self.stream is None:
+            raise AttributeError(name)
+        return getattr(self.stream, name)
+
+
+def rotate_log(path: str, max_bytes: int = 5_000_000) -> None:
+    """Keep the log from growing for ever: past max_bytes it becomes <path>.1 (one old copy is kept)."""
+    try:
+        if os.path.getsize(path) > max_bytes:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+
+
+def start_console_log(path: str, rotate: bool = True):
+    """Copy everything printed (and every traceback) to `path`, from now on. Also records native
+    crashes (a segfault inside a library), which Python cannot otherwise print. Returns the file."""
+    if rotate:
+        rotate_log(path)
+    fh = open(path, "a", encoding="utf-8", errors="replace")
+    sys.stdout = Tee(sys.stdout, fh)
+    sys.stderr = Tee(sys.stderr, fh, "[err] ")
+    try:
+        import faulthandler
+        faulthandler.enable(fh)
+    except Exception:
+        pass
+    print(f"==== voice_mouse started (pid {os.getpid()}): {' '.join(sys.argv)}")
+    return fh
+
+
+def install_crash_hooks(exit=os._exit) -> None:
+    """If the speech thread dies the program is deaf but looks alive: stop it with a failure code so
+    the supervisor restarts it. (Any other thread's traceback is just printed, as usual.)"""
+    def hook(args) -> None:
+        print(f"Exception in thread {getattr(args.thread, 'name', '?')}:", file=sys.stderr)
+        traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)   # to the log too
+        if isinstance(args.thread, SpeechThread):
+            print("fatal: the speech thread died; exiting so it can be restarted")
+            exit(1)
+    threading.excepthook = hook
+    return hook
+
+
+def parent_alive(pid: int) -> bool:
+    """Is process `pid` still running?"""
+    if sys.platform == "win32":
+        import ctypes
+        k = ctypes.windll.kernel32
+        k.OpenProcess.restype = ctypes.c_void_p
+        h = k.OpenProcess(0x00100000, False, pid)            # SYNCHRONIZE
+        if not h:
+            return False
+        try:
+            return k.WaitForSingleObject(ctypes.c_void_p(h), 0) == 0x102     # WAIT_TIMEOUT: still running
+        finally:
+            k.CloseHandle(ctypes.c_void_p(h))
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def watch_parent(pid: int, interval: float = 2.0, gone=lambda: os._exit(0)) -> threading.Thread:
+    """In the supervised program: if the supervisor goes away (closed, killed) quit too, instead of
+    carrying on as an orphan that nothing can restart or stop."""
+    def run() -> None:
+        while parent_alive(pid):
+            time.sleep(interval)
+        gone()
+    t = threading.Thread(target=run, daemon=True, name="parent-watch")
+    t.start()
+    return t
+
+
+def restart_command(cmd: list[str], restarted: bool) -> list[str]:
+    """The command for one launch: after a crash the program comes back already listening (it was
+    almost certainly in use), instead of asleep waiting for "start listening"."""
+    return cmd + ["--start-awake"] if restarted and "--start-awake" not in cmd else list(cmd)
+
+
+def supervise(launch=None, max_crashes: int = 5, window: float = 60.0, delay: float = 2.0,
+              sleep=time.sleep, clock=time.monotonic) -> int:
+    """Run the program as a child process and start it again whenever it crashes (exit code other
+    than 0). A normal exit (0: Ctrl+C, the reload phrase) is final. More than `max_crashes` crashes
+    within `window` seconds means something is badly wrong, so it stops instead of looping."""
+    import subprocess
+    cmd = [*self_command(), "--supervised-by", str(os.getpid())]
+    launches = [0]
+
+    def run_child() -> int:
+        launches[0] += 1
+        return subprocess.run(restart_command(cmd, launches[0] > 1)).returncode
+    launch = launch or run_child
+    crashes: list[float] = []
+    print(f"supervisor: starting (pid {os.getpid()}); it restarts the program if it crashes")
+    while True:
+        try:
+            code = launch()
+        except KeyboardInterrupt:
+            return 0
+        if code == 0:
+            print("supervisor: the program exited normally")
+            return 0
+        now = clock()
+        crashes = [t for t in crashes if now - t < window] + [now]
+        if len(crashes) > max_crashes:
+            print(f"supervisor: {len(crashes)} crashes within {window:g}s (last exit code {code}); giving up")
+            return code
+        print(f"supervisor: the program crashed (exit code {code}); restarting in {delay:g}s "
+              f"[{len(crashes)}/{max_crashes} recent crashes]")
+        sleep(delay)
+
+
+# --------------------------------------------------------------------------
 def main() -> None:
     ap = argparse.ArgumentParser(description="Voice-controlled mouse grid for Windows")
     ap.add_argument("--model", help="path to an unpacked Vosk model (default: auto-download)")
@@ -3222,6 +3403,13 @@ def main() -> None:
     ap.add_argument("--dictate-model-dir",
                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"),
                     help="dictation: where its models are kept / downloaded (default: ./models)")
+    ap.add_argument("--console-log", metavar="FILE", default=os.path.join(app_dir(), "voice_mouse.log"),
+                    help="write everything the console shows, with time stamps and any crash, to FILE "
+                         "(default: voice_mouse.log next to the program; kept to about 5 MB + one old copy)")
+    ap.add_argument("--no-console-log", action="store_true", help="don't write the console log file")
+    ap.add_argument("--no-restart", action="store_true",
+                    help="don't restart the program automatically if it crashes")
+    ap.add_argument("--supervised-by", type=int, help=argparse.SUPPRESS)
     ap.add_argument("--start-awake", action="store_true")
     ap.add_argument("--corner", choices=StatusPill.CORNERS, default="bottom-right",
                     help="screen corner the status box starts in (the arrow button cycles through all four)")
@@ -3239,6 +3427,13 @@ def main() -> None:
     if sys.platform != "win32":
         sys.exit("This tool controls the Windows mouse; run it on Windows.")
 
+    if not args.no_console_log:
+        try:
+            start_console_log(args.console_log, rotate=not args.supervised_by)
+        except OSError as e:
+            print(f"warning: cannot write the console log {args.console_log}: {e}")
+    install_crash_hooks()
+
     try:
         import sounddevice, vosk  # noqa: F401
     except ImportError as e:
@@ -3255,6 +3450,10 @@ def main() -> None:
         print("Could not get administrator rights (prompt declined?); carrying on without them.")
     if args.hide_console:
         hide_console()                   # after the start-up checks above, so their errors are still seen
+    if args.supervised_by:               # we are the child: follow the supervisor out
+        watch_parent(args.supervised_by)
+    elif not args.no_restart:            # we are the supervisor: run the real program and restart it
+        sys.exit(supervise())
 
     import tkinter as tk
     make_dpi_aware()

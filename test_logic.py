@@ -1315,6 +1315,132 @@ def test_speech_loop_returns_to_vosk_when_dictation_ends():
     assert ScriptRec.resets >= 1                                       # recogniser cleared on the way back
 
 
+# ---- running unattended: the log file and the crash supervisor -------------------------------------
+def test_tee_copies_console_output_to_a_log_file():
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.log")
+        shown = io.StringIO()
+        with open(path, "a", encoding="utf-8") as fh:
+            tee = Tee(shown, fh)
+            print("hello", "world", file=tee)
+            tee.write("partial ")
+            tee.write("line\nsecond\n")
+            tee.write("unfinished"); tee.flush()
+            err = Tee(None, fh, "[err] ")                      # pythonw: no console at all
+            print("no console", file=err)
+            assert err.isatty() is False
+        lines = open(path, encoding="utf-8").read().splitlines()
+        assert [l[20:] for l in lines] == ["hello world", "partial line", "second", "unfinished", "[err] no console"], lines
+        assert lines[0][:4].isdigit() and lines[0][4] == "-" and lines[0][13] == ":"     # starts with a time stamp
+        assert shown.getvalue() == "hello world\npartial line\nsecond\nunfinished"      # the console still gets it all
+
+
+def test_rotate_log_keeps_one_old_copy():
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "x.log")
+        open(p, "w").write("a" * 100)
+        rotate_log(p, max_bytes=1000); assert os.path.exists(p) and not os.path.exists(p + ".1")
+        rotate_log(p, max_bytes=50)
+        assert not os.path.exists(p) and open(p + ".1").read() == "a" * 100
+        rotate_log(p, max_bytes=50)                                                  # nothing there: no error
+
+
+def test_console_log_records_prints_and_errors():
+    import tempfile, os, faulthandler
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "console.log")
+        try:
+            fh = start_console_log(path)
+            print("recognised: left click")
+            print("something broke", file=sys.stderr)
+        finally:
+            faulthandler.disable()
+            fh.close()
+            sys.stdout, sys.stderr = saved
+        text = open(path, encoding="utf-8").read()
+    assert "voice_mouse started" in text and "recognised: left click" in text and "[err] something broke" in text
+
+
+def test_self_command_never_passes_on_the_supervisor_flag():
+    _argv = sys.argv
+    try:
+        sys.argv = ["voice_mouse.py", "--supervised-by", "1234", "--corner", "top-left"]
+        assert self_command()[2:] == ["--corner", "top-left"]
+        sys.argv = ["voice_mouse.py", "--supervised-by=77", "--admin"]
+        assert self_command()[2:] == ["--admin"] and relaunch_command().count("--start-awake") == 1
+    finally:
+        sys.argv = _argv
+
+
+def _launches(*codes):
+    it = iter(codes)
+    def launch():
+        c = next(it)
+        if c == "ctrl-c":
+            raise KeyboardInterrupt
+        return c
+    return launch
+
+
+def test_supervisor_restarts_a_crashed_program_but_not_a_normal_exit():
+    sleeps = []
+    assert supervise(_launches(0), sleep=sleeps.append) == 0 and sleeps == []            # normal exit: final
+    assert supervise(_launches(1, 3221225477, 0), sleep=sleeps.append) == 0              # two crashes, then a clean exit
+    assert sleeps == [2.0, 2.0]
+    assert supervise(_launches(1, "ctrl-c"), sleep=sleeps.append) == 0 and len(sleeps) == 3   # Ctrl+C is not a crash
+
+
+def test_a_restarted_program_comes_back_listening():
+    base = ["python", "voice_mouse.py", "--corner", "top-left", "--supervised-by", "9"]
+    assert restart_command(base, False) == base                                  # first launch: as the user started it
+    assert restart_command(base, True) == base + ["--start-awake"]
+    assert restart_command(base + ["--start-awake"], True).count("--start-awake") == 1
+
+
+def test_supervisor_gives_up_on_a_crash_storm():
+    now = [0.0]
+    def clock(): return now[0]
+    sleeps = []
+    code = supervise(_launches(*([7] * 20)), max_crashes=3, sleep=lambda s: (sleeps.append(s), now.__setitem__(0, now[0] + s)),
+                     clock=clock)
+    assert code == 7 and len(sleeps) == 3                                                # 4th crash inside the window: stop
+    now[0], sleeps[:] = 0.0, []
+    slow = supervise(_launches(*([7] * 4 + [0])), max_crashes=3, window=5.0,
+                     sleep=lambda s: now.__setitem__(0, now[0] + 10), clock=clock)       # crashes far apart: keeps going
+    assert slow == 0
+
+
+def test_parent_alive_and_watch_parent():
+    import subprocess
+    assert parent_alive(os.getpid())
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.4)"])
+    gone = threading.Event()
+    watch_parent(child.pid, interval=0.05, gone=gone.set)
+    assert not gone.is_set()
+    child.wait()
+    assert gone.wait(3) and not parent_alive(child.pid)                                  # the "supervisor" ended: we notice
+
+
+def test_crash_hook_exits_only_when_the_speech_thread_dies():
+    import types
+    saved_hook, saved_err = threading.excepthook, sys.stderr
+    sys.stderr = io.StringIO()
+    try:
+        exits = []
+        hook = install_crash_hooks(exit=exits.append)
+        boom = RuntimeError("boom")
+        hook(types.SimpleNamespace(exc_type=RuntimeError, exc_value=boom, exc_traceback=None, thread=threading.current_thread()))
+        assert exits == []                                                                # any other thread: just a traceback
+        hook(types.SimpleNamespace(exc_type=RuntimeError, exc_value=boom, exc_traceback=None, thread=mk()))
+        assert exits == [1]                                                               # speech thread: restart the program
+    finally:
+        threading.excepthook, sys.stderr = saved_hook, saved_err
+
+
 def _run_all(only=()):
     tests = [(n, f) for n, f in sorted(globals().items(), key=lambda kv: getattr(kv[1], "__code__", None) and kv[1].__code__.co_firstlineno or 0)
              if n.startswith("test_") and callable(f) and (not only or any(w in n for w in only))]
