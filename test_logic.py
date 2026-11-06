@@ -428,7 +428,8 @@ print("next_state matches controller ok")
 
 # ---- per-state grammars: what an utterance may START with, and which pairs are taught ----
 assert AWAKE_GRAMMAR_G.first == {"click", "left", "right", "double", "mouse", "page", "press",
-                                 "scroll", "stop", "media", "super", "minimize", "maximize", "restore"}, AWAKE_GRAMMAR_G.first
+                                 "scroll", "stop", "media", "super", "minimize", "maximize", "restore",
+                                 "control", "alt", "shift"}, AWAKE_GRAMMAR_G.first
 assert {"five", "mark", "cancel", "back", "move"} <= GRID_GRAMMAR_G.first
 assert not ({"five", "mark", "cancel", "back", "move"} & AWAKE_GRAMMAR_G.first)
 assert "start" not in GRID_GRAMMAR_G.first | AWAKE_GRAMMAR_G.first
@@ -678,3 +679,56 @@ assert VK["contextmenu"] == 0x5D and "contextmenu" in EXTENDED_KEYS
 kb = FakeKb(); c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay(), keyboard=kb)
 say(c, "start listening press context menu"); assert kb.log == [((), "contextmenu", 1)]
 print("window commands + context menu ok")
+
+
+# ================= modifier clicks =================
+for text, want in (("control left click", ModClick("left", ("ctrl",))), ("shift click", ModClick("left", ("shift",))),
+                   ("alt right click", ModClick("right", ("alt",))), ("control double click", ModClick("double", ("ctrl",))),
+                   ("control shift left click", ModClick("left", ("ctrl", "shift"))),
+                   ("shift control right click", ModClick("right", ("shift", "ctrl")))):
+    assert V(text, AWAKE) == [want] and V(text, GRID) == [want], text      # works awake and in the grid
+    assert V(text, SLEEPING) is None
+assert V("control left click control left click", AWAKE) == [ModClick("left", ("ctrl",))] * 2
+assert V("mouse grid five control left click", AWAKE) == ["grid", "5", ModClick("left", ("ctrl",))]
+for bad in ("control", "control shift", "windows left click", "control press tab", "control mark", "shift page down"):
+    assert V(bad, AWAKE) is None, bad
+# a modifier at the end of a "press" belongs to the click that follows, not to a key press
+assert V("press tab control left click", AWAKE) == [KeyPress((Chord((), "tab", 1),)), ModClick("left", ("ctrl",))]
+assert V("press control c control left click", AWAKE) == [KeyPress((Chord(("ctrl",), "c", 1),)), ModClick("left", ("ctrl",))]
+assert V("press shift tab", AWAKE) == [KeyPress((Chord(("shift",), "tab", 1),))]          # real chords unchanged
+assert V("press windows left click", AWAKE) == [KeyPress((Chord((), "win", 1),)), "left"]
+assert V("press tab left click", AWAKE) == [KeyPress((Chord((), "tab", 1),)), "left"]
+assert "control" in GRID_GRAMMAR_G.first and ("control", "left") in GRID_GRAMMAR_G.pairs
+
+class HoldKb(FakeKb):
+    def hold(self, mods): self.log.append(("hold", tuple(mods)))
+    def release(self, mods): self.log.append(("release", tuple(mods)))
+class LogMouse(FakeMouse):
+    def __init__(self, log): super().__init__(); self.log = log
+    def click(self, button, double=False): self.log.append(("click", button, double))
+    def drag(self, button, a, b): self.log.append(("drag", button))
+    def move(self, x, y): pass                                  # keep the log to holds / clicks
+hk = HoldKb(); lm = LogMouse(hk.log); o = FakeOverlay()
+c = Controller(Region(0, 0, 1920, 1080), lm, o, keyboard=hk)
+say(c, "start listening control left click")
+assert hk.log == [("hold", ("ctrl",)), ("click", "left", False), ("release", ("ctrl",))], hk.log
+hk.log.clear(); say(c, "shift control double click")
+assert hk.log == [("hold", ("shift", "ctrl")), ("click", "left", True), ("release", ("shift", "ctrl"))], hk.log
+hk.log.clear(); say(c, "alt right click")
+assert hk.log == [("hold", ("alt",)), ("click", "right", False), ("release", ("alt",))]
+hk.log.clear(); say(c, "left click"); assert hk.log == [("click", "left", False)]          # plain click: nothing held
+hk.log.clear(); say(c, "mouse grid five shift left click")
+assert c.state == AWAKE and not o.visible
+assert hk.log == [("hold", ("shift",)), ("click", "left", False), ("release", ("shift",))], hk.log
+hk.log.clear(); say(c, "mouse grid five mark one control left click")                      # modified drag
+assert hk.log == [("hold", ("ctrl",)), ("drag", "left"), ("release", ("ctrl",))], hk.log
+class BoomMouse(FakeMouse):
+    def click(self, *a, **k): raise RuntimeError("boom")
+hk = HoldKb(); c = Controller(Region(0, 0, 1920, 1080), BoomMouse(), FakeOverlay(), keyboard=hk)
+c.state = AWAKE
+try: c.handle(ModClick("left", ("ctrl",)))
+except RuntimeError: pass
+assert hk.log[-1] == ("release", ("ctrl",))                                                 # never left held
+c = Controller(Region(0, 0, 1920, 1080), FakeMouse(), FakeOverlay()); c.state = AWAKE
+c.handle(ModClick("left", ("ctrl",)))                                                       # no keyboard: still clicks
+print("modifier clicks ok")

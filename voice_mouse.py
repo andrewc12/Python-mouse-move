@@ -49,6 +49,14 @@ Scrolling (awake, or inside the grid; scrolls whatever window is under the curso
   "scroll down ten scroll up two"      chainable
 Everything can be chained in one breath: "mouse grid five one left click press hello" style.
 
+Modified clicks (awake or in the grid): say the modifier(s) first
+  "control left click"                 ctrl-click        "shift left click"   shift-click
+  "control shift left click"           chords of control / shift / alt, in any order
+  "alt right click"  "control double click"  "shift click" (= shift + left click)
+  The modifiers are held only for that click and released straight after. In the grid the click
+  happens at the aimed spot as usual ("... one five control left click"), and "mark" + a modified
+  click drags with the modifiers held. Windows is not offered as a click modifier.
+
 Windows (awake only; acts on the window you are using, never the desktop or taskbar)
   "minimize window"                    minimise it to the taskbar
   "maximize window"                    maximise it
@@ -116,6 +124,10 @@ NUMBER_WORDS = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
     "six": 6, "seven": 7, "eight": 8, "nine": 9,
 }
+
+# Modifiers that may precede a click ("control shift left click"). Not "windows": tapping the Windows
+# key on its own can open the Start menu.
+CLICK_MODIFIERS = {"control", "alt", "shift"}
 
 # "<verb> window": act on the foreground window. Phrases only, never the bare verb, so a stray word
 # cannot minimise whatever you are working in.
@@ -346,8 +358,9 @@ def build_command_grammar(mode: str = "any", media: bool = True) -> _G:
     press = _seq(_W("press"), _plus(_seq(key_item, _opt(count))))
     page = _seq(_W("page"), _words(["up", "down"]), _opt(count))
     scroll = _seq(_W("scroll"), _words(["up", "down", "left", "right"]), _opt(count))
-    clicks = _alt(*[_phrase(p) for p in ("left click", "right click", "double click")],
-                  _words(["click", "left", "right", "double"]))
+    plain_clicks = _alt(*[_phrase(p) for p in ("left click", "right click", "double click")],
+                        _words(["click", "left", "right", "double"]))
+    clicks = _alt(plain_clicks, _seq(_plus(_words(sorted(CLICK_MODIFIERS))), plain_clicks))
     grid_only = _alt(_phrase("move mouse"), _words(["move", "mark", "back", "cancel"] + list(NUMBER_WORDS)))
     stop, mouse_grid = _phrase("stop listening"), _phrase("mouse grid")
     common = [page, scroll, press, clicks, mouse_grid, stop]
@@ -365,7 +378,8 @@ def build_command_grammar(mode: str = "any", media: bool = True) -> _G:
     raise ValueError(mode)
 
 
-_CLICKS = ["left click", "right click", "double click", "click"]
+_CLICKS = ["left click", "right click", "double click", "click",
+           "control left click", "shift left click", "alt right click", "control shift left click"]
 _COMMON_EXAMPLES = ["mouse grid", "page down", "page up", "scroll down", "scroll up",
                     "page down five", "scroll down ten times", "press tab", "press enter",
                     "press control c", "press down twenty", "press back space", "press question mark",
@@ -495,6 +509,12 @@ class KeyPress:
 
 
 @dataclass(frozen=True)
+class ModClick:
+    kind: str                   # left / right / double
+    mods: tuple[str, ...]       # ctrl / alt / shift, held for the click
+
+
+@dataclass(frozen=True)
 class Media:
     action: str         # play_pause / stop / next / previous / fast_forward / rewind
 
@@ -547,6 +567,13 @@ def _parse_symbol(words: list[str], i: int):
     return None
 
 
+def _starts_click(words: list[str], j: int) -> bool:
+    """Do the words from j begin an explicit click ("left click", "right click", "double click" or
+    "click")? Bare "left"/"right" are NOT counted: inside "press" they are arrow keys."""
+    return words[j:j + 1] == ["click"] or tuple(words[j:j + 2]) in (
+        ("left", "click"), ("right", "click"), ("double", "click"))
+
+
 def _parse_press(words: list[str], i: int, strict: bool = False):
     """Parse everything after 'press'. Returns (list[Chord], next_i)."""
     n = len(words)
@@ -562,6 +589,12 @@ def _parse_press(words: list[str], i: int, strict: bool = False):
         elif w in ("left", "right", "double") and words[i + 1:i + 2] == ["click"]:
             break               # a mouse click, not an arrow key
         elif w in MODIFIERS:
+            j = i
+            while j < n and words[j] in CLICK_MODIFIERS:
+                j += 1
+            if _starts_click(words, j):
+                mods = []           # "press tab control left click": those modifiers belong to the click
+                break
             mods.append(MODIFIERS[w])
             i += 1
         elif w in UNITS or w in TENS:
@@ -647,6 +680,25 @@ def parse_commands(text, min_word_conf: float = 0.0, strict: bool = False, media
                 if i < len(words) and words[i] == "times":
                     i += 1
             out.append(KeyPress((Chord((), key, count),)))
+            continue
+        if words[i] in CLICK_MODIFIERS:                    # "control shift left click"
+            j, mods = i, []
+            while j < len(words) and words[j] in CLICK_MODIFIERS:
+                mods.append(MODIFIERS[words[j]])
+                j += 1
+            kind, used = None, 0
+            two = tuple(words[j:j + 2])
+            if two in (("left", "click"), ("right", "click"), ("double", "click")):
+                kind, used = two[0], 2
+            elif words[j:j + 1] == ["click"]:
+                kind, used = "left", 1
+            elif words[j:j + 1] in (["left"], ["right"], ["double"]):   # "click" dropped by the recogniser
+                kind, used = words[j], 1
+            if kind:
+                out.append(ModClick(kind, tuple(dict.fromkeys(mods))))
+            else:
+                bad = True                                  # modifier(s) with nothing to click
+            i = j + used
             continue
         if tuple(words[i:i + len(RELOAD_PHRASE)]) == RELOAD_PHRASE:      # whole phrase or nothing
             out.append("reload")
@@ -791,6 +843,8 @@ def command_token(cmd) -> str:
         return "scroll"
     if isinstance(cmd, Media):
         return "media"
+    if isinstance(cmd, ModClick):
+        return cmd.kind                 # a modified click is allowed wherever the plain click is
     return cmd
 
 
@@ -857,11 +911,23 @@ class Controller:
         self.nav.reset()
         self._set(new_state)
 
-    def _click_here(self, cmd: str) -> None:
+    def _hold(self, mods) -> None:
+        if mods and self.keyboard and hasattr(self.keyboard, "hold"):
+            self.keyboard.hold(mods)
+
+    def _release(self, mods) -> None:
+        if mods and self.keyboard and hasattr(self.keyboard, "release"):
+            self.keyboard.release(mods)
+
+    def _click_here(self, cmd: str, mods=()) -> None:
         """Click at the current cursor position (used while awake, with no grid open)."""
         button = "left" if cmd == "double" else cmd
-        self.mouse.click(button, double=(cmd == "double"))
-        print(f"{cmd} click at cursor")
+        self._hold(mods)
+        try:
+            self.mouse.click(button, double=(cmd == "double"))
+        finally:
+            self._release(mods)
+        print(f"{'+'.join(mods) + '+' if mods else ''}{cmd} click at cursor")
 
     def handle(self, cmd) -> None:
         # One gate decides whether a command is appropriate right now (see ALLOWED); anything else
@@ -880,6 +946,10 @@ class Controller:
             if self.media:
                 self.media.send(cmd.action)
             return
+
+        mods: tuple = ()
+        if isinstance(cmd, ModClick):                  # same as the plain click, with keys held
+            mods, cmd = cmd.mods, cmd.kind
 
         if isinstance(cmd, Scroll):
             self.mouse.scroll(cmd.direction, cmd.amount)
@@ -910,7 +980,7 @@ class Controller:
                 self._set(GRID)
                 self._show()
             elif cmd in ("left", "right", "double"):
-                self._click_here(cmd)       # click wherever the cursor already is, no grid needed
+                self._click_here(cmd, mods)   # click wherever the cursor already is, no grid needed
             return
 
         # ---- GRID ----
@@ -934,11 +1004,16 @@ class Controller:
             self.overlay.hide()          # make sure the overlay never eats the click
             time.sleep(0.08)
             self.mouse.move(*target)
-            print(f"{cmd} click at {target}" + (f" (drag from {self.mark})" if self.mark and cmd != "double" else ""))
-            if self.mark and cmd != "double":
-                self.mouse.drag(cmd, self.mark, target)
-            else:
-                self.mouse.click("left" if cmd == "double" else cmd, double=(cmd == "double"))
+            print((f"{'+'.join(mods)}+" if mods else "") + f"{cmd} click at {target}"
+                  + (f" (drag from {self.mark})" if self.mark and cmd != "double" else ""))
+            self._hold(mods)
+            try:
+                if self.mark and cmd != "double":
+                    self.mouse.drag(cmd, self.mark, target)
+                else:
+                    self.mouse.click("left" if cmd == "double" else cmd, double=(cmd == "double"))
+            finally:
+                self._release(mods)
             self._leave_grid(AWAKE)
         elif cmd == "move":
             target = self.nav.current.center
@@ -1124,6 +1199,24 @@ class WinMedia:
             hwnd = self.u.GetForegroundWindow()
             self.u.PostMessageW(hwnd, 0x0319, hwnd or 0, MEDIA_APPCOMMAND[action] << 16)   # WM_APPCOMMAND
         print(f"media {action}")
+
+
+def _kb_hold(self, mods) -> None:
+    """Press and keep down the modifier keys (used around a mouse click)."""
+    for m in mods:
+        self._event(m, False)
+    if mods:
+        time.sleep(0.04)
+
+
+def _kb_release(self, mods) -> None:
+    for m in reversed(mods):
+        self._event(m, True)
+    if mods:
+        time.sleep(0.02)
+
+
+WinKeyboard.hold, WinKeyboard.release = _kb_hold, _kb_release
 
 
 class HotkeyWatcher:
