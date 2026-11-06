@@ -1010,9 +1010,10 @@ def make_click_through(widget, clickable: bool = False) -> None:
 class Overlay:
     KEY = "#010203"      # colour treated as fully transparent
 
-    def __init__(self, root, screen: Region):
+    def __init__(self, root, screen: Region, minor_grid: bool = True):
         import tkinter as tk
         self.tk, self.screen = tk, screen
+        self.minor_grid = minor_grid          # thin 9x9 preview lines inside the 3x3 grid
         self.win = tk.Toplevel(root)
         self.win.overrideredirect(True)
         self.win.geometry(f"{int(screen.w)}x{int(screen.h)}+{int(screen.x)}+{int(screen.y)}")
@@ -1030,7 +1031,16 @@ class Overlay:
     def show(self, r: Region, mark: tuple[int, int] | None) -> None:
         c, s = self.canvas, self.screen
         c.delete("all")
-        # grid (the rest of the screen is left undimmed)
+        # minor grid: each of the nine cells split 3x3 again (a preview of the next zoom level),
+        # thin and dashed so it reads as secondary. Skipped when the minor cells would be tiny.
+        if self.minor_grid and min(r.w, r.h) / 9 >= 4:
+            minor = dict(fill="#ff9a9a", width=1, dash=(3, 4))
+            for k in range(1, 9):
+                if k % 3 == 0:
+                    continue                      # those are the major lines, drawn below
+                c.create_line(r.x + r.w * k / 9, r.y, r.x + r.w * k / 9, r.y + r.h, **minor)
+                c.create_line(r.x, r.y + r.h * k / 9, r.x + r.w, r.y + r.h * k / 9, **minor)
+        # major grid (the rest of the screen is left undimmed)
         c.create_rectangle(r.x, r.y, r.x + r.w, r.y + r.h, outline="#ff2d2d", width=3)
         for i in (1, 2):
             c.create_line(r.x + r.w * i / 3, r.y, r.x + r.w * i / 3, r.y + r.h, fill="#ff2d2d", width=2)
@@ -1498,6 +1508,8 @@ def main() -> None:
     ap.add_argument("--no-early-digits", action="store_true",
                     help="in the grid, wait for the end of the whole utterance before zooming "
                          "(default: zoom on each number as soon as it is recognised)")
+    ap.add_argument("--no-minor-grid", action="store_true",
+                    help="don't draw the thin dashed 9x9 lines that preview the next zoom level")
     ap.add_argument("--start-awake", action="store_true")
     ap.add_argument("--corner", choices=StatusPill.CORNERS, default="bottom-right",
                     help="screen corner the status box starts in (the arrow button cycles through all four)")
@@ -1530,7 +1542,7 @@ def main() -> None:
     root.withdraw()
     screen = primary_screen()
     pill = StatusPill(root, screen, corner=args.corner)
-    overlay = Overlay(root, screen)
+    overlay = Overlay(root, screen, minor_grid=not args.no_minor_grid)
     ctl = Controller(screen, WinMouse(), overlay, on_state=pill.set, keyboard=WinKeyboard())
     if args.start_awake:
         ctl.handle("start")
