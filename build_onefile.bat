@@ -30,3 +30,5 @@ rem Add --windows-uac-admin to make the exe always ask for administrator rights 
 rem Dictation (the "dictate" command) is built in: the two sherpa_onnx lines above add it.
 rem   They need: py -m pip install sherpa-onnx webrtcvad-wheels numpy   (delete the two sherpa_onnx lines to build without dictation).
 rem   Copy the dictation models folder (sherpa-onnx-*) next to the exe too, or the first use downloads about 750 MB.
+rem The input helper voice_mouse_hands.py is imported by voice_mouse.py and is built in. To elevate ONLY the helper,
+rem also run build_hands.bat and keep voice_mouse_hands.exe next to this exe, then start with --admin-hands.

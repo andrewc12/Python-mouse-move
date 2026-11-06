@@ -134,6 +134,13 @@ other things hog the CPU (--priority normal / above / high; real-time is deliber
 Elevated windows: Windows (UIPI) stops a normal program from clicking or typing into windows that
 run as administrator, such as Task Manager or an installer. Start with --admin (or right-click ->
 Run as administrator) to reach them. It has no effect on windows that were not elevated.
+That elevates the whole program, models included. The safer way is to elevate only the small
+voice_mouse_hands.py, which does all the clicking, keys and typing and imports nothing but the
+standard library: start with --admin-hands (the program starts it elevated if it is not running),
+or run voice_mouse_hands.py --admin yourself and start this with --use-hands. Speech recognition,
+the models and the screen overlay then run as your normal user. Anything running as you can still
+read the hands' token file and ask them to press keys, so this limits the elevated code; it does
+not make an untrusted program on your account harmless.
 
 No console window: run it with  pythonw voice_mouse.py  (or double-click a .pyw copy) and there is
 never a console. --hide-console hides the console after start-up instead; it does not work inside
@@ -161,6 +168,7 @@ import math
 import os
 import queue
 import re
+import socket
 import sys
 import threading
 import time
@@ -168,6 +176,11 @@ import traceback
 import urllib.request
 import zipfile
 from dataclasses import dataclass
+
+from voice_mouse_hands import (   # the input classes and key tables live in the small elevated-capable file
+    MAX_BACKSPACES, MAX_LINE, MAX_TEXT, default_token_file, read_token_file,
+    EXTENDED_KEYS, KEYUP, MEDIA_APPCOMMAND, MEDIA_VK, MODIFIER_KEYS, UNICODE, VK, VK_BACK, VK_RETURN,
+    WinKeyboard, WinMedia, WinMouse, WinTyper, WinWindow, is_admin, key_events, make_dpi_aware)
 
 MODEL_NAME = "vosk-model-small-en-us-0.15"
 MODEL_URL = f"https://alphacephei.com/vosk/models/{MODEL_NAME}.zip"
@@ -239,8 +252,6 @@ MEDIA_ACTIONS: dict[tuple[str, ...], str] = {
     ("skip", "forward"): "next", ("skip", "back"): "previous",
     ("fast", "forward"): "fast_forward", ("rewind",): "rewind",
 }
-MEDIA_VK = {"play_pause": 0xB3, "stop": 0xB2, "next": 0xB0, "previous": 0xB1}   # VK_MEDIA_*
-MEDIA_APPCOMMAND = {"fast_forward": 49, "rewind": 50}                            # APPCOMMAND_MEDIA_*
 MEDIA_EXAMPLES = ["media play", "media pause", "media stop", "media next", "media previous",
                   "media fast forward", "media rewind", "media skip back", "media skip forward"]
 
@@ -276,25 +287,6 @@ LETTER_WORDS.update({   # NATO alphabet: longer words, usually more reliable tha
         "november oscar papa quebec romeo sierra tango uniform victor whiskey yankee zulu"
     ).split()
 })
-
-# canonical key name -> Windows virtual-key code
-VK: dict[str, int] = {c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"}
-VK.update({str(d): 0x30 + d for d in range(10)})
-VK.update({f"f{n}": 0x6F + n for n in range(1, 13)})
-VK.update({
-    "enter": 0x0D, "tab": 0x09, "escape": 0x1B, "space": 0x20, "backspace": 0x08,
-    "delete": 0x2E, "insert": 0x2D, "home": 0x24, "end": 0x23, "pageup": 0x21,
-    "pagedown": 0x22, "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
-    "period": 0xBE, "comma": 0xBC, "slash": 0xBF, "backslash": 0xDC, "dash": 0xBD,
-    "equals": 0xBB, "semicolon": 0xBA,
-    "lbracket": 0xDB, "rbracket": 0xDD, "quote": 0xDE, "backtick": 0xC0,
-    "capslock": 0x14, "printscreen": 0x2C,
-    "volumeup": 0xAF, "volumedown": 0xAE, "mute": 0xAD, "contextmenu": 0x5D,   # 0x5D = VK_APPS
-    "ctrl": 0x11, "alt": 0x12, "shift": 0x10, "win": 0x5B,
-})
-EXTENDED_KEYS = {"delete", "insert", "home", "end", "pageup", "pagedown",
-                 "left", "up", "right", "down", "win", "printscreen",
-                 "volumeup", "volumedown", "mute", "contextmenu"}
 
 # Multi-word and punctuation key names: spoken phrase -> (extra modifiers, key). Symbols that need
 # Shift are Shift + the key that carries them on a US layout (the Australian layout is the same).
@@ -1130,17 +1122,6 @@ class Controller:
 # --------------------------------------------------------------------------
 # Windows specifics
 # --------------------------------------------------------------------------
-def make_dpi_aware() -> None:
-    import ctypes
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)      # per-monitor v1
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
-
-
 def self_command() -> list[str]:
     """Command line that starts this program again exactly as it was started."""
     frozen = "__compiled__" in globals() or getattr(sys, "frozen", False)
@@ -1180,14 +1161,6 @@ def set_priority(level: str) -> bool:
     return bool(k.SetPriorityClass(k.GetCurrentProcess(), PRIORITY_CLASSES[level]))
 
 
-def is_admin() -> bool:
-    import ctypes
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-
 def relaunch_as_admin() -> bool:
     """Ask Windows to start a copy of this program elevated (shows the UAC prompt). True if the
     elevated copy was started - the caller should then exit; False if it was refused or failed."""
@@ -1220,144 +1193,6 @@ def primary_screen() -> Region:
     import ctypes
     u = ctypes.windll.user32
     return Region(0, 0, u.GetSystemMetrics(0), u.GetSystemMetrics(1))
-
-
-class WinMouse:
-    LEFTDOWN, LEFTUP, RIGHTDOWN, RIGHTUP = 0x0002, 0x0004, 0x0008, 0x0010
-
-    def __init__(self):
-        import ctypes
-        self.u = ctypes.windll.user32
-
-    def move(self, x: int, y: int) -> None:
-        self.u.SetCursorPos(int(x), int(y))
-
-    def _flags(self, button: str) -> tuple[int, int]:
-        return (self.LEFTDOWN, self.LEFTUP) if button == "left" else (self.RIGHTDOWN, self.RIGHTUP)
-
-    def click(self, button: str, double: bool = False) -> None:
-        down, up = self._flags(button)
-        for _ in range(2 if double else 1):
-            self.u.mouse_event(down, 0, 0, 0, 0)
-            self.u.mouse_event(up, 0, 0, 0, 0)
-            time.sleep(0.05)
-
-    def scroll(self, direction: str, amount: int) -> None:
-        """One wheel notch (120 units) per step, at the current cursor position."""
-        flag = 0x0800 if direction in ("up", "down") else 0x1000        # WHEEL / HWHEEL
-        delta = 120 if direction in ("up", "right") else -120
-        for _ in range(amount):
-            self.u.mouse_event(flag, 0, 0, delta, 0)
-            time.sleep(0.01)
-        print(f"scroll {direction} x{amount}")
-
-    def drag(self, button: str, start: tuple[int, int], end: tuple[int, int]) -> None:
-        down, up = self._flags(button)
-        self.move(*start)
-        time.sleep(0.08)
-        self.u.mouse_event(down, 0, 0, 0, 0)
-        time.sleep(0.08)
-        steps = 20
-        for i in range(1, steps + 1):          # intermediate moves: many apps need them
-            self.move(start[0] + (end[0] - start[0]) * i / steps,
-                      start[1] + (end[1] - start[1]) * i / steps)
-            time.sleep(0.01)
-        time.sleep(0.08)
-        self.u.mouse_event(up, 0, 0, 0, 0)
-
-
-class WinKeyboard:
-    def __init__(self):
-        import ctypes
-        self.u = ctypes.windll.user32
-
-    def _event(self, key: str, up: bool) -> None:
-        vk = VK[key]
-        flags = (0x0001 if key in EXTENDED_KEYS else 0) | (0x0002 if up else 0)
-        self.u.keybd_event(vk, self.u.MapVirtualKeyW(vk, 0), flags, 0)
-
-    def press(self, mods, key: str, count: int = 1) -> None:
-        """Hold the modifiers, tap the key, release in reverse. Small gaps let the shell and
-        apps register the modifier first (Windows-key shortcuts need this)."""
-        for _ in range(count):
-            for m in mods:
-                self._event(m, False)
-            if mods:
-                time.sleep(0.04)
-            self._event(key, False)
-            time.sleep(0.02 if mods else 0.005)
-            self._event(key, True)
-            if mods:
-                time.sleep(0.03)
-            for m in reversed(mods):
-                self._event(m, True)
-            time.sleep(0.02 if count > 1 else 0.01)   # let the target app keep up on repeats
-        if mods:
-            print(f"pressed {'+'.join(mods)}+{key}" + (f" x{count}" if count > 1 else ""))
-
-    def hold(self, mods) -> None:
-        """Press and keep down the modifier keys (used around a mouse click)."""
-        for m in mods:
-            self._event(m, False)
-        if mods:
-            time.sleep(0.04)
-
-    def release(self, mods) -> None:
-        for m in reversed(mods):
-            self._event(m, True)
-        if mods:
-            time.sleep(0.02)
-
-
-class WinWindow:
-    """Minimise / maximise / restore the window you are working in (the foreground window)."""
-    SW = {"minimize": 6, "maximize": 3, "restore": 9}          # SW_MINIMIZE, SW_MAXIMIZE, SW_RESTORE
-    SHELL = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}   # desktop + taskbar
-
-    def __init__(self):
-        import ctypes
-        from ctypes import wintypes
-        self.ctypes = ctypes
-        self.u = ctypes.windll.user32
-        self.u.GetForegroundWindow.restype = wintypes.HWND
-        self.u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-        self.u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-
-    def act(self, action: str) -> None:
-        hwnd = self.u.GetForegroundWindow()
-        if not hwnd:
-            return
-        buf = self.ctypes.create_unicode_buffer(256)
-        self.u.GetClassNameW(hwnd, buf, 256)
-        if buf.value in self.SHELL:                  # never minimise the desktop or the taskbar
-            print(f"{action} window: nothing to do (desktop or taskbar is focused)")
-            return
-        self.u.ShowWindow(hwnd, self.SW[action])
-        print(f"{action} window")
-
-
-class WinMedia:
-    """Media buttons. Play/pause, stop, next and previous are the real Windows media keys (they
-    reach whatever player owns media control). Fast forward and rewind have no key, so they are
-    posted to the focused window as WM_APPCOMMAND, which only some players handle."""
-
-    def __init__(self):
-        import ctypes
-        from ctypes import wintypes
-        self.u = ctypes.windll.user32
-        self.u.GetForegroundWindow.restype = wintypes.HWND
-        self.u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-
-    def send(self, action: str) -> None:
-        if action in MEDIA_VK:
-            vk = MEDIA_VK[action]
-            scan = self.u.MapVirtualKeyW(vk, 0)
-            self.u.keybd_event(vk, scan, 0x0001, 0)                 # extended key down
-            self.u.keybd_event(vk, scan, 0x0001 | 0x0002, 0)        # ... and up
-        else:
-            hwnd = self.u.GetForegroundWindow()
-            self.u.PostMessageW(hwnd, 0x0319, hwnd or 0, MEDIA_APPCOMMAND[action] << 16)   # WM_APPCOMMAND
-        print(f"media {action}")
 
 
 class HotkeyWatcher:
@@ -2265,30 +2100,6 @@ def is_dictation_command_prefix(text: str) -> bool:
     return bool(w) and any(k[:len(w)] == w for k in DICTATION_COMMANDS)
 
 
-# ---- keyboard events ---------------------------------------------------------------------------
-KEYUP, UNICODE = 0x0002, 0x0004
-
-
-VK_BACK, VK_RETURN = 0x08, 0x0D
-
-
-def key_events(backspaces: int, text: str) -> list[tuple[int, int, int]]:
-    """(virtual key, scan code, flags) triples: that many Backspaces, then the text. Newline is the
-    Enter key; everything else is sent as UTF-16 code units with KEYEVENTF_UNICODE."""
-    ev: list[tuple[int, int, int]] = []
-    for _ in range(backspaces):
-        ev += [(VK_BACK, 0, 0), (VK_BACK, 0, KEYUP)]
-    for ch in text.replace("\r", ""):
-        if ch == "\n":
-            ev += [(VK_RETURN, 0, 0), (VK_RETURN, 0, KEYUP)]
-            continue
-        data = ch.encode("utf-16-le")
-        for i in range(0, len(data), 2):
-            unit = int.from_bytes(data[i:i + 2], "little")
-            ev += [(0, unit, UNICODE), (0, unit, UNICODE | KEYUP)]
-    return ev
-
-
 # ---- voice activity -> utterances ---------------------------------------------------------------
 class Segmenter:
     """Turns a stream of 30 ms frames plus a speech / not-speech flag per frame into utterances.
@@ -2585,64 +2396,179 @@ class Dictator:
 # --------------------------------------------------------------------------
 # Windows specifics
 # --------------------------------------------------------------------------
-_INPUT_TYPES = None
+# --------------------------------------------------------------------------
+# The hands: input done by a separate, small (optionally elevated) process
+# --------------------------------------------------------------------------
+class HandsError(RuntimeError):
+    """The hands process could not be reached, or refused a request."""
 
 
-def _input_types():
-    global _INPUT_TYPES
-    if _INPUT_TYPES is None:
-        import ctypes
-        from ctypes import wintypes
+class HandsClient:
+    """Sends input requests (plain JSON, one per line) to voice_mouse_hands.py over loopback.
+    Each call waits for the reply, so actions happen in the order they were asked for."""
 
-        class MOUSEINPUT(ctypes.Structure):          # not used, but it sizes the INPUT union correctly
-            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
-                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                        ("dwExtraInfo", ctypes.c_size_t)]
+    def __init__(self, token_file: str, timeout: float = 30.0, connect=socket.create_connection):
+        self.token_file, self.timeout, self._connect = token_file, timeout, connect
+        self.sock = self.rfile = None
+        self.admin = False
+        self.lock = threading.Lock()
 
-        class KEYBDINPUT(ctypes.Structure):
-            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
-                        ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+    def open(self) -> "HandsClient":
+        info = read_token_file(self.token_file)
+        sock = self._connect(("127.0.0.1", info["port"]), 3)
+        sock.settimeout(self.timeout)
+        rfile = sock.makefile("rb")
+        try:
+            sock.sendall((json.dumps({"op": "hello", "token": info["token"]}) + "\n").encode("utf-8"))
+            reply = json.loads(rfile.readline(MAX_LINE) or b"{}")
+        except Exception:
+            sock.close()
+            raise
+        if not reply.get("ok"):
+            sock.close()
+            raise HandsError(f"the hands refused the connection ({reply.get('error', 'no reply')})")
+        self.sock, self.rfile, self.admin = sock, rfile, bool(reply.get("admin"))
+        return self
 
-        class HARDWAREINPUT(ctypes.Structure):
-            _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+    def close(self) -> None:
+        for f in (self.rfile, self.sock):
+            try:
+                f and f.close()
+            except OSError:
+                pass
+        self.sock = self.rfile = None
 
-        class _U(ctypes.Union):
-            _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+    def call(self, op: str, **fields) -> None:
+        data = (json.dumps({"op": op, **fields}) + "\n").encode("utf-8")
+        with self.lock:
+            try:
+                if self.sock is None:
+                    self.open()
+                self.sock.sendall(data)
+            except (OSError, ValueError, KeyError):        # not delivered: reconnect once and send again
+                self.close()
+                try:
+                    self.open()
+                    self.sock.sendall(data)
+                except (OSError, ValueError, KeyError) as e:
+                    self.close()
+                    raise HandsError(f"cannot reach the hands process: {e}") from e
+            try:
+                line = self.rfile.readline(MAX_LINE)
+            except OSError as e:                           # delivered, reply lost: do NOT send it again
+                self.close()
+                raise HandsError(f"lost contact with the hands process: {e}") from e
+            if not line:
+                self.close()
+                raise HandsError("the hands process closed the connection")
+        reply = json.loads(line)
+        if not reply.get("ok"):
+            raise HandsError(f"{op}: {reply.get('error', 'refused')}")
 
-        class INPUT(ctypes.Structure):
-            _fields_ = [("type", wintypes.DWORD), ("u", _U)]
 
-        _INPUT_TYPES = (INPUT, KEYBDINPUT)
-    return _INPUT_TYPES
+class RemoteMouse:
+    def __init__(self, hands: HandsClient):
+        self.hands = hands
+
+    def move(self, x, y) -> None:
+        self.hands.call("move", x=int(x), y=int(y))
+
+    def click(self, button: str, double: bool = False) -> None:
+        self.hands.call("click", button=button, double=bool(double))
+
+    def scroll(self, direction: str, amount: int) -> None:
+        self.hands.call("scroll", direction=direction, amount=int(amount))
+
+    def drag(self, button: str, start, end) -> None:
+        self.hands.call("drag", button=button, start=[int(start[0]), int(start[1])],
+                        end=[int(end[0]), int(end[1])])
 
 
-class WinTyper:
-    """Backspaces and text into the focused window, in as few SendInput calls as possible."""
-    CHUNK = 400                                       # events per call (even, so down/up stay together)
+class RemoteKeyboard:
+    def __init__(self, hands: HandsClient):
+        self.hands = hands
 
-    def __init__(self):
-        import ctypes
-        from ctypes import wintypes
-        self.INPUT, _ = _input_types()
-        self.u = ctypes.windll.user32
-        self.u.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(self.INPUT), ctypes.c_int]
-        self.u.SendInput.restype = wintypes.UINT
-        self._warned = False
+    def press(self, mods, key: str, count: int = 1) -> None:
+        self.hands.call("press", mods=list(mods), key=key, count=int(count))
+
+    def hold(self, mods) -> None:
+        self.hands.call("hold", mods=list(mods))
+
+    def release(self, mods) -> None:
+        self.hands.call("release", mods=list(mods))
+
+
+class RemoteWindow:
+    def __init__(self, hands: HandsClient):
+        self.hands = hands
+
+    def act(self, action: str) -> None:
+        self.hands.call("window", action=action)
+
+
+class RemoteMedia:
+    def __init__(self, hands: HandsClient):
+        self.hands = hands
+
+    def send(self, action: str) -> None:
+        self.hands.call("media", action=action)
+
+
+class RemoteTyper:
+    def __init__(self, hands: HandsClient):
+        self.hands = hands
 
     def edit(self, backspaces: int, text: str) -> None:
-        import ctypes
-        events = key_events(backspaces, text)
-        for i in range(0, len(events), self.CHUNK):
-            chunk = events[i:i + self.CHUNK]
-            arr = (self.INPUT * len(chunk))()
-            for slot, (vk, scan, flags) in zip(arr, chunk):
-                slot.type = 1                         # INPUT_KEYBOARD
-                slot.u.ki.wVk, slot.u.ki.wScan, slot.u.ki.dwFlags = vk, scan, flags
-            sent = self.u.SendInput(len(chunk), arr, ctypes.sizeof(self.INPUT))
-            if sent < len(chunk) and not self._warned:
-                self._warned = True
-                print("warning: Windows refused some typed input (the window is probably running as "
-                      "administrator; start with --admin)")
+        while backspaces > MAX_BACKSPACES:                  # the hands cap one request's size
+            self.hands.call("edit", backspaces=MAX_BACKSPACES, text="")
+            backspaces -= MAX_BACKSPACES
+        self.hands.call("edit", backspaces=backspaces, text=text[:MAX_TEXT])
+        for i in range(MAX_TEXT, len(text), MAX_TEXT):
+            self.hands.call("edit", backspaces=0, text=text[i:i + MAX_TEXT])
+
+
+def hands_command(token_file: str, idle_exit: float = 90.0) -> list[str]:
+    """Command line that starts the hands process (the caller adds elevation)."""
+    frozen = "__compiled__" in globals() or getattr(sys, "frozen", False)
+    here = os.path.dirname(os.path.abspath(sys.argv[0] if frozen else __file__))
+    if frozen:
+        target = [os.path.join(here, "voice_mouse_hands.exe")]
+    else:
+        target = [sys.executable, os.path.join(here, "voice_mouse_hands.py")]
+    return target + ["--token-file", token_file, "--idle-exit", f"{idle_exit:g}"]
+
+
+def connect_hands(token_file: str, wait: float = 0.0, sleep=time.sleep, clock=time.monotonic,
+                  client_factory=HandsClient) -> HandsClient:
+    """Connect to a running hands process, retrying for `wait` seconds (it may still be starting,
+    or waiting for the UAC prompt to be answered)."""
+    deadline = clock() + wait
+    while True:
+        try:
+            return client_factory(token_file).open()
+        except HandsError:
+            raise
+        except (OSError, ValueError, KeyError) as e:
+            if clock() >= deadline:
+                raise HandsError(f"no hands process found via {token_file} ({e}). Start it with "
+                                 f"voice_mouse_hands.py --admin, or use --admin-hands") from e
+            sleep(0.25)
+
+
+def launch_hands_admin(token_file: str, wait: float = 60.0) -> HandsClient:
+    """Use a hands process that is already running; if there is none, start one elevated (UAC
+    prompt) and connect to it. Reusing one means a reload or a crash restart never asks again."""
+    try:
+        return connect_hands(token_file)
+    except HandsError:
+        pass
+    import ctypes
+    import subprocess
+    exe, *args = hands_command(token_file)
+    print("Starting the input helper as administrator (accept the Windows prompt) ...")
+    if ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, subprocess.list2cmdline(args), None, 1) <= 32:
+        raise HandsError("could not start the hands as administrator (prompt declined?)")
+    return connect_hands(token_file, wait=wait)
 
 
 def foreground_window() -> int:
@@ -3294,7 +3220,8 @@ def supervise(launch=None, max_crashes: int = 5, window: float = 60.0, delay: fl
     than 0). A normal exit (0: Ctrl+C, the reload phrase) is final. More than `max_crashes` crashes
     within `window` seconds means something is badly wrong, so it stops instead of looping."""
     import subprocess
-    cmd = [*self_command(), "--supervised-by", str(os.getpid())]
+    cmd = [*("--use-hands" if a == "--admin-hands" else a for a in self_command()),   # hands already running
+           "--supervised-by", str(os.getpid())]
     launches = [0]
 
     def run_child() -> int:
@@ -3369,6 +3296,14 @@ def main() -> None:
     ap.add_argument("--admin", action="store_true",
                     help="restart elevated (UAC prompt) so clicks and keys also reach administrator "
                          "windows, which Windows otherwise blocks")
+    ap.add_argument("--use-hands", action="store_true",
+                    help="send all clicks, keys and typing to a separate voice_mouse_hands.py process "
+                         "(which may run as administrator) instead of doing them here")
+    ap.add_argument("--admin-hands", action="store_true",
+                    help="start voice_mouse_hands.py elevated (UAC prompt) if it is not already running, "
+                         "and use it. Only that small file is elevated; this program and its models are not")
+    ap.add_argument("--hands-file", default=default_token_file(), metavar="FILE",
+                    help="where the hands process publishes its port and token (default: %(default)s)")
     ap.add_argument("--hide-console", action="store_true",
                     help="hide the console window once started (see the note in the docstring: "
                          "pythonw is the reliable way to run with no console at all)")
@@ -3448,6 +3383,16 @@ def main() -> None:
         if relaunch_as_admin():
             return
         print("Could not get administrator rights (prompt declined?); carrying on without them.")
+    hands = None
+    if args.admin_hands and not args.supervised_by:       # once, in the outermost process: restarts reuse it
+        try:
+            hands = launch_hands_admin(args.hands_file)
+        except HandsError as e:
+            sys.exit(f"Could not start the elevated input helper: {e}")
+        args.use_hands = True
+        if not args.no_restart:                           # the supervisor only needed to know it works
+            hands.close()
+            hands = None
     if args.hide_console:
         hide_console()                   # after the start-up checks above, so their errors are still seen
     if args.supervised_by:               # we are the child: follow the supervisor out
@@ -3476,9 +3421,21 @@ def main() -> None:
             threading.Thread(target=winsound.Beep, args=(1300 if state == DICTATE else 700, 70),
                              daemon=True).start()
 
-    ctl = Controller(screen, WinMouse(), overlay, on_state=on_state, keyboard=WinKeyboard(),
-                     media=None if args.no_media else WinMedia(), on_reload=reload_program,
-                     windows=WinWindow())
+    if args.use_hands:
+        try:
+            hands = hands or connect_hands(args.hands_file, wait=20.0)
+        except HandsError as e:
+            sys.exit(f"Could not reach the input helper: {e}")
+        print(f"Input goes through the hands process ({'administrator' if hands.admin else 'NOT elevated'}).")
+        if not hands.admin:
+            print("note: it is not elevated, so administrator windows still ignore clicks and keys")
+        mouse, keyboard, window, media_dev, typer = (RemoteMouse(hands), RemoteKeyboard(hands),
+                                                     RemoteWindow(hands), RemoteMedia(hands), RemoteTyper(hands))
+    else:
+        mouse, keyboard, window, media_dev, typer = WinMouse(), WinKeyboard(), WinWindow(), WinMedia(), None
+    ctl = Controller(screen, mouse, overlay, on_state=on_state, keyboard=keyboard,
+                     media=None if args.no_media else media_dev, on_reload=reload_program,
+                     windows=window)
     if args.start_awake:
         ctl.handle("start")
 
@@ -3505,7 +3462,7 @@ def main() -> None:
         else:
             dictation = DictationSession(
                 d_opts, say, on_idle=lambda: ctl.handle("listen"), on_stop=lambda: ctl.handle("listen"),
-                on_ready=lambda: ctl.handle("dictate"))
+                on_ready=lambda: ctl.handle("dictate"), typist=typer)
             speech.dictation_feed = dictation.feed
             if not args.lazy_dictation:           # load (first run: download) in the background now,
                 dictation.request(want=False)     # so "dictate" works at once; Vosk starts meanwhile
