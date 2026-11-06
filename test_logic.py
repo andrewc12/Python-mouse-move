@@ -827,3 +827,16 @@ print("microphone recovery ok")
 assert PRIORITY_CLASSES == {"normal": 0x20, "above": 0x8000, "high": 0x80}
 assert "realtime" not in PRIORITY_CLASSES                      # never offered: can starve input and audio
 print("priority ok")
+
+
+# ================= overlay inset auto-adjust =================
+assert BUSY_STATES == (2, 3) and MAX_INSET == 8
+assert next_inset(2, False, 1) == 2 and next_inset(3, False, 4) == 5            # busy because of us: grow
+assert next_inset(5, False, 1) == 1 and next_inset(None, False, 1) == 1         # fine / unknown: leave it
+assert next_inset(2, True, 1) == 1                                             # something else was full-screen already
+assert next_inset(2, False, MAX_INSET) == MAX_INSET                            # never past the limit
+i = 1
+for _ in range(20):
+    i = next_inset(2, False, i)
+assert i == MAX_INSET
+print("overlay inset ok")

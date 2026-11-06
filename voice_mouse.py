@@ -96,6 +96,10 @@ Do Not Disturb: the grid overlay stops 1 pixel short of the screen's bottom edge
 because a window that covers the monitor exactly makes Windows think a full-screen app is running and
 turn on Do Not Disturb (which also shifts the taskbar's notification icons).
 
+If Windows still switches Do Not Disturb on, the program notices (it asks Windows what it thinks is
+running) and shrinks the overlay one more pixel at a time, up to 8, printing a line when it does.
+It then remembers the size for the session. --no-adapt-inset turns that off.
+
 Always on top: the status box and the grid are raised to the top of the always-on-top order a few
 times a second, so they stay above the taskbar, the Start menu and other topmost windows (turn off
 with --no-keep-on-top). Windows' own highest layer (on-screen keyboard, Magnifier, the lock screen)
@@ -1355,10 +1359,39 @@ def raise_topmost(widget) -> None:
     u.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, FLAGS)
 
 
+# SHQueryUserNotificationState values: 2 = a full-screen app is running (Do Not Disturb kicks in),
+# 3 = a Direct3D full-screen app is running.
+BUSY_STATES = (2, 3)
+MAX_INSET = 8
+
+
+def notification_state():
+    """Windows' idea of what the user is doing (see BUSY_STATES), or None if it cannot be read."""
+    import ctypes
+    state = ctypes.c_int(0)
+    try:
+        if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state)) == 0:
+            return state.value
+    except Exception:
+        pass
+    return None
+
+
+def next_inset(state, baseline_busy: bool, inset: int, limit: int = MAX_INSET) -> int:
+    """How far short of the screen the grid overlay should stop, given what Windows reports now.
+
+    If Windows reports a full-screen app *because of the overlay* (it was not busy before the grid
+    opened), make the overlay one pixel smaller and look again, up to `limit`. If something else
+    was already full-screen, or Windows is happy, leave it alone."""
+    if state in BUSY_STATES and not baseline_busy and inset < limit:
+        return inset + 1
+    return inset
+
+
 class Overlay:
     KEY = "#010203"      # colour treated as fully transparent
 
-    def __init__(self, root, screen: Region, minor_grid: bool = True, inset: int = 1):
+    def __init__(self, root, screen: Region, minor_grid: bool = True, inset: int = 1, adapt: bool = True):
         import tkinter as tk
         self.tk, self.screen = tk, screen
         self.minor_grid = minor_grid          # thin 9x9 preview lines inside the 3x3 grid
@@ -1367,7 +1400,9 @@ class Overlay:
         # A borderless window that covers the monitor exactly is treated by Windows as a full-screen
         # app, which switches on Do Not Disturb / Focus Assist and shuffles the taskbar's notification
         # area. Stopping `inset` pixel(s) short of the bottom edge avoids that, and is not noticeable.
-        self.win.geometry(f"{int(screen.w)}x{int(screen.h) - max(0, int(inset))}+{int(screen.x)}+{int(screen.y)}")
+        self.inset = max(0, int(inset))
+        self.adapt = adapt                    # grow the inset if Windows still thinks it is full-screen
+        self._apply_geometry()
         self.win.attributes("-topmost", True)
         self.win.attributes("-transparentcolor", self.KEY)
         self.canvas = tk.Canvas(self.win, bg=self.KEY, highlightthickness=0)
@@ -1375,6 +1410,24 @@ class Overlay:
         make_click_through(self.win)
         self.win.withdraw()
         self.shown = False
+        self._baseline_busy = False
+
+    def _apply_geometry(self) -> None:
+        s = self.screen
+        self.win.geometry(f"{int(s.w) - self.inset}x{int(s.h) - self.inset}+{int(s.x)}+{int(s.y)}")
+
+    def _check_notification_state(self, tries_left: int) -> None:
+        """Windows decides asynchronously whether a full-screen app is running. If it has just
+        decided that the grid is one, shrink the overlay a pixel and look again."""
+        if not self.shown or tries_left <= 0:
+            return
+        new = next_inset(notification_state(), self._baseline_busy, self.inset)
+        if new != self.inset:
+            self.inset = new
+            self._apply_geometry()
+            print(f"Windows treated the grid as a full-screen app; overlay is now {new}px smaller")
+            tries_left = 5
+        self.win.after(300, self._check_notification_state, tries_left - 1)
 
     def raise_(self) -> None:
         """Back to the top of the screen (only while the grid is showing)."""
@@ -1415,10 +1468,15 @@ class Overlay:
             c.create_oval(mx - 10, my - 10, mx + 10, my + 10, outline="#00e5ff", width=3)
             c.create_line(mx - 16, my, mx + 16, my, fill="#00e5ff", width=2)
             c.create_line(mx, my - 16, mx, my + 16, fill="#00e5ff", width=2)
+        if not self.shown:
+            self._baseline_busy = notification_state() in BUSY_STATES    # already busy before we appeared?
         self.win.deiconify()
         self.win.attributes("-topmost", True)
+        first_time = not self.shown
         self.shown = True
         raise_topmost(self.win)
+        if first_time and self.adapt:
+            self.win.after(300, self._check_notification_state, 5)
 
 
 class StatusPill:
@@ -2005,6 +2063,8 @@ def main() -> None:
                     help="make the grid overlay this many pixels shorter than the screen (default 1) so "
                          "Windows does not treat it as a full-screen app and switch on Do Not Disturb; "
                          "0 = cover the whole screen")
+    ap.add_argument("--no-adapt-inset", action="store_true",
+                    help="don't auto-shrink the overlay further if Windows still reports a full-screen app")
     ap.add_argument("--no-keep-on-top", action="store_true",
                     help="don't keep re-raising the status box and grid above everything else "
                          "(they are still always-on-top windows)")
@@ -2062,7 +2122,8 @@ def main() -> None:
     root.withdraw()
     screen = primary_screen()
     pill = StatusPill(root, screen, corner=args.corner)
-    overlay = Overlay(root, screen, minor_grid=not args.no_minor_grid, inset=args.overlay_inset)
+    overlay = Overlay(root, screen, minor_grid=not args.no_minor_grid, inset=args.overlay_inset,
+                      adapt=not args.no_adapt_inset)
     ctl = Controller(screen, WinMouse(), overlay, on_state=pill.set, keyboard=WinKeyboard(),
                      media=None if args.no_media else WinMedia(), on_reload=reload_program,
                      windows=WinWindow())
