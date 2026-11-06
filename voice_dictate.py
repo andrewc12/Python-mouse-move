@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import math
 import os
 import queue
 import re
@@ -82,15 +83,308 @@ import traceback
 import urllib.request
 from dataclasses import dataclass
 
-# The status box, DPI handling, priority and admin helpers are shared with voice_mouse.py, so the
-# two programs look and behave the same. Keep this file next to voice_mouse.py.
-from voice_mouse import (AWAKE, GRID, SLEEPING, StatusPill, hide_console, is_admin, level_from_pcm,
-                         make_dpi_aware, primary_screen, relaunch_as_admin, set_priority,
-                         PRIORITY_CLASSES)
-
 SAMPLE_RATE = 16000
 FRAME_MS = 30                                   # webrtcvad takes 10, 20 or 30 ms frames
 FRAME_BYTES = SAMPLE_RATE * FRAME_MS // 1000 * 2
+
+# --------------------------------------------------------------------------
+# Status box and Windows helpers (the same look and behaviour as voice_mouse.py, copied here so this
+# file runs on its own)
+# --------------------------------------------------------------------------
+SLEEPING, AWAKE, GRID = "sleeping", "awake", "grid"
+PRIORITY_CLASSES = {"normal": 0x00000020, "above": 0x00008000, "high": 0x00000080}
+
+
+@dataclass(frozen=True)
+class Region:
+    x: float
+    y: float
+    w: float
+    h: float
+
+
+def level_from_pcm(data: bytes) -> float:
+    """Loudness of a 16-bit mono PCM chunk on a 0..1 scale (-60 dBFS -> 0, -10 dBFS -> 1)."""
+    from array import array
+    a = array("h")
+    a.frombytes(data[: len(data) // 2 * 2])
+    if not a:
+        return 0.0
+    rms = math.sqrt(sum(x * x for x in a) / len(a))
+    if rms < 1:
+        return 0.0
+    db = 20 * math.log10(rms / 32768)
+    return max(0.0, min(1.0, (db + 60) / 50))
+
+
+def make_dpi_aware() -> None:
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)      # per-monitor v1
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def self_command() -> list[str]:
+    """Command line that starts this program again exactly as it was started."""
+    frozen = "__compiled__" in globals() or getattr(sys, "frozen", False)
+    args = list(sys.argv[1:])
+    if frozen:
+        return [os.path.abspath(sys.argv[0]), *args]
+    return [sys.executable, os.path.abspath(sys.argv[0]), *args]
+
+
+def set_priority(level: str) -> bool:
+    """Give this process the named Windows priority class. True on success."""
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.windll.kernel32
+    k.GetCurrentProcess.restype = wintypes.HANDLE
+    k.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    return bool(k.SetPriorityClass(k.GetCurrentProcess(), PRIORITY_CLASSES[level]))
+
+
+def is_admin() -> bool:
+    import ctypes
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_as_admin() -> bool:
+    """Ask Windows to start a copy of this program elevated (shows the UAC prompt). True if the
+    elevated copy was started - the caller should then exit; False if it was refused or failed."""
+    import ctypes
+    import subprocess
+    exe, *args = self_command()
+    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, subprocess.list2cmdline(args), None, 1)
+    return rc > 32
+
+
+def hide_console() -> None:
+    """Hide this program's console window (if it has one). Output still goes to it, unseen."""
+    import ctypes
+    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if hwnd:
+        ctypes.windll.user32.ShowWindow(hwnd, 0)             # SW_HIDE
+
+
+def primary_screen() -> Region:
+    import ctypes
+    u = ctypes.windll.user32
+    return Region(0, 0, u.GetSystemMetrics(0), u.GetSystemMetrics(1))
+
+
+def make_click_through(widget, clickable: bool = False) -> None:
+    """Layered + no-activate window that never takes focus. Unless `clickable`, mouse clicks
+    also pass straight through it to whatever is underneath."""
+    import ctypes
+    u = ctypes.windll.user32
+    widget.update_idletasks()
+    hwnd = u.GetAncestor(widget.winfo_id(), 2)           # GA_ROOT
+    GWL_EXSTYLE = -20
+    style = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    extra = 0x80000 | 0x80 | 0x08000000                  # LAYERED | TOOLWINDOW | NOACTIVATE
+    if not clickable:
+        extra |= 0x20                                    # TRANSPARENT (click-through)
+    u.SetWindowLongW(hwnd, GWL_EXSTYLE, style | extra)
+
+
+def raise_topmost(widget) -> None:
+    """Put the window at the very top of the always-on-top band, without taking focus or moving it.
+    Windows keeps topmost windows in the order they were last raised, so re-raising ours (it is
+    called a few times a second) puts it back above the taskbar, the Start menu and other
+    always-on-top windows that have since been raised. Windows in the system's higher UI-access band
+    (the on-screen keyboard, Magnifier, Task Manager when set to stay on top, the lock screen) cannot
+    be covered by a normal program."""
+    import ctypes
+    u = ctypes.windll.user32
+    hwnd = u.GetAncestor(widget.winfo_id(), 2)           # GA_ROOT
+    HWND_TOPMOST, FLAGS = -1, 0x0001 | 0x0002 | 0x0010   # NOSIZE | NOMOVE | NOACTIVATE
+    u.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, FLAGS)
+
+
+class StatusPill:
+    COLORS = {SLEEPING: ("#444444", "Sleeping", "say \"start listening\""),
+              AWAKE: ("#1e8e3e", "Listening", "\"mouse grid\" or \"press ...\""),
+              GRID: ("#c5221f", "Grid", "say 1-9, back, mark, cancel")}
+    METER_W, METER_H = 90, 10
+    HINT_SECONDS = 6          # how long the hint / last-heard phrase stay visible
+    PAD = 8                   # spacing between every element and around the edge
+    # Where the visual middle of a line of text sits above its baseline, as a fraction of the font
+    # size (about half an x-height plus a little for capitals). Every text item - and the meter and
+    # arrow - is centred on one shared line using this, so differing fonts don't look high or low.
+    VISUAL_MID = 0.30
+
+    CORNERS = ("bottom-right", "bottom-left", "top-left", "top-right")   # order the button cycles
+
+    def __init__(self, root, screen: Region, corner: str = "bottom-right"):
+        import tkinter as tk
+        import tkinter.font as tkfont
+        self.corner = corner                  # which screen corner the box sits in
+        self.win = tk.Toplevel(root)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.attributes("-alpha", 0.85)
+        self.canvas = tk.Canvas(self.win, highlightthickness=0, cursor="hand2")
+        self.canvas.pack()
+        self.f_label = tkfont.Font(family="Segoe UI", size=10, weight="bold")
+        self.f_heard = tkfont.Font(family="Calibri", size=10)   # proportional cousin of Consolas (same designer)
+        self.f_arrow = tkfont.Font(family="Segoe UI Symbol", size=12, weight="bold")
+        self.screen = screen
+        self.level = 0.0
+        self.state = SLEEPING
+        self.label_text = ""
+        self.heard_text = ""
+        self.meter_x = 0                      # set by _draw
+        self.cy = 0
+        self.on_click = lambda: None          # set by main(); toggles listening
+        # Bind ONCE on the toplevel (see earlier double-toggle bug). One handler decides whether the
+        # click landed on the arrow (move the box) or elsewhere (toggle listening).
+        self._last_click = 0.0
+        self._arrow_x0 = 0
+        self.win.bind("<Button-1>", self._clicked)
+        self._hint_job = self._heard_job = None
+        self._heard_seq = -1
+        self.set(SLEEPING)
+        make_click_through(self.win, clickable=True)   # takes clicks but never steals focus
+
+    # ---- drawing -----------------------------------------------------------
+    def _em_px(self, font) -> float:
+        size = font.cget("size")
+        return abs(size) if size < 0 else size * self.win.winfo_fpixels("1i") / 72.0
+
+    def _baseline(self) -> float:
+        """The one baseline shared by the state text and the heard phrase, chosen so the state
+        text's visual middle sits on the centre line. (Centring each font separately put the
+        monospace phrase about a pixel higher than the state text.)"""
+        return self._text_y(self.f_label) + (self.f_label.metrics("ascent")
+                                             - self.f_label.metrics("linespace") / 2.0)
+
+    def _text_y(self, font, baseline: float | None = None) -> float:
+        """y for anchor='w' text. With `baseline`, the text's baseline lands exactly there;
+        without it, its visual middle lands on the centre line (used for the arrow glyph)."""
+        m = font.metrics()
+        if baseline is not None:
+            return baseline - (m["ascent"] - m["linespace"] / 2.0)
+        visual_mid = m["ascent"] - self.VISUAL_MID * self._em_px(font)
+        return self.cy + (m["linespace"] / 2.0 - visual_mid)
+
+    def _draw(self) -> None:
+        P, c = self.PAD, self.canvas
+        colour = self.COLORS[self.state][0]
+        c.delete("all")
+        arrow = "\u21c4"
+        label_w = self.f_label.measure(self.label_text)
+        heard_w = self.f_heard.measure(self.heard_text) if self.heard_text else 0
+        arrow_w = self.f_arrow.measure(arrow)
+        height = max(self.f_label.metrics("linespace"), self.f_arrow.metrics("linespace"),
+                     self.METER_H) + 2 * P
+        x = P + 2
+        width = (x + label_w + (P + heard_w if heard_w else 0)
+                 + P + self.METER_W + P + arrow_w + P)
+        c.config(width=int(width), height=int(height), bg=colour)
+        self.cy = height / 2.0
+        base = self._baseline()
+        c.create_text(x, self._text_y(self.f_label, base), text=self.label_text, anchor="w",
+                      font=self.f_label, fill="white")
+        x += label_w
+        if heard_w:
+            x += P
+            c.create_text(x, self._text_y(self.f_heard, base), text=self.heard_text, anchor="w",
+                          font=self.f_heard, fill="white")
+            x += heard_w
+        x += P
+        self.meter_x = x
+        c.create_rectangle(x, self.cy - self.METER_H / 2, x + self.METER_W,
+                           self.cy + self.METER_H / 2, width=0, fill="#1b1b1b")
+        self.bar = c.create_rectangle(x, self.cy - self.METER_H / 2, x, self.cy + self.METER_H / 2,
+                                      width=0, fill="#34c759")
+        x += self.METER_W + P
+        self._arrow_x0 = x - P / 2
+        c.create_text(x, self._text_y(self.f_arrow), text=arrow, anchor="w",
+                      font=self.f_arrow, fill="white")
+        self._paint_level()
+        self._place()
+
+    def _paint_level(self) -> None:
+        colour = "#34c759" if self.level < 0.6 else "#ffcc00" if self.level < 0.85 else "#ff3b30"
+        top, bottom = self.cy - self.METER_H / 2, self.cy + self.METER_H / 2
+        self.canvas.coords(self.bar, self.meter_x, top, self.meter_x + self.level * self.METER_W, bottom)
+        self.canvas.itemconfig(self.bar, fill=colour)
+
+    # ---- interaction ---------------------------------------------------------
+    def raise_(self) -> None:
+        raise_topmost(self.win)
+
+    def _clicked(self, event=None) -> None:
+        now = time.monotonic()
+        if now - self._last_click < 0.35:       # ignore bounce / duplicate events
+            return
+        self._last_click = now
+        if event is not None and event.x >= self._arrow_x0:
+            self._flip()                         # arrow: move the box, don't toggle listening
+        else:
+            self.on_click()
+
+    def _flip(self) -> None:
+        i = self.CORNERS.index(self.corner)
+        self.corner = self.CORNERS[(i + 1) % len(self.CORNERS)]
+        self._place()
+
+    def _place(self) -> None:
+        self.win.update_idletasks()
+        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
+        x = 16 if "left" in self.corner else self.screen.w - w - 16
+        y = 16 if "top" in self.corner else self.screen.h - h - 56      # 56 clears the taskbar
+        self.win.geometry(f"+{int(x)}+{int(y)}")
+
+    # ---- state / text ----------------------------------------------------------
+    def set(self, state: str) -> None:
+        _, name, hint = self.COLORS[state]
+        self.state = state
+        self.label_text = f"{name} - {hint}"
+        if self._hint_job is not None:                      # restart the hint timer on every change
+            self.win.after_cancel(self._hint_job)
+        self._hint_job = self.win.after(int(self.HINT_SECONDS * 1000), self._hide_hint)
+        self._draw()
+
+    def _hide_hint(self) -> None:
+        """Shrink 'Listening - "mouse grid" or ...' to just 'Listening' once it has been read."""
+        self._hint_job = None
+        self.label_text = self.COLORS[self.state][1]
+        self._draw()
+
+    def set_heard(self, text: str, seq: int = 0) -> None:
+        """Show the last recognised phrase for a few seconds. `seq` changes with every new
+        recognition (so a repeated phrase refreshes the timer); the UI poll loop calls this
+        constantly."""
+        if seq == self._heard_seq:                      # nothing new since the last poll
+            return
+        self._heard_seq = seq
+        if self._heard_job is not None:
+            self.win.after_cancel(self._heard_job)
+            self._heard_job = None
+        if self.heard_text != text:
+            self.heard_text = text
+            self._draw()
+        if text:
+            self._heard_job = self.win.after(int(self.HINT_SECONDS * 1000), self._clear_heard)
+
+    def _clear_heard(self) -> None:
+        self._heard_job = None
+        self.heard_text = ""
+        self._draw()
+
+    def set_level(self, v: float) -> None:
+        """Fast attack, slow decay so short words are visible."""
+        self.level = max(v, self.level * 0.8)
+        self._paint_level()
+
 
 PAUSED, LISTENING, LOADING = SLEEPING, AWAKE, GRID   # the pill's three states, in dictation terms
 
